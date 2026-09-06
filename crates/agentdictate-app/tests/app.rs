@@ -14,6 +14,7 @@ mod openai_http;
 mod overlay_lifecycle;
 #[path = "app/paths.rs"]
 mod paths;
+#[cfg(unix)]
 #[path = "app/startup.rs"]
 mod startup;
 #[path = "app/support.rs"]

@@ -376,6 +376,31 @@ fn dictation_section(
             theme,
         ))
     })
+    .when(cfg!(windows) && uses_chatgpt_subscription, |section| {
+        section.child(
+            action_button("settings-chatgpt-sign-in")
+                .label("Sign in with ChatGPT")
+                .on_click(cx.listener(|shell, _, _, cx| {
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        let result = std::env::current_exe().and_then(|exe| {
+                            std::process::Command::new(exe)
+                                .arg("login")
+                                .creation_flags(0x08000000)
+                                .spawn()
+                        });
+                        shell.set_route_feedback(match result {
+                            Ok(_) => {
+                                "Complete sign-in in your browser, then start dictating.".into()
+                            }
+                            Err(error) => format!("Could not open ChatGPT sign-in: {error}"),
+                        });
+                    }
+                    cx.notify();
+                })),
+        )
+    })
     .when(!uses_chatgpt_subscription, |section| {
         section
             .child(model_catalog_status(model_catalog, theme))

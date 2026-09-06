@@ -571,11 +571,12 @@ fn cleanup_reasoning_efforts(model: &str) -> Option<&'static [ReasoningEffort]> 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         collections::VecDeque,
         io::{Read, Write},
         net::TcpListener,
-        os::unix::fs::PermissionsExt,
         sync::{Arc, Mutex, mpsc},
     };
 
@@ -867,6 +868,7 @@ mod tests {
         assert!(!persisted.contains("sk-account-a"));
         assert!(persisted.contains("gpt-6"));
         assert!(persisted.ends_with('\n'));
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&cache_file).unwrap().permissions().mode() & 0o777,
             0o600

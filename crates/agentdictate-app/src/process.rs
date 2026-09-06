@@ -2,8 +2,8 @@ use std::sync::{Arc, RwLock};
 use std::{io, path::PathBuf};
 
 use agentdictate_core::{
-    ClientCommand, ClientCommandKind, ClientCommandTag, HotkeyReadiness, ServerMessage, Settings,
-    ProcessingStage, WorkflowPhase, WorkflowSnapshot,
+    ClientCommand, ClientCommandKind, ClientCommandTag, HotkeyReadiness, ProcessingStage,
+    ServerMessage, Settings, WorkflowPhase, WorkflowSnapshot,
 };
 use agentdictate_linux::hotkey::{HotkeySignal, HotkeySpec};
 use agentdictate_runtime::{
@@ -13,9 +13,10 @@ use agentdictate_runtime::{
 
 use crate::model_catalog::ModelCatalog;
 use crate::{
-    AppPaths, CodexSubscriptionTransport, Daemon, OverlayController, OverlayUpdate, ReqwestOpenAiTransport,
-    SpeechRouter, SystemDeliverer, SystemRecordingController, TranscriptionPipeline,
-    chatgpt_dictation_import::start_chatgpt_dictation_importer, sync_startup_with_systemctl,
+    AppPaths, CodexSubscriptionTransport, Daemon, OverlayController, OverlayUpdate,
+    ReqwestOpenAiTransport, SpeechRouter, SystemDeliverer, SystemRecordingController,
+    TranscriptionPipeline, chatgpt_dictation_import::start_chatgpt_dictation_importer,
+    sync_startup_with_systemctl,
 };
 
 pub type ProductionTranscriber = TranscriptionPipeline<
@@ -245,7 +246,11 @@ impl AgentProcess {
         if start_on_login_changed {
             match std::env::current_exe() {
                 Ok(executable) => {
-                    let daemon_executable = executable.with_file_name("agentdictated");
+                    let daemon_executable = executable.with_file_name(if cfg!(windows) {
+                        "agentdictated.exe"
+                    } else {
+                        "agentdictated"
+                    });
                     if let Err(error) = sync_startup_with_systemctl(
                         &self.autostart_file,
                         &self.daemon_service_file,
@@ -329,7 +334,11 @@ fn run_post_listener_maintenance(
 ) {
     match std::env::current_exe() {
         Ok(executable) => {
-            let daemon_executable = executable.with_file_name("agentdictated");
+            let daemon_executable = executable.with_file_name(if cfg!(windows) {
+                "agentdictated.exe"
+            } else {
+                "agentdictated"
+            });
             if let Err(error) = sync_startup_with_systemctl(
                 autostart_file,
                 daemon_service_file,
@@ -705,6 +714,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn opening_the_shortcut_process_does_not_run_nonessential_maintenance() {
         let directory = tempdir().unwrap();
         let paths = app_paths(directory.path());

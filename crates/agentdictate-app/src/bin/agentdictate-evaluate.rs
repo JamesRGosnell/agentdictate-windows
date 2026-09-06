@@ -80,12 +80,13 @@ fn main() -> anyhow::Result<()> {
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
     anyhow::ensure!(!parsed.is_empty(), "empty case set");
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(output)?;
+    let mut options_file = fs::OpenOptions::new();
+    options_file.write(true).create_new(true);
+    #[cfg(unix)]
+    options_file.mode(0o600);
+    let mut file = options_file.open(output)?;
     let mut passed = 0;
     let mut count = 0;
     for case in parsed {
@@ -222,12 +223,13 @@ fn replay_live(
     let path = TempAudio(
         std::env::temp_dir().join(format!("agentdictate-replay-{}.wav", uuid::Uuid::new_v4())),
     );
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    let mut writer = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path.0)?;
+    let mut audio_file = fs::OpenOptions::new();
+    audio_file.create_new(true).write(true);
+    #[cfg(unix)]
+    audio_file.mode(0o600);
+    let mut writer = audio_file.open(&path.0)?;
     let mut header = Vec::new();
     header.extend_from_slice(b"RIFF");
     header.extend_from_slice(&0u32.to_le_bytes());

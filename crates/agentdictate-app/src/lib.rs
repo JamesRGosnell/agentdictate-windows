@@ -1,6 +1,8 @@
 //! AgentDictate process composition and production adapters.
 
-use std::{io, os::unix::fs::PermissionsExt, path::PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{io, path::PathBuf};
 
 mod captured_audio;
 mod chatgpt_dictation_import;
@@ -13,12 +15,17 @@ mod model_catalog;
 mod openai;
 mod overlay_process;
 mod process;
+#[cfg_attr(windows, path = "windows/startup.rs")]
 mod startup;
+#[cfg_attr(windows, path = "windows/system.rs")]
 mod system;
+#[cfg_attr(windows, path = "windows/tray.rs")]
 mod tray;
 mod workspace;
 
 pub use codex_subscription::CodexSubscriptionTransport;
+#[cfg(windows)]
+pub use codex_subscription::sign_in_with_chatgpt;
 pub use daemon::{CapturedRecording, Daemon, DaemonError, RecordingController};
 pub use diagnostics::init_file_logging;
 pub use hotkey_dispatch::{
@@ -65,6 +72,7 @@ impl AppPaths {
         self.cache.join("model-catalog.json")
     }
 
+    #[cfg(unix)]
     pub fn from_environment() -> io::Result<Self> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -88,6 +96,26 @@ impl AppPaths {
         ))
     }
 
+    #[cfg(windows)]
+    pub fn from_environment() -> io::Result<Self> {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not set"))?;
+        let root = std::env::var_os("AGENTDICTATE_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| local.join("AgentDictate"));
+        Ok(Self {
+            config_file: root.join("config.json"),
+            autostart_file: root.join("startup.json"),
+            daemon_service_file: root.join("daemon.json"),
+            database_file: root.join("agentdictate.sqlite"),
+            recordings: root.join("recordings"),
+            logs: root.join("logs"),
+            cache: root.join("cache"),
+            runtime: root.join("runtime"),
+        })
+    }
+
     pub fn ensure_directories(&self) -> io::Result<()> {
         for directory in [
             self.config_file.parent(),
@@ -101,6 +129,9 @@ impl AppPaths {
         .flatten()
         {
             std::fs::create_dir_all(directory)?;
+            #[cfg(windows)]
+            agentdictate_runtime::restrict_path(directory)?;
+            #[cfg(unix)]
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
         }
         Ok(())

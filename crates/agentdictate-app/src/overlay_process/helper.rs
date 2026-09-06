@@ -21,6 +21,7 @@ pub fn is_overlay_helper_argument(argument: Option<&str>) -> bool {
 
 #[cfg(feature = "desktop")]
 pub fn run_overlay_helper() -> anyhow::Result<()> {
+    #[cfg(unix)]
     if std::env::var_os("DISPLAY").is_none() {
         let message = "focus-neutral recording overlay requires X11 or XWayland";
         write_overlay_helper_status(&OverlayHelperStatus::Error {

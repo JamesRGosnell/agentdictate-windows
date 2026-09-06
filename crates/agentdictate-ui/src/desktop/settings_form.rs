@@ -432,6 +432,10 @@ fn settings_text_area(
     window: &mut Window,
     cx: &mut Context<SettingsShell>,
 ) -> Entity<InputState> {
+    // gpui-component 0.5.1 passes the entire placeholder's text run to each
+    // line, which panics in DirectWrite for multiline hints. Keep hints on one
+    // line; actual multiline values use the component's correctly sliced runs.
+    debug_assert!(!placeholder.contains('\n'));
     cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(placeholder)

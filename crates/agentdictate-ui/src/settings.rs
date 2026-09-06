@@ -63,7 +63,7 @@ macro_rules! settings_fields {
                 vocabulary: String {
                     from: vocabulary_display,
                     apply: validate_field(parsed_vocabulary),
-                    placeholder: "Leadlord = lead lord\nClaude Code",
+                    placeholder: "Example: Leadlord = lead lord",
                     rows: 3..=8,
                 },
                 project_context: String {

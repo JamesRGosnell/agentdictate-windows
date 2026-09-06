@@ -1,11 +1,11 @@
+#[cfg(unix)]
 use std::{
     ffi::{CString, OsString},
     fs::File,
-    io::{self, Read},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    },
+    io::Read,
+};
+use std::{
+    io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{
@@ -13,6 +13,17 @@ use std::{
         mpsc::{Receiver, channel},
     },
 };
+
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::ffi::OsStrExt,
+};
+#[cfg(windows)]
+#[path = "windows/watcher.rs"]
+mod windows_watcher;
+#[cfg(windows)]
+use windows_watcher::DatabaseChangeWatcher;
 
 use agentdictate_core::{
     ClientCommand, DEFAULT_HISTORY_PAGE_SIZE, HISTORY_CONTINUATION_PAGE_SIZE, HistoryPageCursor,
@@ -377,11 +388,13 @@ impl WorkspaceClient {
     }
 }
 
+#[cfg(unix)]
 struct DatabaseChangeWatcher {
     descriptor: File,
     watched_names: Vec<Vec<u8>>,
 }
 
+#[cfg(unix)]
 impl DatabaseChangeWatcher {
     fn new(database_file: &Path) -> io::Result<Self> {
         Self::for_files(database_file, None)

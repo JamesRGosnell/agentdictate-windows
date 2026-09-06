@@ -32,7 +32,13 @@ fn upload_file_name(audio_path: &Path, extension: &str) -> String {
 }
 
 fn encode_ogg_opus(audio_path: &Path) -> Result<Vec<u8>, ExternalError> {
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command
         .args(["-loglevel", "error", "-i"])
         .arg(audio_path)
         .args(["-ac", "1", "-ar", "16000", "-c:a", "libopus"])

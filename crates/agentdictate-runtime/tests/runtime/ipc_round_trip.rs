@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(unix)]
 use std::{fs, io};
 
 use agentdictate_runtime::{
@@ -63,6 +64,7 @@ fn start_recording_round_trip_and_reconnect_snapshot_use_a_private_socket() {
         workflow,
     };
     let server = IpcServer::bind(&runtime_directory).unwrap();
+    #[cfg(unix)]
     assert_eq!(server.socket_mode().unwrap(), 0o600);
     let server_thread = thread::spawn(move || {
         let mut handler = handler;
@@ -198,10 +200,13 @@ fn second_server_cannot_unlink_an_active_service_socket() {
     let second = IpcServer::bind(&runtime_directory);
 
     assert!(matches!(second, Err(IpcError::AlreadyRunning { .. })));
+    #[cfg(unix)]
     assert_eq!(first.socket_mode().unwrap(), 0o600);
+    drop(first);
 }
 
 #[test]
+#[cfg(unix)]
 fn removing_the_socket_cannot_start_a_second_daemon_while_the_first_owns_the_lock() {
     let directory = TempDir::new().unwrap();
     let runtime_directory = directory.path().join("runtime");
@@ -215,6 +220,7 @@ fn removing_the_socket_cannot_start_a_second_daemon_while_the_first_owns_the_loc
 }
 
 #[test]
+#[cfg(unix)]
 fn binding_never_deletes_a_non_socket_at_the_service_path() {
     let directory = TempDir::new().unwrap();
     let runtime_directory = directory.path().join("runtime");
@@ -231,6 +237,7 @@ fn binding_never_deletes_a_non_socket_at_the_service_path() {
 }
 
 #[test]
+#[cfg(unix)]
 fn dropping_a_server_after_its_socket_disappears_allows_a_clean_rebind() {
     let directory = TempDir::new().unwrap();
     let runtime_directory = directory.path().join("runtime");
@@ -240,6 +247,7 @@ fn dropping_a_server_after_its_socket_disappears_allows_a_clean_rebind() {
 
     let replacement = IpcServer::bind(&runtime_directory).unwrap();
 
+    #[cfg(unix)]
     assert_eq!(replacement.socket_mode().unwrap(), 0o600);
 }
 

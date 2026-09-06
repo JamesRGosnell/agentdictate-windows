@@ -406,6 +406,9 @@ impl WindowsWindow {
 
             (WS_EX_APPWINDOW, dwstyle)
         };
+        if params.kind == WindowKind::PopUp && !params.focus {
+            dwexstyle |= WS_EX_NOACTIVATE;
+        }
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }

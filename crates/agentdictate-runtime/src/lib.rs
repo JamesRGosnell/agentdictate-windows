@@ -6,6 +6,7 @@ pub use agentdictate_core::{
     WorkflowPhase, WorkflowSignal,
 };
 
+#[cfg_attr(windows, path = "windows/ipc.rs")]
 mod ipc;
 pub use ipc::{IpcClient, IpcError, IpcHandler, IpcServer};
 mod external_dictation;
@@ -36,3 +37,9 @@ mod settings_store;
 pub use settings_store::{load_settings, save_settings};
 mod usage;
 pub use usage::{UsageAggregate, UsageMetric, UsagePoint, UsageSummary, UsageWeek};
+
+#[cfg(windows)]
+#[path = "windows/security.rs"]
+mod windows_security;
+#[cfg(windows)]
+pub use windows_security::restrict_path;

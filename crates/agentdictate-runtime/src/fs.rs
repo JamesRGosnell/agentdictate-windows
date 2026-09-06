@@ -1,12 +1,13 @@
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 /// Replaces `path` with fully written bytes using the requested Unix mode.
 ///
-/// The temporary file and its containing directory are synced before the
-/// function reports success.
+/// The temporary file is synced before publication. Unix also syncs the parent
+/// directory; Windows applies a protected current-user ACL before publication.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let parent = path
         .parent()
@@ -14,18 +15,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(mode))?;
+    #[cfg(windows)]
+    crate::restrict_path(temporary.path())?;
     temporary.write_all(bytes)?;
     temporary.as_file_mut().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
+    #[cfg(windows)]
+    let _ = mode;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -37,6 +45,7 @@ mod tests {
 
         write_atomic(&path, b"first\n", 0o640).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"first\n");
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
@@ -44,6 +53,7 @@ mod tests {
 
         write_atomic(&path, b"second\n", 0o600).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second\n");
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

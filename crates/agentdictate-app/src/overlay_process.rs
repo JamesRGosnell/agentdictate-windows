@@ -1,3 +1,4 @@
+#[cfg_attr(windows, path = "overlay_process/child_windows.rs")]
 mod child;
 mod helper;
 mod protocol;

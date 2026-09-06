@@ -12,7 +12,14 @@
   for every account.
 </p>
 
-## Install
+## Windows
+
+A native Windows port is available in this checkout. See [Windows installation,
+ChatGPT sign-in, and build instructions](docs/WINDOWS.md) and the
+[verification record](docs/windows-parity.md). Build a portable ZIP and per-user
+installer with `packaging/build-windows.ps1`.
+
+## Install on Linux
 
 These steps are tested on Ubuntu 24.04. The
 [system requirements](docs/INSTALL.md#requirements)

@@ -1,13 +1,17 @@
+#[cfg(unix)]
+use agentdictate_app::start_overlay_presenter_with_timeout;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use agentdictate_app::{
     ActiveRecordingUpdate, OverlayProcessAction, OverlayProcessState, OverlayUpdate,
-    start_overlay_presenter, start_overlay_presenter_with_timeout,
+    start_overlay_presenter,
 };
 use agentdictate_core::{JobId, Workflow, WorkflowSignal};
 use tempfile::tempdir;
@@ -106,6 +110,7 @@ fn helper_update_serializes_only_overlay_workflow_and_active_recording_metadata(
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn visible_overlay_is_relaunched_when_its_helper_exits_without_an_update() {
     let directory = tempdir().unwrap();
@@ -174,6 +179,7 @@ fn visible_overlay_is_relaunched_when_its_helper_exits_without_an_update() {
     assert!(received.contains("1726000000250"));
 }
 
+#[cfg(unix)]
 #[test]
 fn helper_error_before_readiness_is_killed_and_relaunched() {
     let directory = tempdir().unwrap();
@@ -229,6 +235,7 @@ fn helper_error_before_readiness_is_killed_and_relaunched() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn created_window_without_a_submitted_frame_is_killed_and_relaunched() {
     let directory = tempdir().unwrap();
@@ -284,6 +291,7 @@ fn created_window_without_a_submitted_frame_is_killed_and_relaunched() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn partial_readiness_message_cannot_bypass_the_startup_deadline() {
     let directory = tempdir().unwrap();
@@ -339,6 +347,7 @@ fn partial_readiness_message_cannot_bypass_the_startup_deadline() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn repeated_helper_crashes_are_bounded_until_a_new_visible_update_arrives() {
     let directory = tempdir().unwrap();
@@ -418,6 +427,7 @@ fn repeated_helper_crashes_are_bounded_until_a_new_visible_update_arrives() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn dismissal_acknowledges_only_after_the_helper_exits() {
     let directory = tempdir().unwrap();
@@ -471,6 +481,7 @@ fn dismissal_timeout_comfortably_covers_the_helper_fade() {
     assert!(agentdictate_app::OVERLAY_TEARDOWN_TIMEOUT >= 4 * agentdictate_ui::OVERLAY_FADE_HOLD);
 }
 
+#[cfg(unix)]
 #[test]
 fn presentation_error_after_a_frame_reports_unavailable_until_recovery() {
     let directory = tempdir().unwrap();

@@ -177,7 +177,10 @@ pub(crate) fn start_chatgpt_dictation_importer(
 ) -> io::Result<std::thread::JoinHandle<()>> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|home| PathBuf::from(home).join(".codex"))
+        })
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Codex home is unavailable"))?;
     std::thread::Builder::new()
         .name("agentdictate-chatgpt-usage".into())

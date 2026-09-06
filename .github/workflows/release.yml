@@ -55,3 +55,20 @@ jobs:
           files: |
             dist/*.deb
             dist/*.AppImage
+
+  windows:
+    name: Package Windows ${{ github.ref_name }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Build Windows package
+        shell: pwsh
+        run: ./packaging/build-windows.ps1
+      - name: Publish Windows artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/AgentDictate-Windows-x64.zip
+            dist/AgentDictate-Windows-x64.zip.sha256

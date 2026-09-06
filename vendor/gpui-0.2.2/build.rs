@@ -342,7 +342,9 @@ mod windows {
             && output.status.success()
         {
             let path = String::from_utf8_lossy(&output.stdout);
-            return path.trim().to_string();
+            if let Some(path) = path.lines().next() {
+                return path.trim().to_string();
+            }
         }
 
         // Check the default path
@@ -353,7 +355,35 @@ mod windows {
                 .to_string();
         }
 
-        panic!("Failed to find fxc.exe");
+        // Windows SDK versions vary across machines; accept any installed x64
+        // SDK instead of requiring one hard-coded version.
+        let sdk_bin = std::env::var_os("ProgramFiles(x86)")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)"))
+            .join("Windows Kits/10/bin");
+        let mut candidates: Vec<_> = std::fs::read_dir(sdk_bin)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("x64/fxc.exe"))
+            .filter(|path| path.is_file())
+            .collect();
+        candidates.sort_by_key(|path| {
+            path.parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .map(|name| {
+                    name.to_string_lossy()
+                        .split('.')
+                        .filter_map(|part| part.parse::<u32>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        if let Some(path) = candidates.last() {
+            return path.to_string_lossy().into_owned();
+        }
+        panic!("Failed to find fxc.exe; install a Windows SDK or set GPUI_FXC_PATH");
     }
 
     fn compile_shader_for_module(

@@ -109,6 +109,8 @@ fn run_settings_shell_internal(
                     ..Default::default()
                 },
                 move |window, cx| {
+                    #[cfg(windows)]
+                    window.set_window_title("AgentDictate");
                     let view = cx.new(|cx| {
                         SettingsShell::connected_internal(
                             model,
@@ -164,10 +166,15 @@ fn run_settings_shell_internal(
 /// Runs a focus-neutral X11 overlay. Placement completes before its first
 /// animated frame; frame submission is acknowledged separately from creation.
 #[doc(hidden)]
+#[cfg(windows)]
+type OverlayWindowId = usize;
+#[cfg(unix)]
+type OverlayWindowId = u32;
+
 pub fn run_recording_overlay(
     initial: OverlayPresentation,
     snapshots: Receiver<OverlayPresentation>,
-    on_created: impl FnOnce(u32, f32) + 'static,
+    on_created: impl FnOnce(OverlayWindowId, f32) + 'static,
     on_frame_submitted: impl FnOnce() + 'static,
 ) {
     Application::new()
@@ -220,11 +227,11 @@ pub fn run_recording_overlay(
                     let handle = HasWindowHandle::window_handle(window)
                         .expect("overlay native window handle should exist");
                     let id = match handle.as_raw() {
-                        RawWindowHandle::Xcb(handle) => handle.window.get(),
-                        RawWindowHandle::Xlib(handle) => {
-                            u32::try_from(handle.window).expect("X11 window id fits in u32")
-                        }
-                        _ => panic!("focus-neutral recording overlay requires X11 or XWayland"),
+                        RawWindowHandle::Xcb(handle) => handle.window.get() as OverlayWindowId,
+                        RawWindowHandle::Xlib(handle) => handle.window as OverlayWindowId,
+                        #[cfg(windows)]
+                        RawWindowHandle::Win32(handle) => handle.hwnd.get() as usize,
+                        _ => panic!("unsupported overlay window backend"),
                     };
                     on_created(id, window.scale_factor());
                     cx.new(|_| {

@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use std::sync::Arc;
 
 use agentdictate_app::{
@@ -10,11 +11,53 @@ use agentdictate_ui::{
     run_settings_shell_with_workspace_actions_and_updates,
 };
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(u32::MAX);
+        let id: Vec<u16> = "local.agentdictate.AgentDictate"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+    }
+    if let Err(error) = run() {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::{
+                System::Console::GetConsoleWindow, UI::WindowsAndMessaging::*,
+            };
+            if GetConsoleWindow().is_null()
+                && (std::env::args().len() == 1
+                    || std::env::args().nth(1).as_deref() == Some("login"))
+            {
+                let message: Vec<u16> =
+                    format!("{error:#}").encode_utf16().chain(Some(0)).collect();
+                let title: Vec<u16> = "AgentDictate".encode_utf16().chain(Some(0)).collect();
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    message.as_ptr(),
+                    title.as_ptr(),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        }
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let paths = AppPaths::from_environment()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if args.as_slice() == ["login"] {
+        return agentdictate_app::sign_in_with_chatgpt();
+    }
     if !args.is_empty() {
         let command = match args.as_slice() {
+            [command] if command == "quit" => ClientCommand::quit(1),
+            [command] if command == "status" => ClientCommand::get_snapshot(1),
             [command] if command == "stop" => ClientCommand::stop_recording(1),
             [command] if command == "cancel" => ClientCommand::cancel(1),
             [command] if command == "start" => ClientCommand::start_recording(1),
@@ -22,11 +65,15 @@ fn main() -> anyhow::Result<()> {
                 ClientCommand::start_recording_in_mode(1, mode.parse().map_err(anyhow::Error::msg)?)
             }
             _ => anyhow::bail!(
-                "Usage: agentdictate [start [--mode dictate|literal] | stop | cancel]"
+                "Usage: agentdictate [start [--mode dictate|literal] | stop | cancel | status | quit | login]"
             ),
         };
         let (mut client, _) = IpcClient::connect(&paths.runtime)?;
-        if let ServerMessageKind::CommandRejected { error, .. } = client.send(command)?.kind {
+        let response = client.send(command)?;
+        if args[0] == "status" {
+            println!("{}", serde_json::to_string(&response)?);
+        }
+        if let ServerMessageKind::CommandRejected { error, .. } = response.kind {
             anyhow::bail!(error);
         }
         return Ok(());
@@ -117,7 +164,11 @@ fn main() -> anyhow::Result<()> {
 fn connect_or_start_daemon(
     paths: &AppPaths,
 ) -> anyhow::Result<(IpcClient, agentdictate_core::ServerMessage)> {
-    let daemon = std::env::current_exe()?.with_file_name("agentdictated");
+    let daemon = std::env::current_exe()?.with_file_name(if cfg!(windows) {
+        "agentdictated.exe"
+    } else {
+        "agentdictated"
+    });
     bootstrap_daemon_service(&paths.runtime, &paths.daemon_service_file, &daemon)?;
     IpcClient::connect(&paths.runtime).map_err(Into::into)
 }

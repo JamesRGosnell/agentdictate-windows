@@ -256,7 +256,10 @@ fn temporary_wav(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "agentdictate-overlay-{label}-{}-{}.wav",
         std::process::id(),
-        std::thread::current().name().unwrap_or("test")
+        std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace(':', "-")
     ))
 }
 

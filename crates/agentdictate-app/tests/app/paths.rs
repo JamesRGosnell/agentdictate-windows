@@ -1,4 +1,5 @@
 use agentdictate_app::AppPaths;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -56,6 +57,7 @@ fn ensuring_paths_prepares_every_runtime_parent_without_touching_files() {
         &paths.runtime,
     ] {
         assert!(expected.is_dir(), "{} was not created", expected.display());
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(expected).unwrap().permissions().mode() & 0o777,
             0o700

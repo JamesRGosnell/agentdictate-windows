@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -28,6 +29,7 @@ impl Runtime {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let path = path.as_ref();
         let mut connection = Connection::open(path)?;
+        #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         connection.execute_batch(SCHEMA)?;
         ensure_runtime_id_column(&connection)?;

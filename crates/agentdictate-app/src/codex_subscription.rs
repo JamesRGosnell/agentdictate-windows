@@ -54,6 +54,7 @@ impl CodexAppServerAuthProvider {
     fn discover() -> Self {
         let binary = std::env::var_os("CODEX_BINARY")
             .map(PathBuf::from)
+            .or_else(windows_codex_binary)
             .or_else(|| {
                 std::env::var_os("HOME")
                     .map(PathBuf::from)
@@ -345,12 +346,21 @@ fn load_auth_from_app_server(
     refresh: bool,
 ) -> Result<ChatGptAuth, CodexSubscriptionError> {
     let mut command = Command::new(codex_binary);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
     command
         .args(["app-server", "--stdio"])
         .env_remove("OPENAI_API_KEY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(windows)]
+    if let Some(home) = windows_auth_home() {
+        command.env("CODEX_HOME", home);
+    }
     let mut child = command
         .spawn()
         .map_err(|_| CodexSubscriptionError::AppServerUnavailable)?;
@@ -687,4 +697,98 @@ mod tests {
             Err(CodexSubscriptionError::ChatGptSignInRequired)
         ));
     }
+}
+
+#[cfg(not(windows))]
+fn windows_codex_binary() -> Option<PathBuf> {
+    None
+}
+#[cfg(windows)]
+fn windows_codex_binary() -> Option<PathBuf> {
+    // Prefer an executable distributed with the installed desktop app; never read credentials.
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let exe = dir.join("codex.exe");
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        for suffix in [
+            "Programs/OpenAI/Codex/bin/codex.exe",
+            "Programs/Codex/resources/codex.exe",
+            "Programs/codex/resources/codex.exe",
+        ] {
+            let exe = PathBuf::from(&local).join(suffix);
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    // AppX inventory returns installation paths only, without touching the Codex login cache.
+    let mut command = Command::new("powershell.exe");
+    use std::os::windows::process::CommandExt;
+    let output = command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-AppxPackage *Codex* | Select-Object -ExpandProperty InstallLocation",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+    for location in String::from_utf8_lossy(&output.stdout).lines() {
+        for suffix in [
+            "app/resources/codex.exe",
+            "resources/codex.exe",
+            "app/resources/bin/codex.exe",
+        ] {
+            let exe = PathBuf::from(location.trim()).join(suffix);
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_auth_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("AGENTDICTATE_CODEX_HOME") {
+        return Some(PathBuf::from(home));
+    }
+    let home = crate::AppPaths::from_environment()
+        .ok()?
+        .config_file
+        .parent()?
+        .join("codex-login");
+    home.is_dir().then_some(home)
+}
+#[cfg(windows)]
+pub fn sign_in_with_chatgpt() -> anyhow::Result<()> {
+    use std::os::windows::process::CommandExt;
+    let paths = crate::AppPaths::from_environment()?;
+    let home = std::env::var_os("AGENTDICTATE_CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(
+            paths
+                .config_file
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("configuration directory is missing"))?
+                .join("codex-login"),
+        );
+    std::fs::create_dir_all(&home)?;
+    agentdictate_runtime::restrict_path(&home)?;
+    let provider = CodexAppServerAuthProvider::discover();
+    let status = Command::new(provider.codex_binary)
+        .arg("login")
+        .env("CODEX_HOME", home)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .creation_flags(0x08000000)
+        .status()?;
+    anyhow::ensure!(status.success(), "ChatGPT sign-in did not complete");
+    Ok(())
 }

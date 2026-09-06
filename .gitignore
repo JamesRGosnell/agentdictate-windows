@@ -21,3 +21,6 @@ target/
 # Editor and OS files
 .DS_Store
 *~
+
+# Local Windows build toolchain and probes
+.windows-dev/

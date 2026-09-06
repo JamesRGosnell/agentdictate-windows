@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use agentdictate_runtime::{
@@ -57,6 +58,7 @@ fn settings_replacement_is_private_and_leaves_no_partial_file() {
     save_settings(&settings_path, &settings).unwrap();
 
     assert_eq!(load_settings(&settings_path).unwrap().hotkey, "Alt+Space");
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777,
         0o600

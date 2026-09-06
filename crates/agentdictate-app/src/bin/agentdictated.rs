@@ -1,7 +1,5 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+#![cfg_attr(windows, windows_subsystem = "windows")]
+use std::sync::{Arc, Mutex};
 
 use agentdictate_app::{
     AgentProcess, AppPaths, SERVICE_ARGUMENT, START_SERVICE_ARGUMENT, bootstrap_daemon_service,
@@ -9,9 +7,15 @@ use agentdictate_app::{
     settings_executable_for_current_process, start_hotkey_listener, start_overlay_presenter,
     start_system_tray,
 };
+#[cfg(unix)]
 use agentdictate_core::{ClientCommand, ServerMessageKind};
-use agentdictate_runtime::{IpcClient, IpcServer};
+#[cfg(unix)]
+use agentdictate_runtime::IpcClient;
+use agentdictate_runtime::IpcServer;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn main() -> anyhow::Result<()> {
@@ -121,6 +125,7 @@ fn run_daemon(paths: AppPaths) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn start_signal_listener(runtime: std::path::PathBuf) -> anyhow::Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
@@ -144,5 +149,10 @@ fn start_signal_listener(runtime: std::path::PathBuf) -> anyhow::Result<()> {
                 tracing::error!(%error, "graceful shutdown request failed");
             }
         })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn start_signal_listener(_runtime: std::path::PathBuf) -> anyhow::Result<()> {
     Ok(())
 }

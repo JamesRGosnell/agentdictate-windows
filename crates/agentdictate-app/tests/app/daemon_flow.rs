@@ -1,12 +1,12 @@
-use std::{
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-};
+#[cfg(unix)]
+use agentdictate_app::{OverlayUpdate, start_overlay_presenter};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
-use agentdictate_app::{
-    AppPaths, CapturedRecording, Daemon, OverlayUpdate, RecordingController,
-    start_overlay_presenter,
-};
+use agentdictate_app::{AppPaths, CapturedRecording, Daemon, RecordingController};
 use agentdictate_core::{HistoryPageRequest, HotkeyReadiness, JobStage, Settings, WorkflowPhase};
 use agentdictate_runtime::{
     Deliverer, DeliveryDisposition, ExternalError, HistoryQuery, Recorder, RecordingJob, Runtime,
@@ -113,11 +113,13 @@ impl Deliverer for SubmittedDelivery {
     }
 }
 
+#[cfg(unix)]
 struct ExitInspectingDelivery {
     helper_exited: PathBuf,
     delivered_after_exit: bool,
 }
 
+#[cfg(unix)]
 impl Deliverer for ExitInspectingDelivery {
     fn deliver(&mut self, _job: &RecordingJob) -> Result<DeliveryDisposition, ExternalError> {
         self.delivered_after_exit = self.helper_exited.is_file();
@@ -178,6 +180,7 @@ fn daemon_checkpoints_audio_before_capture_and_transcript_before_delivery() {
 }
 
 #[test]
+#[cfg(unix)]
 fn daemon_waits_for_overlay_exit_before_delivery() {
     let directory = tempdir().unwrap();
     let paths = app_paths(directory.path());
