@@ -233,6 +233,11 @@ impl<S: SpeechTransport, C: CleanupTransport> Transcriber for TranscriptionPipel
         let raw = if !job.raw_transcript.trim().is_empty() {
             job.raw_transcript.clone()
         } else {
+            if crate::captured_audio::is_accidental_tap(&job.audio_path) {
+                self.speech.cancel_recording(job.id);
+                tracing::info!(job_id = %job.id, "quick shortcut release contained less than 50 ms of audio");
+                return Err(ExternalError::NoSpeech);
+            }
             match self.speech.transcribe_audio(TranscriptionRequest {
                 keywords: &keywords,
                 audio_path: &job.audio_path,

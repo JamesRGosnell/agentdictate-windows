@@ -60,12 +60,38 @@ struct SubmittedDelivery {
 #[test]
 fn empty_dictation_finishes_without_delivery_history_or_recovery_and_allows_the_next_start() {
     struct Empty;
-    impl agentdictate_runtime::Transcriber for Empty {
-        fn transcribe(
+    impl agentdictate_app::SpeechTransport for Empty {
+        fn transcribe_audio(
             &mut self,
-            _: &RecordingJob,
-        ) -> Result<agentdictate_runtime::Transcript, ExternalError> {
-            Err(ExternalError::NoSpeech)
+            _: agentdictate_app::TranscriptionRequest<'_>,
+        ) -> Result<String, ExternalError> {
+            panic!("an accidental tap must not be uploaded")
+        }
+    }
+    impl agentdictate_app::CleanupTransport for Empty {
+        fn cleanup_text(
+            &mut self,
+            _: agentdictate_app::CleanupRequest<'_>,
+        ) -> Result<String, ExternalError> {
+            panic!("an accidental tap must not trigger cleanup")
+        }
+    }
+    struct TapRecorder;
+    impl Recorder for TapRecorder {
+        fn start(&mut self, job: &RecordingJob) -> Result<(), ExternalError> {
+            let mut wav = b"RIFF\x64\x01\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data\x40\x01\0\0".to_vec();
+            for _ in 0..160 {
+                wav.extend_from_slice(&2000i16.to_le_bytes());
+            }
+            std::fs::write(&job.audio_path, wav).unwrap();
+            Ok(())
+        }
+    }
+    impl RecordingController for TapRecorder {
+        fn finish(&mut self, _: &RecordingJob) -> Result<CapturedRecording, ExternalError> {
+            Ok(CapturedRecording {
+                duration_seconds: 0.01,
+            })
         }
     }
     let dir = tempdir().unwrap();
@@ -76,8 +102,8 @@ fn empty_dictation_finishes_without_delivery_history_or_recovery_and_allows_the_
         runtime,
         Settings::default(),
         paths.clone(),
-        PreservingRecorder::default(),
-        Empty,
+        TapRecorder,
+        agentdictate_app::TranscriptionPipeline::new(Settings::default(), Empty, Empty),
         SubmittedDelivery::default(),
     );
     daemon.start_recording().unwrap();

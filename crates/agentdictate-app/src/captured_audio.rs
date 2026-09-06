@@ -60,6 +60,26 @@ pub(crate) fn is_near_silent(path: &Path) -> bool {
     inspect_quiet_pcm(path).unwrap_or(false)
 }
 
+/// A quick shortcut release can finalize only one 10 ms input buffer. Skip
+/// these accidental taps before ASR; keep clips of 50 ms or more, including
+/// short words. Inspect the finalized PCM rather than trusting job duration.
+pub(crate) fn is_accidental_tap(path: &Path) -> bool {
+    let inspect = || -> anyhow::Result<bool> {
+        let mut file = File::open(path)?;
+        let start = data_start(&mut file)?;
+        file.seek(SeekFrom::Start(start - 4))?;
+        let mut length = [0; 4];
+        file.read_exact(&mut length)?;
+        let bytes = u64::from(u32::from_le_bytes(length));
+        anyhow::ensure!(
+            bytes % 2 == 0 && start + bytes <= file.metadata()?.len(),
+            "invalid PCM length"
+        );
+        Ok(bytes < 1600) // 50 ms of mono 16 kHz PCM16.
+    };
+    inspect().unwrap_or(false)
+}
+
 fn inspect_quiet_pcm(path: &Path) -> anyhow::Result<bool> {
     let mut file = File::open(path)?;
     let start = data_start(&mut file)?;
@@ -93,6 +113,34 @@ fn inspect_quiet_pcm(path: &Path) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accidental_taps_use_validated_pcm_length_and_preserve_short_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.wav");
+        for (samples, skipped) in [
+            (0, true),
+            (160, true),
+            (799, true),
+            (800, false),
+            (1600, false),
+        ] {
+            let mut wav = b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data\0\0\0\0".to_vec();
+            wav[4..8].copy_from_slice(&(36u32 + samples * 2).to_le_bytes());
+            wav[40..44].copy_from_slice(&(samples * 2).to_le_bytes());
+            for _ in 0..samples {
+                wav.extend_from_slice(&2000i16.to_le_bytes());
+            }
+            std::fs::write(&path, wav).unwrap();
+            assert_eq!(is_accidental_tap(&path), skipped);
+        }
+        let mut wav = std::fs::read(&path).unwrap();
+        wav.truncate(100); // A truncated longer recording must remain recoverable.
+        std::fs::write(&path, wav).unwrap();
+        assert!(!is_accidental_tap(&path));
+        std::fs::write(&path, b"broken recording").unwrap();
+        assert!(!is_accidental_tap(&path));
+        assert!(!is_accidental_tap(&dir.path().join("missing.wav")));
+    }
     #[test]
     fn quiet_pcm_ignores_metadata_but_never_accepts_audible_or_invalid_audio() {
         let dir = tempfile::tempdir().unwrap();

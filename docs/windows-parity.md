@@ -10,7 +10,7 @@ the full-parity acceptance record remains open for that check.
 
 | Area | Windows implementation | Evidence |
 | --- | --- | --- |
-| Shared workflow, recovery, settings, history, usage, replacements, vocabulary | Original core/runtime/app code | Full workspace gate: 352 Rust tests passed; one live-account test intentionally excluded from offline execution |
+| Shared workflow, recovery, settings, history, usage, replacements, vocabulary | Original core/runtime/app code | Full workspace gate: 353 Rust tests passed; one live-account test intentionally excluded from offline execution |
 | Interface and all routes | Original GPUI/component UI with Windows backend | 56 rendered/headless desktop tests and 48 UI contracts passed; eight native Settings fixtures cover both providers, empty/multiline Unicode values, and narrow/wide windows |
 | ChatGPT subscription | Original Codex app-server authentication, refresh, endpoint, request and error handling; separate Windows login profile | Browser sign-in succeeded; live synthetic speech transcription returned the expected sentence |
 | Paid API route, cleanup and streaming | Existing optional transports retained | Mock HTTP/WebSocket and failure/fallback tests passed; no paid key configured or paid calls made |
@@ -66,6 +66,15 @@ style and normal-window titlebar insets, producing the stray white frame and
 offset content. It now uses `WS_POPUP`, skips that non-client path, and starts
 with valid nonzero bounds before final placement. The full gate checks the
 native frame contract and captures all three visible states for inspection.
+
+Quick shortcut releases were producing valid 10 ms WAV files that received HTTP
+500 from the subscription endpoint. Finalized PCM captures below 50 ms now
+finish through the existing no-speech path before a finalized transcription
+request, without paste or a new recovery error. The subscription route avoids
+upload entirely; any active optional API stream is canceled. The guard validates actual PCM length and leaves
+longer clips, unknown/corrupt files, and existing transcript checkpoints intact.
+Unit boundaries and the daemon/pipeline integration test cover this behavior;
+the existing 100 ms short-word and network-error regression still passes.
 
 Remaining user check: choose Hold mode, hold Ctrl+Space while speaking in T3
 Code, and release it. Confirm one paste. The user chose to perform this later.
