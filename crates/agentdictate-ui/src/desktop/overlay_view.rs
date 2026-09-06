@@ -6,6 +6,11 @@ use crate::{
     overlay_opacity,
 };
 
+#[cfg(windows)]
+const OVERLAY_FONT: &str = "Segoe UI";
+#[cfg(not(windows))]
+const OVERLAY_FONT: &str = "Sans";
+
 /// Per-dot opacities for the processing ellipsis: a soft sequential pulse
 /// derived from wall-clock time so every frame is deterministic to render.
 fn busy_dot_alphas() -> [f32; 3] {
@@ -168,8 +173,8 @@ impl Render for RecordingOverlay {
         });
         let timer = crate::format_elapsed(elapsed);
         let timer_color: Hsla = gpui::rgba(0xf5f5f5f0).into();
-        let mut timer_style = window.text_style().highlight(gpui::FontWeight::BOLD);
-        timer_style.font_family = "Sans".into();
+        let mut timer_style = window.text_style().highlight(gpui::FontWeight::MEDIUM);
+        timer_style.font_family = OVERLAY_FONT.into();
         let timer_run = gpui::TextRun {
             len: timer.len(),
             font: timer_style.font(),
@@ -186,7 +191,7 @@ impl Render for RecordingOverlay {
         );
         let recording_layout = crate::recording_overlay_layout(timer_width);
         let bars = crate::waveform_bars(self.waveform.levels(), recording_layout.waveform);
-        let waveform_color: Hsla = gpui::rgb(0xf04a1f).into();
+        let waveform_color: Hsla = gpui::rgb(0xe6a48a).into();
 
         gpui::div()
             .debug_selector(move || stable_id)
@@ -196,28 +201,23 @@ impl Render for RecordingOverlay {
             .when(self.state.is_visible(), |root| {
                 root.child(
                     gpui::div()
-                        .absolute()
-                        .left(px(6.))
-                        .top(px(8.))
-                        .w(px(127.))
-                        .h(px(42.))
-                        .rounded(px(14.))
-                        .bg(gpui::rgba(0x0000003d)),
-                )
-                .child(
-                    gpui::div()
                         .debug_selector(|| "recording-overlay-card".to_owned())
                         .absolute()
-                        .left(px(6.))
+                        .left(px(8.))
                         .top(px(6.))
-                        .w(px(127.))
-                        .h(px(42.))
-                        .relative()
+                        .w(px(184.))
+                        .h(px(40.))
                         .overflow_hidden()
-                        .rounded(px(14.))
+                        .rounded(px(20.))
                         .border_1()
-                        .border_color(gpui::rgba(0xffffff1c))
-                        .bg(gpui::rgba(0x111112f2))
+                        .border_color(gpui::rgba(0xffffff26))
+                        .bg(gpui::rgba(0x202023f5))
+                        .shadow(vec![gpui::BoxShadow {
+                            color: gpui::rgba(0x00000040).into(),
+                            offset: gpui::point(px(0.), px(3.)),
+                            blur_radius: px(6.),
+                            spread_radius: px(0.),
+                        }])
                         .when(recording, |card| {
                             card.children(bars.into_iter().enumerate().map(|(index, bar)| {
                                 gpui::div()
@@ -234,6 +234,15 @@ impl Render for RecordingOverlay {
                             }))
                             .child(
                                 gpui::div()
+                                    .absolute()
+                                    .left(px(recording_layout.timer_x - 11.))
+                                    .top(px(12.))
+                                    .w(px(1.))
+                                    .h(px(16.))
+                                    .bg(gpui::rgba(0xffffff1c)),
+                            )
+                            .child(
+                                gpui::div()
                                     .debug_selector(|| "recording-overlay-timer".to_owned())
                                     .absolute()
                                     .left(px(recording_layout.timer_x))
@@ -243,8 +252,8 @@ impl Render for RecordingOverlay {
                                     .flex()
                                     .items_center()
                                     .text_size(px(13.))
-                                    .font_family("Sans")
-                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .font_family(OVERLAY_FONT)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(timer_color)
                                     .child(timer),
                             )
@@ -256,14 +265,14 @@ impl Render for RecordingOverlay {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .gap(px(5.))
-                                    .px_3()
+                                    .gap(px(12.))
+                                    .px(px(16.))
                                     .overflow_hidden()
                                     .whitespace_nowrap()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_size(px(13.))
+                                    .font_family(OVERLAY_FONT)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(gpui::rgba(0xf5f5f5f5))
-                                    .child(if busy { busy_label } else { label })
                                     .when(busy, |row| {
                                         row.child(
                                             gpui::div()
@@ -274,7 +283,7 @@ impl Render for RecordingOverlay {
                                                     busy_dot_alphas.into_iter().enumerate().map(
                                                         |(index, alpha)| {
                                                             let dot_color: Hsla =
-                                                                gpui::rgb(0xf5f5f5).into();
+                                                                gpui::rgb(0xe6a48a).into();
                                                             gpui::div()
                                                                 .debug_selector(move || {
                                                                     format!(
@@ -289,7 +298,10 @@ impl Render for RecordingOverlay {
                                                     ),
                                                 ),
                                         )
-                                    }),
+                                    })
+                                    .child(gpui::div()
+                                        .debug_selector(|| "recording-overlay-status-label".to_owned())
+                                        .child(if busy { busy_label } else { label })),
                             )
                         }),
                 )

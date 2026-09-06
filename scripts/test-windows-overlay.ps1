@@ -1,8 +1,8 @@
 [CmdletBinding()]
-param([string]$Binary)
+param([string]$Binary, [ValidateSet('recording','transcribing','cleaning')][string]$State = 'recording')
 if (!$Binary) { $Binary = Join-Path (Split-Path $PSScriptRoot) 'target/debug/agentdictated.exe' }
 $ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @'
+Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System;
 using System.IO;
 using System.Text;
@@ -28,6 +28,9 @@ public class AgentDictateOverlayProbe {
  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd,out int pid);
  [DllImport("user32.dll")] static extern IntPtr GetWindowLongPtr(IntPtr hwnd,int index);
  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd,out RECT rect);
+ [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd,out RECT rect);
+ [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd,ref POINT point);
+ [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr hwnd,IntPtr dc,uint flags);
  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
  [StructLayout(LayoutKind.Sequential)] struct POINT {public int x,y;}
@@ -64,9 +67,19 @@ public class AgentDictateOverlayProbe {
     if(!status.ToString().Contains("frame_submitted"))throw new Exception("Overlay did not submit a frame: "+status);
     bool found=false;EnumDesktopWindows(desktop,delegate(IntPtr hwnd,IntPtr state){int pid;GetWindowThreadProcessId(hwnd,out pid);if(pid!=pi.pid)return true;long style=GetWindowLongPtr(hwnd,-20).ToInt64();RECT rect;GetWindowRect(hwnd,out rect);if(IsWindowVisible(hwnd)&&rect.right-rect.left>50&&rect.bottom-rect.top>20){if((style&0x08000000)==0||(style&0x80)==0)throw new Exception("Overlay is missing no-activate/tool-window styles: "+style.ToString("X")+" bounds "+rect.left+","+rect.top+","+rect.right+","+rect.bottom);var info=new MONITORINFO{size=Marshal.SizeOf(typeof(MONITORINFO))};
       if(!GetMonitorInfo(MonitorFromPoint(new POINT(),1),ref info))throw new Exception("Monitor metrics unavailable");
-      var scale=GetDpiForWindow(hwnd)/96.0;var width=(int)Math.Round(143*scale);var height=(int)Math.Round(56*scale);var gap=(int)Math.Round(72*scale);
+      long normalStyle=GetWindowLongPtr(hwnd,-16).ToInt64();
+      if((normalStyle&0x80000000L)==0||(normalStyle&0x00C40000L)!=0)throw new Exception("Overlay must be a borderless WS_POPUP, without caption or resize frame");
+      RECT client;var origin=new POINT();
+      if(!GetClientRect(hwnd,out client)||!ClientToScreen(hwnd,ref origin)||client.right!=rect.right-rect.left||client.bottom!=rect.bottom-rect.top||origin.x!=rect.left||origin.y!=rect.top)throw new Exception("Overlay has a non-client frame or inset");
+      var scale=GetDpiForWindow(hwnd)/96.0;var width=(int)Math.Round(200*scale);var height=(int)Math.Round(56*scale);var gap=(int)Math.Round(72*scale);
       int expectedX=info.work.left+(info.work.right-info.work.left-width)/2;int expectedY=info.work.bottom-height-gap;
       if(Math.Abs(rect.left-expectedX)>2||Math.Abs(rect.top-expectedY)>2||Math.Abs(rect.right-rect.left-width)>2||Math.Abs(rect.bottom-rect.top-height)>2)throw new Exception("Overlay is not centered above the primary taskbar: actual "+rect.left+","+rect.top+","+rect.right+","+rect.bottom+" expected "+expectedX+","+expectedY+","+width+","+height);
+      using(var bitmap=new System.Drawing.Bitmap(rect.right-rect.left,rect.bottom-rect.top)){
+       using(var graphics=System.Drawing.Graphics.FromImage(bitmap)){
+        var dc=graphics.GetHdc();try{PrintWindow(hwnd,dc,2);}finally{graphics.ReleaseHdc(dc);}
+       }
+       bitmap.Save(Path.Combine(data,"overlay.png"),System.Drawing.Imaging.ImageFormat.Png);
+      }
       found=true;}return true;},IntPtr.Zero);
     if(!found)throw new Exception("No native overlay window found");
    }
@@ -87,6 +100,25 @@ New-Item -ItemType Directory -Force -Path $taskProbeData | Out-Null
 $previousDataHome = $env:AGENTDICTATE_DATA_HOME
 try {
     $env:AGENTDICTATE_DATA_HOME = $taskProbeData
-    $taskOverlayJson = @{workflow=@{phase=@{phase='recording';job_id=[guid]::NewGuid().ToString()}};active_recording=$null} | ConvertTo-Json -Depth 5 -Compress
+    $taskPhase = @{phase='recording';job_id=[guid]::NewGuid().ToString()}
+    if ($State -ne 'recording') { $taskPhase.phase = 'processing'; $taskPhase.stage = $State }
+    $taskActiveRecording = $null
+    if ($State -eq 'recording') {
+        $taskWavePath = Join-Path $taskProbeData 'synthetic-waveform.wav'
+        $taskWriter = [IO.BinaryWriter]::new([IO.File]::Create($taskWavePath))
+        try {
+            $taskWriter.Write([Text.Encoding]::ASCII.GetBytes('RIFF')); $taskWriter.Write([int]5668)
+            $taskWriter.Write([Text.Encoding]::ASCII.GetBytes('WAVEfmt ')); $taskWriter.Write([int]16)
+            $taskWriter.Write([int16]1); $taskWriter.Write([int16]1); $taskWriter.Write([int]16000)
+            $taskWriter.Write([int]32000); $taskWriter.Write([int16]2); $taskWriter.Write([int16]16)
+            $taskWriter.Write([Text.Encoding]::ASCII.GetBytes('data')); $taskWriter.Write([int]5632)
+            for ($taskSample = 0; $taskSample -lt 2816; $taskSample++) {
+                $taskWriter.Write([int16](22000 * [Math]::Sin($taskSample * 0.17) * (0.55 + 0.45 * [Math]::Sin($taskSample * 0.007))))
+            }
+        } finally { $taskWriter.Dispose() }
+        $taskActiveRecording = @{audio_path=$taskWavePath;started_at_unix_millis=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 6000}
+    }
+    $taskOverlayJson = @{workflow=@{phase=$taskPhase};active_recording=$taskActiveRecording} | ConvertTo-Json -Depth 5 -Compress
     [AgentDictateOverlayProbe]::Run([IO.Path]::GetFullPath($Binary),$taskProbeData,$taskOverlayJson)
+    Write-Host "Native window capture: $taskProbeData\overlay.png"
 } finally { $env:AGENTDICTATE_DATA_HOME = $previousDataHome }

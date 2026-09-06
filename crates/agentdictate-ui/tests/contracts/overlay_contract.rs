@@ -230,7 +230,7 @@ fn timer_width_dynamically_reserves_non_overlapping_waveform_space() {
         let bars = waveform_bars(&[0.0; 20], layout.waveform);
         let last_bar = bars.last().expect("twenty bars are laid out");
 
-        assert_close(layout.timer_x + layout.timer_width, 117.0);
+        assert_close(layout.timer_x + layout.timer_width, 168.0);
         assert!(last_bar.x + last_bar.width <= layout.timer_x - 8.0 + f32::EPSILON);
         assert!(layout.waveform.x >= 12.0);
         assert!(layout.timer_x >= 0.0);

@@ -377,11 +377,14 @@ impl WindowsWindow {
             directx_devices,
         } = creation_info;
         register_window_class(icon);
-        let hide_title_bar = params
-            .titlebar
-            .as_ref()
-            .map(|titlebar| titlebar.appears_transparent)
-            .unwrap_or(true);
+        // Popup windows have no non-client area. Applying the normal custom
+        // titlebar path would add resize insets and DWM frame margins anyway.
+        let hide_title_bar = params.kind != WindowKind::PopUp
+            && params
+                .titlebar
+                .as_ref()
+                .map(|titlebar| titlebar.appears_transparent)
+                .unwrap_or(true);
         let window_name = HSTRING::from(
             params
                 .titlebar
@@ -392,7 +395,9 @@ impl WindowsWindow {
         );
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
+            // Zero is WS_OVERLAPPED: CreateWindowEx adds a non-client frame.
+            // A true popup must have no system border or client-area inset.
+            (WS_EX_TOOLWINDOW, WS_POPUP)
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -440,15 +445,19 @@ impl WindowsWindow {
             directx_devices,
         };
         let creation_result = unsafe {
+            // CW_USEDEFAULT gives popup windows a zero-sized client area,
+            // which cannot initialize a DirectComposition swap chain. Final
+            // bounds are applied immediately after native window creation.
+            let popup = params.kind == WindowKind::PopUp;
             CreateWindowExW(
                 dwexstyle,
                 WINDOW_CLASS_NAME,
                 &window_name,
                 dwstyle,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                if popup { 0 } else { CW_USEDEFAULT },
+                if popup { 0 } else { CW_USEDEFAULT },
+                if popup { 1 } else { CW_USEDEFAULT },
+                if popup { 1 } else { CW_USEDEFAULT },
                 None,
                 None,
                 Some(hinstance.into()),

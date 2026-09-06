@@ -11,8 +11,10 @@ try {
     if ($LASTEXITCODE) { throw 'Native verification binaries failed to build.' }
     & 'target\debug\examples\verify_windows.exe' overlay
     if ($LASTEXITCODE) { throw 'Windows overlay lifecycle checks failed.' }
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-overlay.ps1
-    if ($LASTEXITCODE) { throw 'Isolated native overlay check failed.' }
+    foreach ($taskOverlayState in @('recording','transcribing','cleaning')) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-overlay.ps1 -State $taskOverlayState
+        if ($LASTEXITCODE) { throw "Isolated native overlay check failed: $taskOverlayState" }
+    }
     & cargo build --locked -p agentdictate-ui --features desktop --example verify_windows_settings
     if ($LASTEXITCODE) { throw 'Native Settings verification binary failed to build.' }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-settings.ps1

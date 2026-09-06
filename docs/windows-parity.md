@@ -10,15 +10,15 @@ the full-parity acceptance record remains open for that check.
 
 | Area | Windows implementation | Evidence |
 | --- | --- | --- |
-| Shared workflow, recovery, settings, history, usage, replacements, vocabulary | Original core/runtime/app code | Full workspace gate: 351 Rust tests passed; one live-account test intentionally excluded from offline execution |
-| Interface and all routes | Original GPUI/component UI with Windows backend | 55 rendered/headless desktop tests and 48 UI contracts passed; eight native Settings fixtures cover both providers, empty/multiline Unicode values, and narrow/wide windows |
+| Shared workflow, recovery, settings, history, usage, replacements, vocabulary | Original core/runtime/app code | Full workspace gate: 352 Rust tests passed; one live-account test intentionally excluded from offline execution |
+| Interface and all routes | Original GPUI/component UI with Windows backend | 56 rendered/headless desktop tests and 48 UI contracts passed; eight native Settings fixtures cover both providers, empty/multiline Unicode values, and narrow/wide windows |
 | ChatGPT subscription | Original Codex app-server authentication, refresh, endpoint, request and error handling; separate Windows login profile | Browser sign-in succeeded; live synthetic speech transcription returned the expected sentence |
 | Paid API route, cleanup and streaming | Existing optional transports retained | Mock HTTP/WebSocket and failure/fallback tests passed; no paid key configured or paid calls made |
 | Microphone | WASAPI through CPAL; 16 kHz mono PCM WAV | Real default microphone captured 0.51 s; audio deleted without upload; 16/44.1/48 kHz conversion tests passed |
 | IPC and private files | Current-user named pipes, singleton lock, Windows ACLs | 59 runtime integration tests; protected current-user/System file ACL verified against the intended descriptor |
 | Global shortcut | Low-level Windows keyboard hook, original edge tracker/dispatch logic | Scan-code and hold/toggle/cancel/reconfigure tests passed; real Ctrl+Space toggle dictation in T3 Code confirmed by the user |
 | Overlay process | Hidden helper with readiness timeout, crash recovery and parent-pipe lifecycle | Six native process scenarios passed: normal, early exit, error, missing frame, partial frame, bounded repeated crash |
-| Overlay window | Native no-activate/tool-window; primary taskbar placement and DPI tracking | Real frame submission, exact bottom-center bounds, no focus change, and clean teardown passed on an isolated desktop |
+| Overlay window | Borderless native popup; no-activate/tool-window; primary taskbar placement and DPI tracking | Recording/transcribing/cleaning frames, exact bottom-center bounds, zero non-client inset, no caption/resize frame, no focus change, and clean teardown checked on an isolated desktop; native captures visually inspected |
 | Clipboard and paste | Unicode clipboard readback and single tagged SendInput chord; terminal conventions | Dispatch conventions tested; real T3 Code paste confirmed by the user: one insertion, no message submission. Private clipboard probe could not create a fresh Windows window station, and did not touch the user's clipboard |
 | Playback ducking | Windows audio-session volume control, fades, new-session discovery and conditional restoration | User confirmed playback lowers and returns after recording/cancellation |
 | Tray | Native Windows notification icon, menu actions, Explorer restart registration | Shared action tests passed; actual executable icon resource verified; native tray initialized successfully in the installed daemon |
@@ -57,6 +57,15 @@ The hint now uses one line; the adjacent instructions still explain one entry
 per line, and actual multiline values remain supported. The probe renders the
 production Settings form on an isolated Windows desktop, uses synthetic data
 and a command sink that rejects writes, and is included in `run-tests.ps1`.
+
+The recording bar was redesigned at the user's request: a 184 x 40 DIP charcoal
+capsule inside a 200 x 56 DIP transparent window, rounded ends, restrained border
+and shadow, Segoe UI on Windows, warm waveform/processing indicators, and a
+separated timer. The native popup previously used zero (`WS_OVERLAPPED`) window
+style and normal-window titlebar insets, producing the stray white frame and
+offset content. It now uses `WS_POPUP`, skips that non-client path, and starts
+with valid nonzero bounds before final placement. The full gate checks the
+native frame contract and captures all three visible states for inspection.
 
 Remaining user check: choose Hold mode, hold Ctrl+Space while speaking in T3
 Code, and release it. Confirm one paste. The user chose to perform this later.

@@ -27,7 +27,7 @@ fn recording_overlay_restores_the_twenty_bar_waveform_and_timer(cx: &mut TestApp
     let card = cx
         .debug_bounds("recording-overlay-card")
         .expect("overlay card renders");
-    assert_eq!(card.size, size(px(127.), px(42.)));
+    assert_eq!(card.size, size(px(184.), px(40.)));
     assert_recording_content_fits(cx);
     for selector in [
         "recording-overlay-wave-0",
@@ -81,8 +81,9 @@ fn open_recording_overlay(
 ) {
     test_support::initialize(cx);
     let audio_path = std::env::temp_dir().join(format!(
-        "agentdictate-rendered-overlay-{}-{elapsed_millis}.wav",
+        "agentdictate-rendered-overlay-{}-{}-{elapsed_millis}.wav",
         std::process::id(),
+        JobId::new(),
     ));
     let mut wav = vec![0_u8; 44];
     for sample in std::iter::repeat_n(16_384_i16, 2_816) {
@@ -180,5 +181,27 @@ fn dismissal_preserves_the_rendered_card_while_it_fades(cx: &mut TestAppContext)
     assert_eq!(opacity(cx), 0.0);
     cx.debug_bounds("recording-overlay-card")
         .expect("card remains until its owner closes the window");
+    fs::remove_file(audio_path).unwrap();
+}
+
+#[gpui::test]
+fn processing_labels_and_activity_dots_fit_inside_the_capsule(cx: &mut TestAppContext) {
+    let (audio_path, overlay, cx) = open_recording_overlay(cx, 0);
+    for state in [
+        agentdictate_ui::OverlayState::Transcribing,
+        agentdictate_ui::OverlayState::Cleaning,
+    ] {
+        overlay.update(cx, |overlay, cx| {
+            overlay.set_state(state);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let card = cx.debug_bounds("recording-overlay-card").unwrap();
+        let label = cx.debug_bounds("recording-overlay-status-label").unwrap();
+        let dot = cx.debug_bounds("recording-overlay-busy-dot-2").unwrap();
+        assert!(dot.right() + px(10.) <= label.left());
+        assert!(label.right() <= card.right() - px(14.));
+        assert!(label.top() >= card.top() && label.bottom() <= card.bottom());
+    }
     fs::remove_file(audio_path).unwrap();
 }

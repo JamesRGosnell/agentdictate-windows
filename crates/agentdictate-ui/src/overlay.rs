@@ -9,7 +9,7 @@ use agentdictate_core::{ProcessingStage, WorkflowPhase, WorkflowSnapshot};
 
 use crate::StatusTone;
 
-pub const OVERLAY_WIDTH: u32 = 143;
+pub const OVERLAY_WIDTH: u32 = 200;
 pub const OVERLAY_HEIGHT: u32 = 56;
 pub const OVERLAY_BOTTOM_GAP: u32 = 72;
 pub const WAVEFORM_SOURCE_BIN_COUNT: usize = 44;
@@ -212,20 +212,17 @@ pub struct RecordingOverlayLayout {
     pub timer_width: f32,
 }
 
-/// Reproduces the previous Cairo overlay's timer-first layout.
-///
-/// The timer is right-aligned ten pixels inside the 127-pixel card. The
-/// waveform starts twelve pixels from the left and consumes only the space
-/// remaining before the fixed eight-pixel timer gap.
+/// Reserves room for the timer and divider inside the 184-pixel capsule.
+/// The waveform uses the remaining space without colliding with long timers.
 pub fn recording_overlay_layout(timer_width: f32) -> RecordingOverlayLayout {
     let timer_width = if timer_width.is_finite() {
         timer_width.max(0.0)
     } else {
         0.0
     };
-    let timer_x = 127.0 - timer_width - 10.0;
+    let timer_x = 184.0 - timer_width - 16.0;
     RecordingOverlayLayout {
-        waveform: WaveformArea::new(12.0, (timer_x - 12.0 - 8.0).max(1.0), 21.0),
+        waveform: WaveformArea::new(18.0, (timer_x - 18.0 - 22.0).max(1.0), 20.0),
         timer_x,
         timer_width,
     }
