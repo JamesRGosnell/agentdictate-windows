@@ -583,7 +583,7 @@ fn recording_audio_section(
     ))
     .child(toggle_row(
         "Audio ducking",
-        "Lower playback while you dictate",
+        "Lower the default output while you dictate",
         settings.audio_ducking_enabled,
         "toggle-audio-ducking",
         theme,
