@@ -2,26 +2,33 @@
   <img src="assets/agentdictate.svg" alt="AgentDictate microphone icon" width="72">
 </p>
 
-<h1 align="center">AgentDictate</h1>
+<h1 align="center">AgentDictate for Windows</h1>
 
 <p align="center">
   <strong>Experimental STT using the ChatGPT account signed into Codex.</strong><br>
   By default, press <kbd>Ctrl</kbd> + <kbd>Space</kbd> once to start and again to
   stop. AgentDictate copies the transcript and submits one paste shortcut to
-  the focused app on Wayland or X11. The undocumented route may not be enabled
+  the focused Windows app. The undocumented route may not be enabled
   for every account.
 </p>
 
+This is the independently maintained [Windows fork](https://github.com/JamesRGosnell/agentdictate-windows)
+of [Luzivog/agentdictate](https://github.com/Luzivog/agentdictate), the original
+Linux project. Windows development and fixes are published here; the original
+repository remains the Linux upstream. The fork preserves the project's history
+and MIT license.
+
 ## Windows
 
-A native Windows port is available in this checkout. See [Windows installation,
+See [Windows installation,
 ChatGPT sign-in, and build instructions](docs/WINDOWS.md) and the
 [verification record](docs/windows-parity.md). Build a portable ZIP and per-user
 installer with `packaging/build-windows.ps1`.
 
-## Install on Linux
+## Install on Linux (upstream)
 
-These steps are tested on Ubuntu 24.04. The
+The original Linux installation instructions are retained below and clone the
+upstream repository. These steps are tested on Ubuntu 24.04. The
 [system requirements](docs/INSTALL.md#requirements)
 cover both distributions. A graphical session with a working systemd user
 manager, a running PipeWire session, and Rust 1.95.0 through

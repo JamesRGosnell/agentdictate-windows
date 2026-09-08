@@ -1,6 +1,8 @@
 # Windows
 
-This port targets Windows 10/11 x64 and retains the existing Rust application,
+This port is maintained at [JamesRGosnell/agentdictate-windows](https://github.com/JamesRGosnell/agentdictate-windows),
+separately from the [original Linux repository](https://github.com/Luzivog/agentdictate).
+It targets Windows 10/11 x64 and retains the existing Rust application,
 GPUI interface, workflow, history, settings, recovery, and transcription routes.
 The source baseline is `cd71aea56940303ff1c7efa2e33429614cb7253f`.
 
@@ -76,9 +78,11 @@ run `agentdictate.exe` directly from the extracted directory.
 ## Build and verify
 
 Install Rust 1.95.0 with the MSVC target and Visual Studio C++ Build Tools with
-the Windows SDK. From the repository directory:
+the Windows SDK. Clone the Windows fork, then build and verify it:
 
 ```powershell
+git clone https://github.com/JamesRGosnell/agentdictate-windows.git
+cd agentdictate-windows
 cargo build --locked -p agentdictate-app --features desktop --bins
 .\run-tests.ps1
 .\packaging\build-windows.ps1

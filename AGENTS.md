@@ -1,12 +1,24 @@
 # Repository Guidelines
 
+## Repository Ownership
+
+This is the Windows fork at `JamesRGosnell/agentdictate-windows`. `origin` is
+the Windows repository and is the default push destination. `upstream` refers
+to the original Linux project, `Luzivog/agentdictate`. Keep the projects separate:
+do not push to upstream or merge its updates unless the user explicitly requests it.
+Retain the original history, attribution, and license.
+
 ## Mainline Delivery Workflow
 
 All work happens directly on `main`; do not create feature branches or pull
 requests. For changes to application behavior, complete focused verification,
-commit the task's changes, push to `origin/main`, run `./install.sh`, and restart
+commit the task's changes, push to `origin/main`, install, and restart
 `agentdictated` so the changed behavior is live. Follow the resource checks below
 before rebuilding. Preserve unrelated staged or working changes.
+
+On Windows, use `.\install.ps1 -NoStart`, then restart the installed
+`agentdictated.exe --service` in the background. Close the old Settings process
+before replacing its executable. The retained Linux installer is `./install.sh`.
 
 For documentation or instruction-only maintenance, verify the edited documents,
 references, and applicable command contracts. Rebuild, reinstall, and daemon restart
@@ -14,7 +26,8 @@ are unnecessary. Publish these edits only when included in the requested scope.
 
 ## Project Structure & Module Organization
 
-AgentDictate is a Rust workspace for a native Linux dictation app. The workspace
+AgentDictate is a Rust workspace for a native Windows dictation app, retaining
+the original Linux platform code. The workspace
 uses the Rust toolchain pinned in `rust-toolchain.toml` and is split by
 responsibility:
 
@@ -22,8 +35,8 @@ responsibility:
   and protocol logic.
 - `crates/agentdictate-runtime`: durable history, recovery, usage, pricing, and
   IPC persistence.
-- `crates/agentdictate-linux`: Linux recording, hotkey, focus, clipboard, and
-  paste integrations.
+- `crates/agentdictate-linux`: platform integrations, including the original
+  Linux adapters and target-gated Windows hotkey and overlay placement code.
 - `crates/agentdictate-ui`: GPUI presentation, view models, route surfaces, and
   the recording overlay. Native UI code is behind the `desktop` feature.
 - `crates/agentdictate-app`: daemon and desktop composition plus the
@@ -48,8 +61,9 @@ Cargo's native/default job parallelism; do not add a fixed `-j` or `jobs` cap.
 - Focused library test: `cargo test --locked -p <package> --lib <test-filter>`
 - One integration harness: `cargo test --locked -p <package> --test <harness> <test-filter>`
 - Focused lint: `cargo clippy --locked -p <package> --lib -- -D warnings`
-- Run the desktop app: `./run.sh`
-- Run only the daemon/background app: `./run.sh --background`
+- Run the Windows desktop app: `.\run.ps1`
+- Run only the Windows daemon/background app: `.\run.ps1 -Background`
+- Retained Linux commands: `./run.sh` and `./run.sh --background`
 
 A test-name filter by itself is not a narrow command: without `-p`, `--lib`, or
 `--test`, Cargo can still compile every selected integration-test executable.
@@ -78,7 +92,10 @@ variant, so avoid uncontrolled full rebuilds while an oversized target remains.
 
 ## Final Test Gate
 
-`./run-tests.sh` is the one final comprehensive local gate. It runs the locked
+`.\run-tests.ps1` is the final comprehensive local gate on Windows. It runs
+the locked Rust workspace with every target and feature, isolated native overlay
+and Settings probes, packaging checks, and `cargo deny check` when installed.
+The retained Linux equivalent, `./run-tests.sh`, runs the locked
 Rust workspace with every target and feature, the native-readiness packaging
 checks, and `cargo deny check` when `cargo-deny` is installed. The gate is
 local-only by design; CI runs tag-gated packaging only. For application code or
@@ -104,6 +121,9 @@ safety contract is documented next to the boundary.
 
 ## Packaging and Installation
 
+- `.\install.ps1`: builds and installs the Windows release; use `-NoStart` when
+  restarting only the daemon in the background.
+- `.\packaging\build-windows.ps1`: builds the portable Windows ZIP in `dist/`.
 - `./install.sh`: builds the release desktop binaries and installs them, the
   desktop entry, autostart entry, and icon into the user profile.
 - `packaging/build-deb.sh`: builds the Debian package in `dist/`.
@@ -121,6 +141,8 @@ temporary or retained audio, IPC sockets, diagnostics, or generated package
 contents. Runtime data belongs under `~/.config/agentdictate/`,
 `~/.local/share/agentdictate/`, `~/.local/state/agentdictate/`, and
 `~/.cache/agentdictate/`.
+On Windows, runtime data belongs under `%LOCALAPPDATA%\AgentDictate`, and
+installed executables belong under `%LOCALAPPDATA%\Programs\AgentDictate`.
 
 ## UI Placement Requirement
 

@@ -1,6 +1,9 @@
 # AgentDictate Architecture
 
-AgentDictate is a native Linux dictation app written in Rust. A daemon records
+This repository maintains the Windows port of AgentDictate, a native dictation
+app written in Rust. The original Linux adapters remain in the shared workspace;
+Windows platform details are documented in [Windows parity](windows-parity.md).
+A daemon records
 audio, transcribes it through the OpenAI speech-to-text API, and pastes the
 transcript into the focused window. A GPUI desktop app provides settings and
 history. The workspace is split by responsibility; dependencies flow downward.
