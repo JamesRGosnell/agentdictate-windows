@@ -142,7 +142,7 @@ fn overlay_fixture() -> anyhow::Result<()> {
             _ => {}
         }
         std::io::stdout().flush()?;
-        if scenario != "normal" {
+        if scenario != "normal" && scenario != "stubborn" {
             for _ in input {}
             return Ok(());
         }
@@ -151,13 +151,19 @@ fn overlay_fixture() -> anyhow::Result<()> {
     std::io::stdout().flush()?;
     std::fs::write(directory.join("ready"), "ready")?;
     for _ in input {}
+    if scenario == "stubborn" {
+        // Simulate a UI/graphics shutdown that never completes after pipe EOF.
+        std::thread::sleep(Duration::from_secs(30));
+    }
     std::fs::write(directory.join("exited"), "exited")?;
     Ok(())
 }
 fn verify_overlay_lifecycle() -> anyhow::Result<()> {
     use agentdictate_app::{OverlayUpdate, start_overlay_presenter_with_timeout};
     use agentdictate_core::{JobId, Workflow, WorkflowSignal};
-    for scenario in ["normal", "exit", "error", "created", "partial", "crash"] {
+    for scenario in [
+        "normal", "exit", "error", "created", "partial", "crash", "stubborn",
+    ] {
         let directory = tempfile::tempdir()?;
         let helper = directory.path().join(if cfg!(windows) {
             "fixture.exe"
@@ -207,7 +213,12 @@ fn verify_overlay_lifecycle() -> anyhow::Result<()> {
             "overlay scenario {scenario} failed readiness/relaunch/bounded retry"
         );
         dismissed?;
-        if scenario != "crash" {
+        if scenario == "stubborn" {
+            anyhow::ensure!(
+                !directory.path().join("exited").exists(),
+                "stubborn helper should require forced termination"
+            );
+        } else if scenario != "crash" {
             anyhow::ensure!(
                 directory.path().join("exited").exists(),
                 "overlay {scenario} did not finish before dismissal acknowledgment"

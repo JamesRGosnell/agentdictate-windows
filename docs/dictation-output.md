@@ -24,7 +24,7 @@ agentdictate stop
 
 Plain `start` and `cancel` are also supported. Mode starts
 are ignored by the tray while busy and rejected by the daemon while recording.
-Protocol version 5 requires a matching client and daemon. Cleanup settings and
+Protocol version 6 requires a matching client and daemon. Cleanup settings and
 Organize have been removed from the everyday controls. Existing Organize defaults
 become Dictate for new recordings. Saved recovery snapshots retain their original
 processing options; the evaluator still supports explicit cleanup experiments.

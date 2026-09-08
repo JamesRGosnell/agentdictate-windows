@@ -54,6 +54,8 @@ pub enum WorkspaceError {
     Ipc(#[from] agentdictate_runtime::IpcError),
     #[error("{message}")]
     CommandRejected { message: String },
+    #[error(transparent)]
+    DeliveryFocus(#[from] agentdictate_runtime::ExternalError),
     #[error("daemon returned unrelated data for a history request")]
     UnexpectedHistoryResponse,
     #[error("daemon returned a lifecycle snapshot for a workspace request")]
@@ -138,6 +140,8 @@ impl WorkspaceClient {
                 let job_id = id
                     .parse::<JobId>()
                     .map_err(|_| WorkspaceError::InvalidRecoveryId { id })?;
+                #[cfg(windows)]
+                crate::system::prepare_recovery_delivery()?;
                 match stage {
                     RecoveryStage::Transcription => {
                         ClientCommand::retry_transcription(request_id, job_id)
@@ -153,6 +157,12 @@ impl WorkspaceClient {
             }
             WorkspaceAction::CopyTranscript { id } => {
                 ClientCommand::copy_transcript(request_id, id)
+            }
+            WorkspaceAction::CopyRecovery { id } => {
+                let job_id = id
+                    .parse::<JobId>()
+                    .map_err(|_| WorkspaceError::InvalidRecoveryId { id })?;
+                ClientCommand::copy_recovery(request_id, job_id)
             }
             WorkspaceAction::SearchHistory { .. } | WorkspaceAction::LoadMoreHistory => {
                 unreachable!("handled above")

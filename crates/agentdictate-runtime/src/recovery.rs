@@ -20,6 +20,15 @@ pub struct RecoveryEntry {
 }
 
 impl Runtime {
+    /// Reads the full saved text for manual copy without retrying or completing delivery.
+    pub fn recovery_transcript(&self, id: JobId) -> Result<Option<String>, RuntimeError> {
+        Ok(self
+            .recovery_entries()?
+            .into_iter()
+            .find(|entry| entry.job_id == id && !entry.final_text.trim().is_empty())
+            .map(|entry| entry.final_text))
+    }
+
     pub fn recovery_entries(&self) -> Result<Vec<RecoveryEntry>, RuntimeError> {
         Ok(self
             .recoverable_jobs()?

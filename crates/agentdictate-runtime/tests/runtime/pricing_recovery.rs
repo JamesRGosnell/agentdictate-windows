@@ -125,3 +125,33 @@ fn recovery_projection_lists_recoverable_stages_with_audio_evidence() {
         .unwrap();
     assert!(!missing_audio.audio_present);
 }
+
+#[test]
+fn recovery_copy_reads_full_text_without_changing_delivery_or_requiring_audio() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("history.db");
+    let runtime = Runtime::open(&database).unwrap();
+    let connection = Connection::open(&database).unwrap();
+    insert_job(&connection, "missing.wav", "failed", "failed");
+    let id = runtime.recovery_entries().unwrap()[0].job_id;
+    let text = "Long transcript: caf\u{e9}, \u{1f399}\nSecond line. ".repeat(100);
+    connection.execute("UPDATE dictation_jobs SET final_text = ?1, delivery_status = 'ambiguous' WHERE runtime_id = ?2", params![text, id.to_string()]).unwrap();
+    let before = runtime.job(id).unwrap();
+    assert_eq!(runtime.recovery_transcript(id).unwrap(), Some(text));
+    assert_eq!(runtime.job(id).unwrap(), before);
+    assert!(
+        runtime
+            .recovery_transcript(agentdictate_core::JobId::new())
+            .unwrap()
+            .is_none()
+    );
+    connection
+        .execute(
+            "UPDATE dictation_jobs SET final_text = ' ' WHERE runtime_id = ?1",
+            [id.to_string()],
+        )
+        .unwrap();
+    assert!(runtime.recovery_transcript(id).unwrap().is_none());
+    connection.execute("UPDATE dictation_jobs SET final_text = 'saved', stage = 'deleted' WHERE runtime_id = ?1", [id.to_string()]).unwrap();
+    assert!(runtime.recovery_transcript(id).unwrap().is_none());
+}

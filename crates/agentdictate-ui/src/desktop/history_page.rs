@@ -197,6 +197,14 @@ fn recovery_row(
         stage: item.stage,
     };
     let retry_selector = retry_action.selector();
+    let copy_action = WorkspaceAction::CopyRecovery {
+        id: item.id.clone(),
+    };
+    let copy_selector = copy_action.selector();
+    let can_copy = item
+        .transcript_preview
+        .as_ref()
+        .is_some_and(|text| !text.trim().is_empty());
     let delete_action = WorkspaceAction::DeleteRecovery {
         id: item.id.clone(),
     };
@@ -269,6 +277,18 @@ fn recovery_row(
             h_flex()
                 .flex_none()
                 .gap_1()
+                .when(can_copy, |actions| {
+                    actions.child(
+                        action_button(SharedString::from(copy_selector.clone()))
+                            .debug_selector(move || copy_selector)
+                            .small()
+                            .label("Copy")
+                            .on_click(cx.listener(move |shell, _, _, cx| {
+                                shell.emit_workspace_action(copy_action.clone(), cx);
+                                cx.notify();
+                            })),
+                    )
+                })
                 .child(
                     action_button(SharedString::from(retry_selector.clone()))
                         .debug_selector(move || retry_selector)

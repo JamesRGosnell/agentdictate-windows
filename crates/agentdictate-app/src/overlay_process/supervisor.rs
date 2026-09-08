@@ -105,8 +105,21 @@ impl OverlayController {
         match acknowledgment.recv_timeout(OVERLAY_TEARDOWN_TIMEOUT) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
-                let _ = self.commands.send(OverlayCommand::ForceDismiss);
-                Err(OverlayTeardownError::TimedOut)
+                tracing::warn!(
+                    "overlay graceful teardown timed out; terminating helper before paste"
+                );
+                self.commands
+                    .send(OverlayCommand::ForceDismiss)
+                    .map_err(|_| OverlayTeardownError::PresenterUnavailable)?;
+                // Killing the presentation-only helper is safe, but paste still
+                // requires its observed process exit, not merely a kill request.
+                match acknowledgment.recv_timeout(OVERLAY_TEARDOWN_TIMEOUT) {
+                    Ok(result) => result,
+                    Err(RecvTimeoutError::Timeout) => Err(OverlayTeardownError::TimedOut),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        Err(OverlayTeardownError::PresenterUnavailable)
+                    }
+                }
             }
             Err(RecvTimeoutError::Disconnected) => Err(OverlayTeardownError::PresenterUnavailable),
         }

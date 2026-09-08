@@ -7,7 +7,7 @@ use crate::snapshots::{
 };
 use crate::workflow::{JobId, WorkflowSnapshot};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientCommand {
@@ -136,6 +136,11 @@ impl ClientCommand {
     }
 
     #[must_use]
+    pub const fn copy_recovery(request_id: u64, job_id: JobId) -> Self {
+        Self::with_kind(ClientCommandKind::CopyRecovery { request_id, job_id })
+    }
+
+    #[must_use]
     pub const fn quit(request_id: u64) -> Self {
         Self::with_kind(ClientCommandKind::Quit { request_id })
     }
@@ -186,6 +191,7 @@ impl ClientCommand {
             ClientCommandKind::DeleteHistory { .. } => ClientCommandTag::DeleteHistory,
             ClientCommandKind::ClearHistory { .. } => ClientCommandTag::ClearHistory,
             ClientCommandKind::CopyTranscript { .. } => ClientCommandTag::CopyTranscript,
+            ClientCommandKind::CopyRecovery { .. } => ClientCommandTag::CopyRecovery,
             ClientCommandKind::UpdateSettings { .. } => ClientCommandTag::UpdateSettings,
             ClientCommandKind::SetApiKey { .. } => ClientCommandTag::SetApiKey,
             ClientCommandKind::HotkeyStatusChanged { .. } => ClientCommandTag::HotkeyStatusChanged,
@@ -221,6 +227,7 @@ pub enum ClientCommandTag {
     UpdateSettings,
     SetApiKey,
     HotkeyStatusChanged,
+    CopyRecovery,
     Quit,
 }
 
@@ -247,6 +254,7 @@ impl ClientCommandTag {
         Self::UpdateSettings,
         Self::SetApiKey,
         Self::HotkeyStatusChanged,
+        Self::CopyRecovery,
         Self::Quit,
     ];
 }
@@ -329,6 +337,10 @@ pub enum ClientCommandKind {
         request_id: u64,
         readiness: HotkeyReadiness,
     },
+    CopyRecovery {
+        request_id: u64,
+        job_id: JobId,
+    },
     Quit {
         request_id: u64,
     },
@@ -362,7 +374,8 @@ mod tests {
             ClientCommandTag::UpdateSettings => 17,
             ClientCommandTag::SetApiKey => 18,
             ClientCommandTag::HotkeyStatusChanged => 19,
-            ClientCommandTag::Quit => 20,
+            ClientCommandTag::CopyRecovery => 20,
+            ClientCommandTag::Quit => 21,
         }
     }
 

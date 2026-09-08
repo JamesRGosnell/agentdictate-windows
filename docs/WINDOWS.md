@@ -48,6 +48,13 @@ paste. Windows prevents a normal process from injecting input into elevated
 applications and the secure desktop. Copy from Recovery and paste manually
 in those destinations, or run the applications at matching permissions.
 
+In History's Recovery section, **Paste again** minimizes AgentDictate and waits
+for focus to return to the previous app before retrying. Focus the desired text
+field before opening History. **Copy** copies the full saved transcript without
+retrying delivery or removing the recovery item; switch to your destination and
+paste manually. A slow overlay shutdown is terminated after a grace period, and
+automatic paste proceeds only after the helper's process exit is confirmed.
+
 The tray offers Settings, toggle dictation, literal dictation, and Quit.
 **Launch at login** uses the current user's Windows Run registration.
 The microphone uses Windows' default input device. Audio ducking temporarily

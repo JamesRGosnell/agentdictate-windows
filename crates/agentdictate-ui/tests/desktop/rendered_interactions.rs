@@ -445,7 +445,7 @@ fn recovery_rows_emit_typed_retry_actions(cx: &mut TestAppContext) {
         ),
         ..WorkspaceViewModel::default()
     });
-    let refreshed = WorkspaceViewModel::default();
+    let refreshed = model.workspace.clone();
     let mut harness = Harness::open_model_with_actions(
         cx,
         size(px(1_100.), px(780.)),
@@ -457,14 +457,28 @@ fn recovery_rows_emit_typed_retry_actions(cx: &mut TestAppContext) {
     );
 
     harness.bounds("history-recovery-item-job-42");
+    harness.click("history-copy-recovery-job-42");
+
+    assert_eq!(
+        *actions.lock().expect("action lock"),
+        vec![WorkspaceAction::CopyRecovery {
+            id: "job-42".to_owned()
+        }]
+    );
+
     harness.click("history-retry-recovery-job-42");
 
     assert_eq!(
         *actions.lock().expect("action lock"),
-        vec![WorkspaceAction::RetryRecovery {
-            id: "job-42".to_owned(),
-            stage: RecoveryStage::Delivery,
-        }]
+        vec![
+            WorkspaceAction::CopyRecovery {
+                id: "job-42".to_owned()
+            },
+            WorkspaceAction::RetryRecovery {
+                id: "job-42".to_owned(),
+                stage: RecoveryStage::Delivery,
+            }
+        ]
     );
 }
 
@@ -503,6 +517,7 @@ fn deleting_recoverable_audio_requires_an_explicit_second_click(cx: &mut TestApp
         }),
     );
 
+    assert!(!harness.has("history-copy-recovery-job-42"));
     harness.click("history-delete-recovery-job-42");
     assert!(actions.lock().expect("action lock").is_empty());
     harness.click("confirm-history-delete-recovery-job-42");

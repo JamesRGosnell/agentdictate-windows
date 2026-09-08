@@ -401,6 +401,7 @@ impl IpcHandler for AgentProcess {
                 | ClientCommandTag::DeleteHistory
                 | ClientCommandTag::ClearHistory
                 | ClientCommandTag::CopyTranscript
+                | ClientCommandTag::CopyRecovery
         );
         let result: anyhow::Result<()> = match command.kind {
             ClientCommandKind::GetSnapshot { .. } => Ok(()),
@@ -486,6 +487,19 @@ impl IpcHandler for AgentProcess {
                         .copy_text(&entry.final_text)
                         .map_err(Into::into)
                 }),
+            ClientCommandKind::CopyRecovery { job_id, .. } => self
+                .daemon
+                .recovery_transcript(job_id)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| {
+                    text.ok_or_else(|| anyhow::anyhow!("recovery {job_id} has no saved transcript"))
+                })
+                .and_then(|text| {
+                    self.daemon
+                        .deliverer_mut()
+                        .copy_text(&text)
+                        .map_err(Into::into)
+                }),
             ClientCommandKind::UpdateSettings { settings, .. } => self.update_settings(*settings),
             ClientCommandKind::SetApiKey { api_key, .. } => {
                 self.set_api_key(api_key.expose_secret())
@@ -540,6 +554,7 @@ const fn request_id(command: &ClientCommandKind) -> u64 {
         | ClientCommandKind::DeleteHistory { request_id, .. }
         | ClientCommandKind::ClearHistory { request_id }
         | ClientCommandKind::CopyTranscript { request_id, .. }
+        | ClientCommandKind::CopyRecovery { request_id, .. }
         | ClientCommandKind::UpdateSettings { request_id, .. }
         | ClientCommandKind::SetApiKey { request_id, .. }
         | ClientCommandKind::HotkeyStatusChanged { request_id, .. }

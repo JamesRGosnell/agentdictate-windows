@@ -39,6 +39,10 @@ impl SettingsShell {
             return;
         };
         let feedback_route = self.model.active_route;
+        let copies_text = matches!(
+            action,
+            WorkspaceAction::CopyRecovery { .. } | WorkspaceAction::CopyTranscript { .. }
+        );
         let sink = Arc::clone(sink);
         let closes_editor = matches!(
             action,
@@ -61,6 +65,12 @@ impl SettingsShell {
                                     &shell.settings.current.currency,
                                 );
                                 shell.clear_route_feedback_for(feedback_route);
+                                if copies_text {
+                                    shell.set_route_feedback_for(
+                                        feedback_route,
+                                        "Copied. Paste into your destination app.".to_owned(),
+                                    );
+                                }
                                 if closes_editor {
                                     shell.routes.replacement_editor = None;
                                 }

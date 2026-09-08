@@ -314,6 +314,46 @@ impl RecordingController for SystemRecordingController {
 pub struct SystemDeliverer {
     shortcut: String,
 }
+
+/// Runs in the Settings action worker before a recovery request reaches the daemon.
+pub(crate) fn prepare_recovery_delivery() -> Result<(), ExternalError> {
+    // SAFETY: only query the foreground HWND and its owning process. Minimize only
+    // this UI process's window, never another application's destination window.
+    let window = unsafe { GetForegroundWindow() };
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, &mut pid) };
+    if window.is_null() || pid != std::process::id() {
+        return Ok(());
+    }
+    if unsafe { ShowWindowAsync(window, SW_MINIMIZE) } == 0 {
+        return Err(ExternalError::new(
+            "Could not minimize AgentDictate. Use Copy and paste manually.",
+        ));
+    }
+    wait_for_recovery_focus(
+        || {
+            let foreground = unsafe { GetForegroundWindow() };
+            !foreground.is_null() && foreground != window
+        },
+        || std::thread::sleep(Duration::from_millis(10)),
+    )
+}
+
+fn wait_for_recovery_focus(
+    mut destination_ready: impl FnMut() -> bool,
+    mut wait: impl FnMut(),
+) -> Result<(), ExternalError> {
+    // ShowWindowAsync posts to the UI thread; do not race it with the IPC request.
+    for _ in 0..200 {
+        if destination_ready() {
+            return Ok(());
+        }
+        wait();
+    }
+    Err(ExternalError::new(
+        "Focus the destination application, or use Copy and paste manually.",
+    ))
+}
 struct ClipboardGuard(HWND);
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
@@ -538,6 +578,28 @@ impl Deliverer for SystemDeliverer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_waits_for_focus_handoff_and_bounds_a_failed_minimize() {
+        let mut observations = 0;
+        let mut waits = 0;
+        wait_for_recovery_focus(
+            || {
+                observations += 1;
+                observations == 4
+            },
+            || waits += 1,
+        )
+        .unwrap();
+        assert_eq!(waits, 3);
+        waits = 0;
+        assert!(wait_for_recovery_focus(|| false, || waits += 1).is_err());
+        assert_eq!(waits, 200);
+        wait_for_recovery_focus(
+            || true,
+            || panic!("already focused destination must not wait"),
+        )
+        .unwrap();
+    }
     #[test]
     fn terminal_paste_uses_windows_application_conventions() {
         assert_eq!(

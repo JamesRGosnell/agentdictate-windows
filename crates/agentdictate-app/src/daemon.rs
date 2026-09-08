@@ -595,6 +595,10 @@ where
         self.runtime.history(id)
     }
 
+    pub fn recovery_transcript(&self, id: JobId) -> Result<Option<String>, RuntimeError> {
+        self.runtime.recovery_transcript(id)
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> AppSnapshot {
         AppSnapshot {

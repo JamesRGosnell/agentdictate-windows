@@ -9,6 +9,7 @@ use crate::{
 pub enum WorkspaceAction {
     RetryRecovery { id: String, stage: RecoveryStage },
     DeleteRecovery { id: String },
+    CopyRecovery { id: String },
     CopyTranscript { id: i64 },
     SearchHistory { query: String },
     LoadMoreHistory,
@@ -24,6 +25,7 @@ impl WorkspaceAction {
         match self {
             Self::RetryRecovery { id, .. } => format!("history-retry-recovery-{id}"),
             Self::DeleteRecovery { id } => format!("history-delete-recovery-{id}"),
+            Self::CopyRecovery { id } => format!("history-copy-recovery-{id}"),
             Self::CopyTranscript { id } => format!("history-copy-transcript-{id}"),
             Self::SearchHistory { .. } => "history-search".to_owned(),
             Self::LoadMoreHistory => "history-load-more".to_owned(),
