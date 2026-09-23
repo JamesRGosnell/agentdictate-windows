@@ -25,92 +25,27 @@ fn busy_dot_alphas() -> [f32; 3] {
     })
 }
 
-fn microphone_indicator(starting: bool, elapsed: Duration) -> impl IntoElement {
+fn waiting_ring(elapsed: Duration) -> impl IntoElement {
     let ring_phase = (elapsed.as_secs_f32() / 0.9).fract();
     let ring_color: Hsla = gpui::rgb(0xe6a48a).into();
     gpui::div()
-        .debug_selector(move || {
-            if starting {
-                "recording-overlay-mic-waiting"
-            } else {
-                "recording-overlay-mic-ready"
-            }
-            .to_owned()
-        })
+        .debug_selector(|| "recording-overlay-waiting-ring".to_owned())
         .absolute()
-        .left(px(if starting { 3. } else { 7. }))
+        .left(px(3.))
         .top(px(3.))
         .size(px(32.))
-        .child(
+        .children((0..16).map(|index| {
+            let fraction = index as f32 / 16.;
+            let angle = fraction * std::f32::consts::TAU;
+            let trail = (fraction - ring_phase).rem_euclid(1.);
             gpui::div()
                 .absolute()
-                .left(px(4.))
-                .top(px(4.))
-                .size(px(24.))
+                .left(px(15. + 14. * angle.sin()))
+                .top(px(15. - 14. * angle.cos()))
+                .size(px(2.))
                 .rounded_full()
-                .bg(gpui::rgb(if starting { 0x47474f } else { 0xc94c42 })),
-        )
-        .when(starting, |mic| {
-            mic.child(
-                gpui::div()
-                    .debug_selector(|| "recording-overlay-waiting-ring".to_owned())
-                    .absolute()
-                    .size_full()
-                    .children((0..16).map(|index| {
-                        let fraction = index as f32 / 16.;
-                        let angle = fraction * std::f32::consts::TAU;
-                        let trail = (fraction - ring_phase).rem_euclid(1.);
-                        gpui::div()
-                            .absolute()
-                            .left(px(15. + 14. * angle.sin()))
-                            .top(px(15. - 14. * angle.cos()))
-                            .size(px(2.))
-                            .rounded_full()
-                            .bg(ring_color.opacity(0.15 + 0.85 * trail.powi(3)))
-                    })),
-            )
-        })
-        .child(
-            gpui::div()
-                .absolute()
-                .left(px(13.))
-                .top(px(8.))
-                .w(px(6.))
-                .h(px(10.))
-                .rounded_full()
-                .bg(gpui::rgb(0xffffff)),
-        )
-        .child(
-            gpui::div()
-                .absolute()
-                .left(px(10.))
-                .top(px(12.))
-                .w(px(12.))
-                .h(px(10.))
-                .border_2()
-                .border_t_0()
-                .border_color(gpui::rgb(0xffffff))
-                .rounded_b(px(6.)),
-        )
-        .child(
-            gpui::div()
-                .absolute()
-                .left(px(15.))
-                .top(px(22.))
-                .w(px(2.))
-                .h(px(3.))
-                .bg(gpui::rgb(0xffffff)),
-        )
-        .child(
-            gpui::div()
-                .absolute()
-                .left(px(12.))
-                .top(px(24.))
-                .w(px(8.))
-                .h(px(2.))
-                .rounded_full()
-                .bg(gpui::rgb(0xffffff)),
-        )
+                .bg(ring_color.opacity(0.15 + 0.85 * trail.powi(3)))
+        }))
 }
 
 /// GPUI content for the bottom-centered recording status window.
@@ -307,9 +242,7 @@ impl Render for RecordingOverlay {
                             blur_radius: px(6.),
                             spread_radius: px(0.),
                         }])
-                        .when(starting || recording, |card| {
-                            card.child(microphone_indicator(starting, since_shown))
-                        })
+                        .when(starting, |card| card.child(waiting_ring(since_shown)))
                         .when(recording, |card| {
                             card.children(bars.into_iter().enumerate().map(|(index, bar)| {
                                 gpui::div()

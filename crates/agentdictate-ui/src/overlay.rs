@@ -212,7 +212,7 @@ pub struct RecordingOverlayLayout {
     pub timer_width: f32,
 }
 
-/// Reserves room for the microphone, timer and divider inside the capsule.
+/// Reserves room for the timer and divider inside the 184-pixel capsule.
 /// The waveform uses the remaining space without colliding with long timers.
 pub fn recording_overlay_layout(timer_width: f32) -> RecordingOverlayLayout {
     let timer_width = if timer_width.is_finite() {
@@ -222,7 +222,7 @@ pub fn recording_overlay_layout(timer_width: f32) -> RecordingOverlayLayout {
     };
     let timer_x = 184.0 - timer_width - 16.0;
     RecordingOverlayLayout {
-        waveform: WaveformArea::new(48.0, (timer_x - 48.0 - 22.0).max(1.0), 20.0),
+        waveform: WaveformArea::new(18.0, (timer_x - 18.0 - 22.0).max(1.0), 20.0),
         timer_x,
         timer_width,
     }
