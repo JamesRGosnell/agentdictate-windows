@@ -7,8 +7,8 @@ use agentdictate_core::{
 };
 use agentdictate_linux::hotkey::{HotkeySignal, HotkeySpec};
 use agentdictate_runtime::{
-    HistoryIndexMaintenance, IpcClient, IpcHandler, RecordingPriorityGuard, Runtime, RuntimeError,
-    load_settings, save_settings,
+    FinishedJobCleanup, HistoryIndexMaintenance, IpcClient, IpcHandler, RecordingPriorityGuard,
+    Runtime, RuntimeError, load_settings, save_settings,
 };
 
 use crate::model_catalog::ModelCatalog;
@@ -39,6 +39,7 @@ pub struct AgentProcess {
     daemon_service_file: PathBuf,
     systemctl_command: PathBuf,
     database_file: PathBuf,
+    recordings_directory: PathBuf,
     runtime_directory: PathBuf,
     model_catalog: ModelCatalog,
     history_index_maintenance: HistoryIndexMaintenance,
@@ -53,6 +54,7 @@ impl AgentProcess {
         paths.ensure_directories()?;
         let settings = load_settings(&paths.config_file)?;
         let runtime = Runtime::open(&paths.database_file)?;
+        runtime.reconcile_recovery_deletions(&paths.recordings)?;
         let model_catalog = ModelCatalog::open(&paths.cache, &settings.openai_api_key);
         let speech = SpeechRouter::new(
             ReqwestOpenAiTransport::new(&settings.openai_api_key),
@@ -77,6 +79,7 @@ impl AgentProcess {
             daemon_service_file: paths.daemon_service_file,
             systemctl_command: PathBuf::from("systemctl"),
             database_file: paths.database_file,
+            recordings_directory: paths.recordings,
             runtime_directory: paths.runtime,
             model_catalog,
             history_index_maintenance,
@@ -156,6 +159,7 @@ impl AgentProcess {
         let daemon_service_file = self.daemon_service_file.clone();
         let systemctl_command = self.systemctl_command.clone();
         let database_file = self.database_file.clone();
+        let recordings_directory = self.recordings_directory.clone();
         let history_index_maintenance = self.history_index_maintenance.clone();
         std::thread::Builder::new()
             .name("agentdictate-maintenance".into())
@@ -166,6 +170,7 @@ impl AgentProcess {
                     &daemon_service_file,
                     &systemctl_command,
                     &database_file,
+                    &recordings_directory,
                     &history_index_maintenance,
                 );
             })
@@ -330,6 +335,7 @@ fn run_post_listener_maintenance(
     daemon_service_file: &std::path::Path,
     systemctl_command: &std::path::Path,
     database_file: &std::path::Path,
+    recordings_directory: &std::path::Path,
     history_index_maintenance: &HistoryIndexMaintenance,
 ) {
     match std::env::current_exe() {
@@ -351,7 +357,23 @@ fn run_post_listener_maintenance(
         }
         Err(error) => tracing::warn!(%error, "could not locate daemon for autostart"),
     }
-    let mut runtime = match Runtime::open(database_file) {
+    run_database_maintenance(
+        settings,
+        database_file,
+        recordings_directory,
+        history_index_maintenance,
+    );
+}
+
+fn run_database_maintenance(
+    settings: &Settings,
+    database_file: &std::path::Path,
+    recordings_directory: &std::path::Path,
+    history_index_maintenance: &HistoryIndexMaintenance,
+) {
+    // The listener is already live, so a recording may have started. The
+    // reconciling `Runtime::open` would mark it interrupted.
+    let mut runtime = match Runtime::open_background_writer(database_file) {
         Ok(runtime) => runtime,
         Err(error) => {
             tracing::warn!(%error, "could not open maintenance database connection");
@@ -361,12 +383,16 @@ fn run_post_listener_maintenance(
     if let Err(error) = runtime.sync_pricing(settings) {
         tracing::warn!(%error, "could not synchronize pricing cache");
     }
-    match runtime.backfill_delivered_sessions(settings) {
-        Ok(0) => {}
-        Ok(repaired_history) => {
-            tracing::info!(repaired_history, "repaired delivered session history");
-        }
-        Err(error) => tracing::warn!(%error, "could not repair delivered session history"),
+    match runtime.clean_up_finished_jobs(settings, recordings_directory) {
+        Ok(cleanup) if cleanup == FinishedJobCleanup::default() => {}
+        Ok(cleanup) => tracing::info!(
+            recorded_deliveries = cleanup.recorded_deliveries,
+            removed_jobs = cleanup.removed_jobs,
+            removed_recordings = cleanup.removed_recordings,
+            failed_removals = cleanup.failed_removals,
+            "cleaned up finished dictations"
+        ),
+        Err(error) => tracing::warn!(%error, "could not clean up finished dictations"),
     }
     if let Err(error) = history_index_maintenance.prepare_history_search(&mut runtime) {
         tracing::warn!(%error, "could not prepare indexed transcript search");
@@ -601,8 +627,10 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use agentdictate_core::{ClientCommand, ServerMessageKind};
-    use agentdictate_runtime::IpcHandler;
+    use agentdictate_core::{ClientCommand, JobStage, ServerMessageKind, TranscriptionProvider};
+    use agentdictate_runtime::{
+        ExternalError, IpcHandler, Recorder, RecordingJob, RecordingRequest,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -745,6 +773,50 @@ mod tests {
             .unwrap();
         assert!(paths.autostart_file.exists());
         assert!(paths.daemon_service_file.exists());
+    }
+
+    struct StartedRecorder;
+
+    impl Recorder for StartedRecorder {
+        fn start(&mut self, _job: &RecordingJob) -> Result<(), ExternalError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn startup_maintenance_leaves_a_recording_that_started_before_it_alone() {
+        let directory = tempdir().unwrap();
+        let paths = app_paths(directory.path());
+        paths.ensure_directories().unwrap();
+        let mut runtime = Runtime::open(&paths.database_file).unwrap();
+        // A hotkey press lands between the listener going live and maintenance.
+        let recording = runtime
+            .start_recording(
+                RecordingRequest {
+                    options: None,
+                    audio_path: directory.path().join("recording.wav"),
+                    started_at: chrono::Utc::now(),
+                    transcription_provider: TranscriptionProvider::OpenAiApi,
+                    transcription_model: "test".into(),
+                },
+                &mut StartedRecorder,
+            )
+            .unwrap();
+
+        // Exercise the production database work without touching autostart,
+        // network services, audio devices, or the user's desktop.
+        run_database_maintenance(
+            &Settings::default(),
+            &paths.database_file,
+            &paths.recordings,
+            &HistoryIndexMaintenance::new(),
+        );
+
+        let observer = Runtime::open_observer(&paths.database_file).unwrap();
+        assert_eq!(
+            observer.job(recording.id).unwrap().unwrap().stage,
+            JobStage::Recording
+        );
     }
 
     fn app_paths(root: &Path) -> AppPaths {

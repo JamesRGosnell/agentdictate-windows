@@ -2,17 +2,18 @@ use std::cell::RefCell;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use agentdictate_core::apply_replacements;
 use chrono::Utc;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::history::serialize_replacements;
 use crate::history_search;
 use crate::schema::{SCHEMA, row_to_job, stage_name, state_for_stage, timestamp};
+use crate::startup_cleanup::recovery_delete_path;
 use crate::{
     Deliverer, DeliveryDisposition, DeliveryGate, DeliveryStatus, ExternalError, JobId, JobStage,
     Recorder, RecordingJob, RecordingRequest, ReplacementRule, RuntimeError, RuntimeEvent,
@@ -31,6 +32,7 @@ impl Runtime {
         let mut connection = Connection::open(path)?;
         #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        configure_writer(&mut connection)?;
         connection.execute_batch(SCHEMA)?;
         ensure_runtime_id_column(&connection)?;
         ensure_delivery_status_column(&connection)?;
@@ -45,7 +47,7 @@ impl Runtime {
         reconcile_legacy_python_stages(&connection)?;
         reconcile_ambiguous_deliveries(&connection)?;
         reconcile_interrupted_jobs(&connection)?;
-        reconcile_recovery_deletions(&connection)?;
+        ensure_completion_recording_policy(&mut connection)?;
         Ok(Self {
             connection,
             subscribers: Vec::new(),
@@ -67,8 +69,8 @@ impl Runtime {
     /// daemon. Unlike `open`, this never performs crash reconciliation that
     /// could reinterpret the live daemon's active recording as abandoned.
     pub fn open_background_writer(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
-        let connection = Connection::open(path)?;
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let mut connection = Connection::open(path)?;
+        configure_writer(&mut connection)?;
         Ok(Self {
             connection,
             subscribers: Vec::new(),
@@ -199,8 +201,8 @@ impl Runtime {
 
     /// Permanently discards a recording after its audio has reached the
     /// durable captured checkpoint. The shared recovery deletion path moves
-    /// the audio into quarantine before committing `Deleted`, so a failed
-    /// checkpoint never strands a retryable row without its only audio copy.
+    /// the audio into quarantine before deleting the job row, so a failed
+    /// delete never strands a retryable row without its only audio copy.
     pub fn discard_recording(&mut self, id: JobId) -> Result<RecordingJob, RuntimeError> {
         let current = self.job(id)?.ok_or(RuntimeError::JobNotFound(id))?;
         if current.stage != JobStage::Captured {
@@ -243,8 +245,17 @@ impl Runtime {
             }) {
                 Ok(transcript) => transcript,
                 Err(ExternalError::NoSpeech) => {
-                    self.update_stage(id, JobStage::NoSpeech, None)?;
-                    let finished = self.job(id)?.ok_or(RuntimeError::JobNotFound(id))?;
+                    // Nothing to deliver or recover, so the job leaves the
+                    // in-flight table. The caller removes its audio.
+                    self.connection.execute(
+                        "DELETE FROM dictation_jobs WHERE runtime_id = ?1",
+                        [id.to_string()],
+                    )?;
+                    let finished = RecordingJob {
+                        stage: JobStage::NoSpeech,
+                        updated_at: Utc::now(),
+                        ..transcribing
+                    };
                     self.publish(RuntimeEvent::JobUpdated(finished.clone()));
                     return Ok(finished);
                 }
@@ -481,8 +492,10 @@ impl Runtime {
         self.deliver_ready(ready, delivery_gate, deliverer)
     }
 
-    /// Deletes explicit recovery data without exposing a crash window where
-    /// the database still offers a retry after the only audio copy is gone.
+    /// Deletes explicit recovery data, text and audio, without exposing a
+    /// crash window where the database still offers a retry after the only
+    /// audio copy is gone: the audio moves to quarantine, then the job row is
+    /// deleted, then the quarantine file is unlinked.
     pub fn delete_recovery(&mut self, id: JobId) -> Result<RecordingJob, RuntimeError> {
         let current = self.job(id)?.ok_or(RuntimeError::JobNotFound(id))?;
         if matches!(
@@ -508,18 +521,26 @@ impl Runtime {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => quarantine_path.exists(),
             Err(error) => return Err(error.into()),
         };
-        if let Err(error) = self.update_stage(id, JobStage::Deleted, None) {
+        if let Err(error) = self.connection.execute(
+            "DELETE FROM dictation_jobs WHERE runtime_id = ?1",
+            [id.to_string()],
+        ) {
             if quarantined && !current.audio_path.exists() {
                 fs::rename(&quarantine_path, &current.audio_path)?;
             }
-            return Err(error);
+            return Err(error.into());
         }
-        let deleted = self.job(id)?.expect("updated job must be readable");
+        let deleted = RecordingJob {
+            stage: JobStage::Deleted,
+            updated_at: Utc::now(),
+            error_message: None,
+            ..current
+        };
         self.publish(RuntimeEvent::JobUpdated(deleted.clone()));
         if quarantined {
-            // The durable row is already deleted. A rare unlink failure leaves
-            // a deterministic quarantine file that startup reconciliation can
-            // finish, never a falsely retryable job without audio.
+            // The job row is already gone. A rare unlink failure leaves a
+            // deterministic quarantine file that startup reconciliation
+            // removes, never a falsely retryable job without audio.
             let _ = fs::remove_file(quarantine_path);
         }
         Ok(deleted)
@@ -656,22 +677,7 @@ impl Runtime {
     }
 
     pub fn job(&self, id: JobId) -> Result<Option<RecordingJob>, RuntimeError> {
-        self.connection
-            .query_row(
-                r#"
-                SELECT id, runtime_id, started_at, updated_at, stage, audio_path,
-                       duration_seconds, transcription_model, transcription_provider,
-                       raw_transcript,
-                       final_text, copied_to_clipboard, paste_triggered,
-                       delivery_status, error_message, cleanup_error, processing_options
-                FROM dictation_jobs
-                WHERE runtime_id = ?1
-                "#,
-                [id.to_string()],
-                row_to_job,
-            )
-            .optional()?
-            .map_or(Ok(None), |job| job.map(Some))
+        load_job(&self.connection, id)
     }
 
     pub fn recoverable_jobs(&self) -> Result<Vec<RecordingJob>, RuntimeError> {
@@ -722,6 +728,41 @@ impl Runtime {
     }
 }
 
+/// Configures every connection that writes. WAL lets readers proceed while
+/// another connection writes. FULL keeps delivery checkpoints durable across
+/// power loss, so a submitted paste never becomes safely retryable again.
+/// Transactions begin IMMEDIATE so one that
+/// reads before it writes waits for a concurrent writer instead of failing
+/// with "database is locked".
+fn configure_writer(connection: &mut Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;",
+    )?;
+    connection.set_transaction_behavior(TransactionBehavior::Immediate);
+    Ok(())
+}
+
+/// Old completed rows cannot distinguish deleted history from a crash before
+/// history was saved. Never recreate their history or usage during migration.
+/// Mark them before accepting new recordings, and persist the decision even
+/// if audio cleanup fails or the process exits before maintenance runs.
+fn ensure_completion_recording_policy(connection: &mut Connection) -> rusqlite::Result<()> {
+    let transaction = connection.transaction()?;
+    let has_policy: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_jobs')
+         WHERE name = 'completion_recording_allowed')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_policy {
+        transaction.execute_batch(
+            "ALTER TABLE dictation_jobs ADD COLUMN completion_recording_allowed INTEGER NOT NULL DEFAULT 1;
+             UPDATE dictation_jobs SET completion_recording_allowed = 0 WHERE stage = 'delivered';",
+        )?;
+    }
+    transaction.commit()
+}
+
 fn ensure_runtime_id_column(connection: &Connection) -> rusqlite::Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(dictation_jobs)")?;
     let columns = statement
@@ -737,42 +778,27 @@ fn ensure_runtime_id_column(connection: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn recovery_delete_path(audio_path: &Path, id: JobId) -> PathBuf {
-    audio_path.with_file_name(format!(".agentdictate-delete-{id}.pending"))
-}
-
-fn reconcile_recovery_deletions(connection: &Connection) -> Result<(), RuntimeError> {
-    let mut statement = connection.prepare(
-        "SELECT runtime_id, audio_path, stage FROM dictation_jobs WHERE audio_path != ''",
-    )?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                PathBuf::from(row.get::<_, String>(1)?),
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
-    for (runtime_id, audio_path, stage) in rows {
-        let id = JobId::from_str(&runtime_id)
-            .map_err(|_| RuntimeError::InvalidJobId(runtime_id.clone()))?;
-        let quarantine_path = recovery_delete_path(&audio_path, id);
-        if !quarantine_path.exists() {
-            continue;
-        }
-        if stage == "deleted" || audio_path.exists() {
-            match fs::remove_file(&quarantine_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        } else {
-            fs::rename(quarantine_path, audio_path)?;
-        }
-    }
-    Ok(())
+/// Reads one job row. Takes a connection so a transaction can use it too.
+pub(crate) fn load_job(
+    connection: &Connection,
+    id: JobId,
+) -> Result<Option<RecordingJob>, RuntimeError> {
+    connection
+        .query_row(
+            r#"
+            SELECT id, runtime_id, started_at, updated_at, stage, audio_path,
+                   duration_seconds, transcription_model, transcription_provider,
+                   raw_transcript,
+                   final_text, copied_to_clipboard, paste_triggered,
+                   delivery_status, error_message, cleanup_error, processing_options
+            FROM dictation_jobs
+            WHERE runtime_id = ?1
+            "#,
+            [id.to_string()],
+            row_to_job,
+        )
+        .optional()?
+        .map_or(Ok(None), |job| job.map(Some))
 }
 
 fn ensure_delivery_status_column(connection: &Connection) -> rusqlite::Result<()> {
@@ -922,4 +948,75 @@ fn reconcile_interrupted_jobs(connection: &Connection) -> rusqlite::Result<()> {
         [timestamp(Utc::now())],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writers_reserve_the_write_lock_while_observers_keep_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("concurrent.sqlite");
+        let mut first = Runtime::open(&database).unwrap();
+        let mut second = Runtime::open_background_writer(&database).unwrap();
+        for connection in [&first.connection, &second.connection] {
+            let journal: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            let synchronous: i64 = connection
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal, "wal");
+            assert_eq!(
+                synchronous, 2,
+                "delivery checkpoints require FULL durability"
+            );
+        }
+        first
+            .connection
+            .execute_batch("CREATE TABLE writer_probe (value INTEGER);")
+            .unwrap();
+        let observer = Runtime::open_observer(&database).unwrap();
+        let transaction = first.connection.transaction().unwrap();
+        transaction
+            .execute("INSERT INTO writer_probe VALUES (1)", [])
+            .unwrap();
+
+        // IMMEDIATE must reserve the writer before any read can become stale.
+        // A zero timeout makes this lock assertion deterministic and fast.
+        second
+            .connection
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(matches!(
+            second.connection.transaction(),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        let count: i64 = observer
+            .connection
+            .query_row("SELECT COUNT(*) FROM writer_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "readers must see the last committed state without blocking"
+        );
+        transaction.commit().unwrap();
+
+        let transaction = second.connection.transaction().unwrap();
+        let value: i64 = transaction
+            .query_row("SELECT value FROM writer_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 1);
+        transaction
+            .execute("UPDATE writer_probe SET value = 2", [])
+            .unwrap();
+        transaction.commit().unwrap();
+        let value: i64 = observer
+            .connection
+            .query_row("SELECT value FROM writer_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 2);
+    }
 }

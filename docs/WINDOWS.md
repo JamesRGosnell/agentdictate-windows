@@ -71,6 +71,20 @@ Settings, history, recordings, logs, and runtime files live in
 current-user/System ACL. `AGENTDICTATE_DATA_HOME` overrides the data directory
 for isolated testing or a separate installation.
 
+After a successful delivery, completed job rows are removed. **Save history**
+controls whether the transcript remains in History; usage numbers are retained
+without transcript text. Deleting or clearing History survives a restart, and
+deleting a Recovery item removes its saved text and recording. Startup cleans
+finished recordings and unowned WAVs older than an hour, unless **Preserve
+temporary audio** is enabled. Failed dictations keep their recovery data.
+
+The retention upgrade preserves existing History and Recovery. It does not
+recreate missing History or usage from old completed jobs, because the old
+database cannot distinguish a deliberate deletion from an interrupted save.
+New deliveries still finish interrupted history bookkeeping after a restart.
+Database writers use WAL with FULL synchronization to preserve delivery
+checkpoints across power loss.
+
 Uninstall from Windows Installed apps. The uninstaller retains personal data
 and removes only known application files. Portable use is also supported:
 run `agentdictate.exe` directly from the extracted directory.

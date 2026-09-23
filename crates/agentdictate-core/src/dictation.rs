@@ -109,6 +109,9 @@ pub struct DictationOptions {
     pub cleanup_instruction: String,
     pub cleanup_timeout_ms: u32,
     pub streaming: bool,
+    /// Missing on older recordings; their current setting remains the fallback.
+    #[serde(default)]
+    pub save_history: Option<bool>,
     pub replacements: Vec<ReplacementRule>,
 }
 
@@ -166,6 +169,7 @@ impl DictationOptions {
             cleanup_instruction: instruction,
             cleanup_timeout_ms: settings.cleanup_timeout_ms.clamp(100, 30_000),
             streaming: settings.streaming_enabled,
+            save_history: Some(settings.save_history),
             replacements: if mode == DictationMode::Literal {
                 Vec::new()
             } else {
