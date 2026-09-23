@@ -40,7 +40,10 @@ The default shortcut is **Ctrl+Space**: press once to start, speak, and press
 again to stop. Change the shortcut or choose Hold mode in Settings. Escape
 cancels. Keep the destination text field focused when stopping the recording.
 The overlay stays centered above the primary monitor's taskbar and does not
-take focus. Dictate and Literal modes, replacements, vocabulary, recording
+take focus. A grey microphone with a moving ring indicates startup. Once audio
+is ready, the microphone turns red and the waveform and timer appear. The
+indicator initializes alongside the microphone, without a separate Listening
+banner. Dictate and Literal modes, replacements, vocabulary, recording
 retention, recovery, history search, usage, and available streaming/API options
 use the existing shared application code.
 

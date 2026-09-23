@@ -212,7 +212,7 @@ pub struct RecordingOverlayLayout {
     pub timer_width: f32,
 }
 
-/// Reserves room for the timer and divider inside the 184-pixel capsule.
+/// Reserves room for the microphone, timer and divider inside the capsule.
 /// The waveform uses the remaining space without colliding with long timers.
 pub fn recording_overlay_layout(timer_width: f32) -> RecordingOverlayLayout {
     let timer_width = if timer_width.is_finite() {
@@ -222,7 +222,7 @@ pub fn recording_overlay_layout(timer_width: f32) -> RecordingOverlayLayout {
     };
     let timer_x = 184.0 - timer_width - 16.0;
     RecordingOverlayLayout {
-        waveform: WaveformArea::new(18.0, (timer_x - 18.0 - 22.0).max(1.0), 20.0),
+        waveform: WaveformArea::new(48.0, (timer_x - 48.0 - 22.0).max(1.0), 20.0),
         timer_x,
         timer_width,
     }
@@ -345,8 +345,8 @@ fn fade_progress(elapsed: Duration, span: Duration) -> f32 {
 
 /// Presentation state derived from the workflow.
 ///
-/// The transient window intentionally mirrors the previous overlay and opens
-/// only while recording, transcribing, or cleaning, then lingers up to
+/// The transient window opens during microphone startup, recording,
+/// transcription, or cleaning, then lingers up to
 /// `OVERLAY_FADE_HOLD` while it fades out. Recovery remains durable in
 /// History rather than turning the overlay into a second action surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,7 +371,10 @@ impl OverlayState {
     }
 
     pub const fn is_visible(&self) -> bool {
-        matches!(self, Self::Recording | Self::Transcribing | Self::Cleaning)
+        matches!(
+            self,
+            Self::Starting | Self::Recording | Self::Transcribing | Self::Cleaning
+        )
     }
 
     pub const fn window_policy(&self) -> OverlayWindowPolicy {

@@ -137,10 +137,51 @@ fn assert_recording_content_fits(cx: &mut VisualTestContext) {
     let last_bar = cx
         .debug_bounds("recording-overlay-wave-19")
         .expect("last waveform bar renders");
+    let microphone = cx
+        .debug_bounds("recording-overlay-mic-ready")
+        .expect("ready microphone renders");
+    let first_bar = cx.debug_bounds("recording-overlay-wave-0").unwrap();
 
+    assert!(microphone.left() >= card.left());
+    assert!(microphone.right() + px(6.) <= first_bar.left());
     assert!(timer.left() >= card.left());
     assert!(timer.right() <= card.right() - px(9.));
     assert!(last_bar.right() <= timer.left() - px(7.));
+}
+
+#[gpui::test]
+fn waiting_mic_changes_to_ready_without_a_listening_banner(cx: &mut TestAppContext) {
+    let (audio_path, overlay, cx) = open_recording_overlay(cx, 0);
+    overlay.update(cx, |overlay, cx| {
+        overlay.set_state(agentdictate_ui::OverlayState::Starting);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let card = cx.debug_bounds("recording-overlay-card").unwrap();
+    let mic = cx.debug_bounds("recording-overlay-mic-waiting").unwrap();
+    let ring = cx.debug_bounds("recording-overlay-waiting-ring").unwrap();
+    assert_eq!(card.size, size(px(40.), px(40.)));
+    assert_eq!(card.center().x, px(OVERLAY_WIDTH as f32 / 2.));
+    assert_eq!(mic.center(), card.center());
+    assert_eq!(ring.size, mic.size);
+    for selector in [
+        "recording-overlay-mic-ready",
+        "recording-overlay-timer",
+        "recording-overlay-wave-0",
+        "recording-overlay-status-label",
+    ] {
+        assert!(cx.debug_bounds(selector).is_none(), "unexpected {selector}");
+    }
+
+    overlay.update(cx, |overlay, cx| {
+        overlay.set_state(agentdictate_ui::OverlayState::Recording);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_recording_content_fits(cx);
+    assert!(cx.debug_bounds("recording-overlay-waiting-ring").is_none());
+    assert!(cx.debug_bounds("recording-overlay-status-label").is_none());
+    fs::remove_file(audio_path).unwrap();
 }
 
 fn now_unix_millis() -> i64 {

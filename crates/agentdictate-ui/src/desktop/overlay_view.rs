@@ -25,6 +25,94 @@ fn busy_dot_alphas() -> [f32; 3] {
     })
 }
 
+fn microphone_indicator(starting: bool, elapsed: Duration) -> impl IntoElement {
+    let ring_phase = (elapsed.as_secs_f32() / 0.9).fract();
+    let ring_color: Hsla = gpui::rgb(0xe6a48a).into();
+    gpui::div()
+        .debug_selector(move || {
+            if starting {
+                "recording-overlay-mic-waiting"
+            } else {
+                "recording-overlay-mic-ready"
+            }
+            .to_owned()
+        })
+        .absolute()
+        .left(px(if starting { 3. } else { 7. }))
+        .top(px(3.))
+        .size(px(32.))
+        .child(
+            gpui::div()
+                .absolute()
+                .left(px(4.))
+                .top(px(4.))
+                .size(px(24.))
+                .rounded_full()
+                .bg(gpui::rgb(if starting { 0x47474f } else { 0xc94c42 })),
+        )
+        .when(starting, |mic| {
+            mic.child(
+                gpui::div()
+                    .debug_selector(|| "recording-overlay-waiting-ring".to_owned())
+                    .absolute()
+                    .size_full()
+                    .children((0..16).map(|index| {
+                        let fraction = index as f32 / 16.;
+                        let angle = fraction * std::f32::consts::TAU;
+                        let trail = (fraction - ring_phase).rem_euclid(1.);
+                        gpui::div()
+                            .absolute()
+                            .left(px(15. + 14. * angle.sin()))
+                            .top(px(15. - 14. * angle.cos()))
+                            .size(px(2.))
+                            .rounded_full()
+                            .bg(ring_color.opacity(0.15 + 0.85 * trail.powi(3)))
+                    })),
+            )
+        })
+        .child(
+            gpui::div()
+                .absolute()
+                .left(px(13.))
+                .top(px(8.))
+                .w(px(6.))
+                .h(px(10.))
+                .rounded_full()
+                .bg(gpui::rgb(0xffffff)),
+        )
+        .child(
+            gpui::div()
+                .absolute()
+                .left(px(10.))
+                .top(px(12.))
+                .w(px(12.))
+                .h(px(10.))
+                .border_2()
+                .border_t_0()
+                .border_color(gpui::rgb(0xffffff))
+                .rounded_b(px(6.)),
+        )
+        .child(
+            gpui::div()
+                .absolute()
+                .left(px(15.))
+                .top(px(22.))
+                .w(px(2.))
+                .h(px(3.))
+                .bg(gpui::rgb(0xffffff)),
+        )
+        .child(
+            gpui::div()
+                .absolute()
+                .left(px(12.))
+                .top(px(24.))
+                .w(px(8.))
+                .h(px(2.))
+                .rounded_full()
+                .bg(gpui::rgb(0xffffff)),
+        )
+}
+
 /// GPUI content for the bottom-centered recording status window.
 pub struct RecordingOverlay {
     state: OverlayState,
@@ -125,9 +213,10 @@ impl Render for RecordingOverlay {
         let label = self.state.label().to_owned();
         let stable_id = self.state.stable_id().to_owned();
         let recording = self.state == OverlayState::Recording;
+        let starting = self.state == OverlayState::Starting;
         // Processing states (transcribing, cleaning) animate a small pulsing
         // ellipsis so the helper visibly shows work in progress.
-        let busy = self.state.is_visible() && !recording;
+        let busy = self.state.is_visible() && !recording && !starting;
         let now = cx.background_executor().now();
         let shown_at = *self.shown_at.get_or_insert(now);
         let since_shown = now.saturating_duration_since(shown_at);
@@ -143,7 +232,7 @@ impl Render for RecordingOverlay {
         {
             window.on_next_frame(move |_, _| callback());
         }
-        if recording || busy || overlay_fade_active(since_shown, since_dismissal) {
+        if starting || recording || busy || overlay_fade_active(since_shown, since_dismissal) {
             window.request_animation_frame();
         }
         let busy_label = label
@@ -203,9 +292,9 @@ impl Render for RecordingOverlay {
                     gpui::div()
                         .debug_selector(|| "recording-overlay-card".to_owned())
                         .absolute()
-                        .left(px(8.))
+                        .left(px(if starting { 80. } else { 8. }))
                         .top(px(6.))
-                        .w(px(184.))
+                        .w(px(if starting { 40. } else { 184. }))
                         .h(px(40.))
                         .overflow_hidden()
                         .rounded(px(20.))
@@ -218,6 +307,9 @@ impl Render for RecordingOverlay {
                             blur_radius: px(6.),
                             spread_radius: px(0.),
                         }])
+                        .when(starting || recording, |card| {
+                            card.child(microphone_indicator(starting, since_shown))
+                        })
                         .when(recording, |card| {
                             card.children(bars.into_iter().enumerate().map(|(index, bar)| {
                                 gpui::div()
@@ -258,7 +350,7 @@ impl Render for RecordingOverlay {
                                     .child(timer),
                             )
                         })
-                        .when(!recording, |card| {
+                        .when(!recording && !starting, |card| {
                             card.child(
                                 gpui::div()
                                     .size_full()

@@ -216,7 +216,7 @@ fn daemon_waits_for_overlay_exit_before_delivery() {
     std::fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nIFS= read -r line\nprintf '%s' \"$line\" > '{}'\nwhile IFS= read -r line; do :; done\nprintf 'exited' > '{}'\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\nprintf 'exited' > '{}'\n",
             received.display(),
             helper_exited.display(),
         ),
@@ -251,7 +251,19 @@ fn daemon_waits_for_overlay_exit_before_delivery() {
     assert!(daemon.deliverer().delivered_after_exit);
     assert_eq!(std::fs::read_to_string(helper_exited).unwrap(), "exited");
     let encoded = std::fs::read_to_string(received).unwrap();
-    let recording: OverlayUpdate = serde_json::from_str(&encoded).unwrap();
+    let updates: Vec<OverlayUpdate> = encoded
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(matches!(
+        updates[0].workflow.phase,
+        WorkflowPhase::Starting { .. }
+    ));
+    assert!(updates[0].active_recording.is_none());
+    let recording = updates
+        .iter()
+        .find(|update| matches!(update.workflow.phase, WorkflowPhase::Recording { .. }))
+        .unwrap();
     assert_eq!(
         recording
             .active_recording

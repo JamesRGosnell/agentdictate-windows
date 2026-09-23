@@ -3,8 +3,8 @@ use std::fs;
 use agentdictate_core::{
     AppSnapshot, HistoryPageCursor, HistoryPageRequest, HistoryPageSnapshot, HistorySnapshot,
     HotkeyReadiness, JobId, JobStage, RecoverySnapshot, ReplacementRule, Settings,
-    UsageDaySnapshot, UsageSnapshot, UsageTotalsSnapshot, Workflow, WorkflowError, WorkflowSignal,
-    WorkspaceSnapshot,
+    UsageDaySnapshot, UsageSnapshot, UsageTotalsSnapshot, Workflow, WorkflowError, WorkflowPhase,
+    WorkflowSignal, WorkspaceSnapshot,
 };
 use agentdictate_runtime::{
     Deliverer, DeliveryGate, DeliveryGateError, DeliveryStatus, ExternalError,
@@ -33,6 +33,36 @@ pub trait RecordingController: Recorder {
 enum OverlayDeliveryGate {
     Headless(HeadlessDeliveryGate),
     Live(OverlayController),
+}
+
+/// Publishes the durable Starting checkpoint before microphone initialization
+/// blocks, allowing the presentation process to initialize in parallel.
+struct StartingRecorder<'a, R> {
+    inner: &'a mut R,
+    workflow: &'a mut Workflow,
+    sequence: &'a mut u64,
+    overlay: &'a OverlayDeliveryGate,
+}
+
+impl<R: Recorder> Recorder for StartingRecorder<'_, R> {
+    fn start(&mut self, job: &RecordingJob) -> Result<(), ExternalError> {
+        self.workflow
+            .apply(WorkflowSignal::StartRequested { job_id: job.id })
+            .map_err(|error| ExternalError::new(error.to_string()))?;
+        *self.sequence += 1;
+        if let OverlayDeliveryGate::Live(overlay) = self.overlay {
+            overlay.update(OverlayUpdate {
+                workflow: self.workflow.snapshot(),
+                active_recording: None,
+            });
+        }
+        tracing::info!(job_id = %job.id, "recording startup requested");
+        self.inner.start(job)
+    }
+
+    fn abort_start(&mut self, job: &RecordingJob) -> Result<(), ExternalError> {
+        self.inner.abort_start(job)
+    }
 }
 
 impl DeliveryGate for OverlayDeliveryGate {
@@ -156,31 +186,29 @@ where
                 transcription_provider: self.settings.transcription_provider,
                 transcription_model: self.settings.active_transcription_model().to_owned(),
             },
-            &mut self.recorder,
+            &mut StartingRecorder {
+                inner: &mut self.recorder,
+                workflow: &mut self.workflow,
+                sequence: &mut self.sequence,
+                overlay: &self.overlay,
+            },
         ) {
             Ok(job) => job,
             Err(error) => {
-                if let Some(failed) = self
-                    .runtime
-                    .recoverable_jobs()?
-                    .into_iter()
-                    .find(|job| job.audio_path == path)
-                {
-                    self.workflow
-                        .apply(WorkflowSignal::StartRequested { job_id: failed.id })?;
+                if let WorkflowPhase::Starting { job_id } = self.workflow.snapshot().phase {
                     self.workflow.apply(WorkflowSignal::Interrupted {
-                        job_id: failed.id,
-                        at: failed.stage,
+                        job_id,
+                        at: JobStage::Interrupted,
                     })?;
-                    self.recoverable_count = self.attention_recovery_count()?;
                     self.sequence += 1;
+                    // Dismiss the waiting indicator even if the database can
+                    // no longer be queried after a failed checkpoint.
                     self.publish_overlay_update();
+                    self.recoverable_count = self.attention_recovery_count()?;
                 }
                 return Err(error.into());
             }
         };
-        self.workflow
-            .apply(WorkflowSignal::StartRequested { job_id: job.id })?;
         self.workflow
             .apply(WorkflowSignal::FirstAudioFrameWritten { job_id: job.id })?;
         self.transcriber.begin_recording(&job);

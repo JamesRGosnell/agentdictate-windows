@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$Binary, [ValidateSet('recording','transcribing','cleaning')][string]$State = 'recording')
+param([string]$Binary, [ValidateSet('starting','recording','transcribing','cleaning')][string]$State = 'recording')
 if (!$Binary) { $Binary = Join-Path (Split-Path $PSScriptRoot) 'target/debug/agentdictated.exe' }
 $ErrorActionPreference = 'Stop'
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
@@ -101,7 +101,8 @@ $previousDataHome = $env:AGENTDICTATE_DATA_HOME
 try {
     $env:AGENTDICTATE_DATA_HOME = $taskProbeData
     $taskPhase = @{phase='recording';job_id=[guid]::NewGuid().ToString()}
-    if ($State -ne 'recording') { $taskPhase.phase = 'processing'; $taskPhase.stage = $State }
+    if ($State -eq 'starting') { $taskPhase.phase = 'starting' }
+    elseif ($State -ne 'recording') { $taskPhase.phase = 'processing'; $taskPhase.stage = $State }
     $taskActiveRecording = $null
     if ($State -eq 'recording') {
         $taskWavePath = Join-Path $taskProbeData 'synthetic-waveform.wav'

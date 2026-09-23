@@ -11,7 +11,7 @@ try {
     if ($LASTEXITCODE) { throw 'Native verification binaries failed to build.' }
     & 'target\debug\examples\verify_windows.exe' overlay
     if ($LASTEXITCODE) { throw 'Windows overlay lifecycle checks failed.' }
-    foreach ($taskOverlayState in @('recording','transcribing','cleaning')) {
+    foreach ($taskOverlayState in @('starting','recording','transcribing','cleaning')) {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-overlay.ps1 -State $taskOverlayState
         if ($LASTEXITCODE) { throw "Isolated native overlay check failed: $taskOverlayState" }
     }
