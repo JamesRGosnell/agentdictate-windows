@@ -16,9 +16,13 @@ commit the task's changes, push to `origin/main`, install, and restart
 `agentdictated` so the changed behavior is live. Follow the resource checks below
 before rebuilding. Preserve unrelated staged or working changes.
 
-On Windows, use `.\install.ps1 -NoStart`, then restart the installed
-`agentdictated.exe --service` in the background. Close the old Settings process
-before replacing its executable. The retained Linux installer is `./install.sh`.
+On Windows, use `.\install.ps1 -NoStart`, then restart the installed daemon
+through Explorer: `explorer.exe "$env:LOCALAPPDATA\Programs\AgentDictate\agentdictated.exe"`.
+Without arguments it starts `agentdictated.exe --service` and exits. Do not start
+the service directly from an agent or terminal shell: those shells run inside a
+Windows job object, and the daemon is killed silently when the shell's session
+ends. Close the old Settings process before replacing its executable. The
+retained Linux installer is `./install.sh`.
 
 For documentation or instruction-only maintenance, verify the edited documents,
 references, and applicable command contracts. Rebuild, reinstall, and daemon restart
