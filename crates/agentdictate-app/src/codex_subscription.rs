@@ -557,15 +557,25 @@ impl ChatGptCredentials {
                 account_id: cached.account_id.clone(),
             });
         }
-        let auth = self
+        let expiry = |auth: &ChatGptAuth| {
+            parse_jwt_claims(auth.access_token.expose())
+                .ok()
+                .and_then(|claims| claims.get("exp").and_then(Value::as_u64))
+        };
+        let mut provider = self
             .provider
             .lock()
-            .map_err(|_| "ChatGPT sign-in state is unavailable".to_owned())?
+            .map_err(|_| "ChatGPT sign-in state is unavailable".to_owned())?;
+        let mut auth = provider
             .load(force_refresh)
             .map_err(|error| error.to_string())?;
-        let expires_at_unix = parse_jwt_claims(auth.access_token.expose())
-            .ok()
-            .and_then(|claims| claims.get("exp").and_then(Value::as_u64));
+        // Codex can hand back a token that is about to lapse; refresh it now
+        // rather than failing the next request.
+        if !force_refresh && expiry(&auth).is_some_and(|expires| expires <= now + 120) {
+            auth = provider.load(true).map_err(|error| error.to_string())?;
+        }
+        drop(provider);
+        let expires_at_unix = expiry(&auth);
         let bearer = ChatGptBearer {
             token: auth.access_token.expose().to_owned(),
             account_id: auth.account_id.expose().to_owned(),

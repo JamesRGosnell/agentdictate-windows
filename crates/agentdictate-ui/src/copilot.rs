@@ -9,7 +9,7 @@ use agentdictate_core::{
 /// bar with its panel so the transparent area never blocks the meeting app.
 pub const COPILOT_WIDTH: f32 = 720.0;
 pub const COPILOT_BAR_HEIGHT: f32 = 64.0;
-pub const COPILOT_PANEL_HEIGHT: f32 = 540.0;
+pub const COPILOT_PANEL_HEIGHT: f32 = 480.0;
 pub const COPILOT_PANEL_GAP: f32 = 6.0;
 pub const COPILOT_TOP_MARGIN: f32 = 10.0;
 

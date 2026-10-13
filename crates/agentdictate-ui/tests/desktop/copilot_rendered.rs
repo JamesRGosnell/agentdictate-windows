@@ -171,7 +171,7 @@ fn ask_ai_requests_assistance_and_answers_open_the_panel(cx: &mut TestAppContext
         harness
             .host_calls()
             .iter()
-            .any(|call| call == "resize 720x634")
+            .any(|call| call == "resize 720x574")
     );
 }
 
