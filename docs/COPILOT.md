@@ -61,6 +61,29 @@ does not reach other apps, including chat apps that use it to send.
 The panel opens when there is something to show and collapses to the bar with
 the chevron. While collapsed, new answers reopen it.
 
+## Speakers and echo
+
+Headphones are not required. When the call plays through speakers, the
+microphone also hears the other side; the copilot removes that echo so their
+words are not written as **You**:
+
+- **Windows echo cancellation.** The copilot records the microphone the way
+  call apps do, in communications mode, so Windows applies its voice
+  processing: echo cancellation and noise suppression from the device or
+  Voice Clarity. It points echo cancellation at the device the call plays
+  through and does not trigger Windows' communications ducking.
+- **Echo gate.** The copilot also hears exactly what the speakers play. Every
+  20 ms it compares the microphone with that output and removes audio the
+  speakers explain, while your voice, even over the other side, passes. This
+  covers PCs without Windows echo cancellation and any residue.
+- **Transcript check.** A line from the microphone that repeats what the
+  other side just said is dropped.
+
+`agentdictate copilot --check` reports whether Windows echo cancellation is
+active. `agentdictate copilot --echo-test path\to\speech.wav` plays a recording
+through your speakers while the copilot listens and reports anything that
+reached **You**; run it in a quiet room without speaking.
+
 ## Answer engines
 
 Choose the engine and models in the copilot settings (the sliders button).
@@ -109,8 +132,9 @@ agentdictate copilot --check path\to\speech.wav --latency
 `--latency` also times each model with and without web search. The copilot
 logs to `%LOCALAPPDATA%\AgentDictate\logs\copilot.log*`.
 
-- **"Them" stays silent:** the copilot records the default playback device.
-  If your call plays through a different device, make it the Windows default.
-- **Your words appear as "Them":** use headphones. With speakers, the copilot
-  removes most echo but can miss some.
+- **"Them" stays silent:** the copilot records the default playback device and,
+  when it differs, the default communications device. If your call app plays
+  through a third device, make it the Windows default.
+- **Their words appear as "You":** run the echo test above. If it fails, check
+  that the call app and Windows use the same speakers.
 - **Claude Code is signed out:** run `claude auth login` in a terminal.
