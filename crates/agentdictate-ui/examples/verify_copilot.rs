@@ -5,7 +5,7 @@
 fn main() {
     use agentdictate_core::{
         AnswerSource, AnswerStatus, CopilotEvent, CopilotInsights, CopilotSettings, ListenState,
-        Speaker, TranscriptLine,
+        Situation, Speaker, TranscriptLine,
     };
     use agentdictate_ui::{
         AgentDictateAssets, COPILOT_BAR_HEIGHT, COPILOT_PANEL_GAP, COPILOT_PANEL_HEIGHT,
@@ -100,6 +100,7 @@ fn main() {
                 "Compare to competitors".into(),
                 "Ask about rollout timeline".into(),
             ],
+            situation: Situation::Conversation,
         }));
         feed(CopilotEvent::AnswerStarted {
             id: 1,

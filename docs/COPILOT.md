@@ -49,15 +49,21 @@ does not reach other apps, including chat apps that use it to send.
   researches, using web search when needed, and streams a verified answer with
   sources underneath. The instant draft never states specific prices, versions,
   dates, or news it cannot verify.
-- **Automatic answers.** When the other side asks you a question and pauses
-  for your reply, an answer starts without a keypress. Rhetorical questions,
-  questions they go on to answer themselves, and advice are skipped: the
-  copilot waits a moment to see whether they keep talking, and the fast model
-  confirms the question is aimed at you. Turn this off with **Answer questions
+- **Automatic answers.** When the other side asks you something and pauses
+  for your reply, an answer appears without a keypress. The fast model judges
+  each thing they say in context, so requests without a question mark ("walk
+  me through your pricing") and objections count, while rhetorical questions,
+  questions they answer themselves, remarks to someone else, and advice do
+  not. A question is drafted the moment it is transcribed, while it is being
+  judged, and shown only once confirmed; a rejected draft is discarded unseen,
+  so checking adds almost no delay. Turn this off with **Answer questions
   automatically**.
 - **Live insights.** The current topic, a short summary, any unanswered
   question directed at you as a card you can click to answer, and suggested
-  prompts.
+  prompts. Insights also tell a conversation you take part in from a
+  presentation or a video or podcast you are watching; in the latter two,
+  automatic answers pause and the panel says so, while insights and notes
+  continue.
 - **Quick actions.** What should I say?, Follow-up questions, Recap so far,
   Fact-check, and Explain my screen.
 - **Transcript.** Everything said, labeled **You** (your microphone) and

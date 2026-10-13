@@ -468,6 +468,61 @@ pub struct CopilotInsights {
     pub summary: Vec<String>,
     pub question: Option<String>,
     pub suggestions: Vec<String>,
+    #[serde(deserialize_with = "lenient_situation")]
+    pub situation: Situation,
+}
+
+/// What the copilot is listening to, judged from the transcript.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Situation {
+    /// Not enough to tell yet.
+    #[default]
+    Unclear,
+    /// A live conversation the user takes part in.
+    Conversation,
+    /// Someone presenting to an audience that includes the user.
+    Presentation,
+    /// A recording the user is watching or listening to, such as a video.
+    Media,
+}
+
+impl Situation {
+    /// Whether questions from the other side may be meant for the user, so
+    /// they can be answered without being asked.
+    #[must_use]
+    pub const fn user_takes_part(self) -> bool {
+        matches!(self, Self::Unclear | Self::Conversation)
+    }
+
+    const fn prompt_description(self) -> &'static str {
+        match self {
+            Self::Unclear => "not yet clear",
+            Self::Conversation => "a live conversation Me takes part in",
+            Self::Presentation => "a presentation to an audience that includes Me",
+            Self::Media => "a recording Me is watching or listening to",
+        }
+    }
+}
+
+/// Reads a model-written situation, treating anything unexpected as unclear
+/// so one odd value never discards the rest of the insights.
+fn lenient_situation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Situation, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let text = value
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    Ok(match text.as_str() {
+        "conversation" => Situation::Conversation,
+        "presentation" => Situation::Presentation,
+        "media" => Situation::Media,
+        _ => Situation::Unclear,
+    })
 }
 
 /// Shortcut labels as actually registered (fallbacks differ from defaults).
@@ -682,7 +737,10 @@ Respond with ONLY one JSON object and no other text, using exactly these keys:\n
  \"summary\": array of at most 3 very short bullets about the latest discussion,\n\
  \"question\": string or null - the most recent genuine question Them asked Me and paused for Me to answer, which Me has not answered yet, rewritten to be self-contained; \
 null for advice, opinions, instructions, statements, rhetorical questions, questions Them answered themselves, small talk, or when unsure,\n\
- \"suggestions\": array of at most 3 short clickable prompts (under 6 words) the user may want next, like \"Define <term>\" or \"Suggest a reply\"}"
+ \"suggestions\": array of at most 3 short clickable prompts (under 6 words) the user may want next, like \"Define <term>\" or \"Suggest a reply\",\n\
+ \"situation\": \"conversation\" if Me takes part in a live conversation, \"presentation\" if someone presents or lectures to an audience that includes Me, \
+\"media\" if Me is watching or listening to a recording such as a video or podcast (Them talk to each other or to a camera while Me stays silent), \
+or \"unclear\"}"
 }
 
 /// User turn for rolling insights.
@@ -740,21 +798,32 @@ const SMALL_TALK: [&str; 8] = [
     "how have you been",
 ];
 
-/// True when a line from the other side is very likely a substantive
-/// question worth answering immediately, before slower model detection.
-#[must_use]
-pub fn looks_like_question(text: &str) -> bool {
-    let normalized = text.trim().to_lowercase();
-    let words: Vec<&str> = normalized
+fn spoken_words(normalized: &str) -> Vec<&str> {
+    normalized
         .split(|character: char| !character.is_alphanumeric() && character != '\'')
         .filter(|word| !word.is_empty())
-        .collect();
-    if words.len() < 4 {
+        .collect()
+}
+
+/// True when a line from the other side says enough to judge whether the
+/// user should respond: not a fragment, a greeting, or a connection check.
+#[must_use]
+pub fn worth_judging(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase();
+    let words = spoken_words(&normalized);
+    words.len() >= 4
+        && !(SMALL_TALK.iter().any(|phrase| normalized.contains(phrase)) && words.len() < 9)
+}
+
+/// True when a line from the other side is very likely a substantive
+/// question, worth drafting an answer to before the fast model confirms it.
+#[must_use]
+pub fn looks_like_question(text: &str) -> bool {
+    if !worth_judging(text) {
         return false;
     }
-    if SMALL_TALK.iter().any(|phrase| normalized.contains(phrase)) && words.len() < 9 {
-        return false;
-    }
+    let normalized = text.trim().to_lowercase();
+    let words = spoken_words(&normalized);
     let ends_with_question = normalized.trim_end().ends_with('?');
     let opener = words
         .first()
@@ -817,28 +886,45 @@ pub fn is_echo_of(mine: &str, theirs: &str) -> bool {
         || utterance_similarity(mine, theirs) >= ECHO_SIMILARITY
 }
 
-/// System prompt deciding whether the other side's latest question is aimed
-/// at the user and needs an answer now.
+/// System prompt deciding whether the other side's latest line calls for the
+/// user to respond now, with help.
 #[must_use]
-pub const fn question_classifier_system_prompt() -> &'static str {
-    "You decide whether the user (\"Me\") should answer right now in a live conversation. \
-Look at the latest line from \"Them\". Answer true only if it asks Me something or asks Me to do or explain something, \
-and Me would be expected to respond next. Answer false for rhetorical questions, questions the speaker goes on to answer, \
-questions to someone else, small talk, and statements. Respond with ONLY {\"answer\": true} or {\"answer\": false}."
+pub const fn turn_judge_system_prompt() -> &'static str {
+    "You decide, during a live call, whether the user (\"Me\") should respond now to the latest line from \"Them\". \
+Answer true when that line asks Me a question, asks Me to do or explain something, or raises a concern or objection \
+Me needs to address, even without a question mark. Answer false for rhetorical questions, questions the speaker answers \
+or moves past, questions or remarks to someone else or to an audience, small talk, acknowledgments, and statements \
+that need no reply. When Me has not been speaking, Them may be talking to each other or to a camera, as in a video, \
+webinar, or podcast: answer true only if the line clearly addresses Me. \
+Respond with ONLY {\"answer\": true} or {\"answer\": false}."
 }
 
-/// User turn for the question classifier.
+/// What the turn judge knows beyond the transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnContext {
+    pub situation: Situation,
+    /// Seconds since the user last spoke, if they have.
+    pub me_last_spoke_secs: Option<u64>,
+}
+
+/// User turn for the turn judge.
 #[must_use]
-pub fn question_classifier_user_prompt(transcript: &str, latest: &str) -> String {
+pub fn turn_judge_user_prompt(transcript: &str, latest: &str, context: TurnContext) -> String {
+    let participation = match context.me_last_spoke_secs {
+        None => "Me has not spoken yet.".to_owned(),
+        Some(seconds) => format!("Me last spoke {seconds} seconds ago."),
+    };
     format!(
-        "<transcript>\n{transcript}\n</transcript>\n\nLatest line from Them: \"{}\"",
+        "<transcript>\n{transcript}\n</transcript>\n\nSituation: {}. {participation}\n\
+Latest line from Them: \"{}\"",
+        context.situation.prompt_description(),
         latest.trim()
     )
 }
 
-/// Reads the classifier's verdict, tolerating prose around the JSON.
+/// Reads the turn judge's verdict, tolerating prose around the JSON.
 #[must_use]
-pub fn parse_question_verdict(response: &str) -> Option<bool> {
+pub fn parse_turn_verdict(response: &str) -> Option<bool> {
     let start = response.find('{')?;
     let end = response.rfind('}')?;
     let value: serde_json::Value = serde_json::from_str(response.get(start..=end)?).ok()?;
@@ -1060,17 +1146,60 @@ mod tests {
     }
 
     #[test]
-    fn question_verdicts_parse_from_json_or_prose() {
-        assert_eq!(parse_question_verdict("{\"answer\": true}"), Some(true));
+    fn turn_verdicts_parse_and_prompts_carry_the_context() {
+        assert_eq!(parse_turn_verdict("{\"answer\": true}"), Some(true));
         assert_eq!(
-            parse_question_verdict("Sure: {\"answer\": false} done"),
+            parse_turn_verdict("Sure: {\"answer\": false} done"),
             Some(false)
         );
-        assert_eq!(parse_question_verdict("yes"), None);
-        assert!(
-            question_classifier_user_prompt("[0:01] Them: Hi", "How much?")
-                .contains("Latest line from Them: \"How much?\"")
+        assert_eq!(parse_turn_verdict("yes"), None);
+        let silent = turn_judge_user_prompt(
+            "[0:01] Them: Hi",
+            "How much?",
+            TurnContext {
+                situation: Situation::Unclear,
+                me_last_spoke_secs: None,
+            },
         );
+        assert!(silent.contains("Latest line from Them: \"How much?\""));
+        assert!(silent.contains("Me has not spoken yet."));
+        let talking = turn_judge_user_prompt(
+            "",
+            "Walk me through your pricing",
+            TurnContext {
+                situation: Situation::Conversation,
+                me_last_spoke_secs: Some(12),
+            },
+        );
+        assert!(talking.contains("a live conversation Me takes part in"));
+        assert!(talking.contains("Me last spoke 12 seconds ago."));
+    }
+
+    #[test]
+    fn situations_parse_leniently_and_gate_automatic_answers() {
+        let media = parse_insights("{\"topic\":\"Podcast\",\"situation\":\"Media\"}").unwrap();
+        assert_eq!(media.situation, Situation::Media);
+        assert!(!media.situation.user_takes_part());
+        // Unknown or missing values keep the rest of the insights.
+        let odd = parse_insights("{\"topic\":\"Sync\",\"situation\":\"standup\"}").unwrap();
+        assert_eq!(
+            (odd.topic.as_str(), odd.situation),
+            ("Sync", Situation::Unclear)
+        );
+        let missing = parse_insights("{\"topic\":\"Sync\",\"situation\":null}").unwrap();
+        assert_eq!(missing.situation, Situation::Unclear);
+        assert!(Situation::Unclear.user_takes_part());
+        assert!(Situation::Conversation.user_takes_part());
+        assert!(!Situation::Presentation.user_takes_part());
+    }
+
+    #[test]
+    fn substantial_lines_are_judged_even_without_a_question_mark() {
+        assert!(worth_judging(
+            "I'd love to understand how you handle security."
+        ));
+        assert!(!worth_judging("Can you hear me?"));
+        assert!(!worth_judging("Sounds good."));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! busy engine never delays the words the user is waiting for.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -19,15 +19,16 @@ use std::{
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights, CopilotProvider,
     CopilotSettings, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction, RESEARCHED_GUIDANCE,
-    Speaker, TranscriptLine, answer_system_prompt, answer_user_prompt,
+    Speaker, TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt,
     detected_question_instruction, insights_system_prompt, insights_user_prompt, is_echo_of,
     looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_insights,
-    parse_question_verdict, question_classifier_system_prompt, question_classifier_user_prompt,
-    render_transcript, typed_question_instruction, utterance_similarity,
+    parse_turn_verdict, render_transcript, turn_judge_system_prompt, turn_judge_user_prompt,
+    typed_question_instruction, utterance_similarity, worth_judging,
 };
 
 use super::{
     providers::{AnswerProvider, AnswerRequest, complete},
+    reveal::RevealGate,
     stream::StreamEvent,
     vad::{SegmentEvent, Utterance, wav_bytes},
 };
@@ -50,11 +51,12 @@ const ECHO_WINDOW_MS: u64 = 500;
 /// Silence after the other side's question before answering it: someone
 /// asking you something waits; a rhetorical question runs straight on.
 const QUESTION_PAUSE_MS: u64 = 1_000;
-/// Questions still waiting this long, for example while sound keeps playing,
-/// are dropped as stale.
-const QUESTION_EXPIRY: Duration = Duration::from_secs(8);
-/// Longest the fast model's confirmation is awaited before answering anyway.
-const QUESTION_VERDICT_WAIT: Duration = Duration::from_secs(3);
+/// Turns still waiting this long, for example while sound keeps playing, are
+/// dropped as stale.
+const TURN_EXPIRY: Duration = Duration::from_secs(8);
+/// Longest the fast model's judgment is awaited before deciding from the
+/// wording alone.
+const TURN_VERDICT_WAIT: Duration = Duration::from_secs(3);
 /// System-audio speech starting this long after a question ended is new
 /// speech. The segmenter needs over half a second of silence to end an
 /// utterance, while another device's copy of the question starts with it.
@@ -164,9 +166,10 @@ pub(crate) enum EngineMsg {
         text: String,
     },
     InsightsFinished(Result<Option<CopilotInsights>, String>),
-    QuestionVerdict {
+    /// Whether the user should respond to a turn; `None` when the judge failed.
+    TurnVerdict {
         id: u64,
-        directed: bool,
+        respond: Option<bool>,
     },
     Hotkey(HotkeyCommand),
     ShowRequested,
@@ -186,12 +189,24 @@ struct ThemSpan {
     text: Option<String>,
 }
 
-struct PendingQuestion {
+/// A line from the other side that may call for the user to respond.
+struct PendingTurn {
     id: u64,
     text: String,
     end_ms: u64,
-    directed: Option<bool>,
-    asked: Instant,
+    verdict: Option<bool>,
+    /// Worded like a question, so an answer is drafted before the verdict.
+    likely: bool,
+    draft: Option<Draft>,
+    heard: Instant,
+}
+
+/// An answer drafted ahead of the verdict, hidden until confirmed.
+struct Draft {
+    id: u64,
+    gate: Arc<RevealGate>,
+    /// Title and text, when the draft finished while still hidden.
+    finished: Option<(String, String)>,
 }
 
 struct PendingMine {
@@ -204,6 +219,7 @@ struct ActiveAnswer {
     id: u64,
     automatic: bool,
     cancel: Arc<AtomicBool>,
+    gate: Arc<RevealGate>,
 }
 
 /// Engine state, owned by the engine thread.
@@ -223,8 +239,10 @@ pub(crate) struct Engine {
     them_spans: VecDeque<ThemSpan>,
     pending_mine: Vec<PendingMine>,
     them_speaking: bool,
-    pending_question: Option<PendingQuestion>,
-    next_question: u64,
+    pending_turn: Option<PendingTurn>,
+    next_turn: u64,
+    /// Drafts discarded unseen, kept out of the meeting notes.
+    discarded: HashSet<u64>,
     next_answer: u64,
     active_answer: Option<ActiveAnswer>,
     answers: Vec<(String, String)>,
@@ -260,8 +278,9 @@ impl Engine {
             them_spans: VecDeque::new(),
             pending_mine: Vec::new(),
             them_speaking: false,
-            pending_question: None,
-            next_question: 1,
+            pending_turn: None,
+            next_turn: 1,
+            discarded: HashSet::new(),
             next_answer: 1,
             active_answer: None,
             answers: Vec::new(),
@@ -408,27 +427,15 @@ impl Engine {
                 text,
             } => self.handle_transcribed(speaker, start_ms, end_ms, text),
             EngineMsg::AnswerFinished { id, title, text } => {
-                if self
-                    .active_answer
-                    .as_ref()
-                    .is_some_and(|active| active.id == id)
-                {
-                    self.active_answer = None;
-                }
-                if !text.trim().is_empty() {
-                    self.answers.push((title, text));
-                }
+                self.handle_answer_finished(id, title, text);
             }
             EngineMsg::InsightsFinished(result) => self.handle_insights(result),
-            EngineMsg::QuestionVerdict { id, directed } => {
-                if let Some(pending) = self
-                    .pending_question
-                    .as_mut()
-                    .filter(|pending| pending.id == id)
-                {
-                    pending.directed = Some(directed);
+            EngineMsg::TurnVerdict { id, respond } => {
+                if let Some(turn) = self.pending_turn.as_mut().filter(|turn| turn.id == id) {
+                    // Without a verdict, the wording decides.
+                    turn.verdict = Some(respond.unwrap_or(turn.likely));
                 }
-                self.evaluate_question();
+                self.evaluate_turn();
             }
             EngineMsg::Hotkey(HotkeyCommand::Assist) => {
                 // The shortcut works while the copilot is hidden.
@@ -544,7 +551,7 @@ impl Engine {
                 if speaker == Speaker::Them {
                     self.them_speaking = active;
                     if !active {
-                        self.evaluate_question();
+                        self.evaluate_turn();
                     }
                 }
                 (self.ui)(CopilotEvent::Speaking { speaker, active });
@@ -648,12 +655,10 @@ impl Engine {
                     tracing::info!("dropped duplicate system-audio line");
                     return;
                 }
-                let question = looks_like_question(&line.text).then(|| line.text.clone());
+                let text = line.text.clone();
                 self.publish(line);
                 self.resolve_pending_mine(false);
-                if let Some(question) = question {
-                    self.consider_question(question, end_ms);
-                }
+                self.consider_turn(text, end_ms);
             }
             Speaker::Me => {
                 let nearby = self.nearby_them(start_ms, end_ms);
@@ -737,109 +742,199 @@ impl Engine {
         (self.ui)(CopilotEvent::Transcript(line));
     }
 
-    /// Starts confirming that a question from the other side is aimed at the
-    /// user. It is answered only once they pause and the fast model agrees.
-    fn consider_question(&mut self, question: String, end_ms: u64) {
-        if !self.settings.auto_answer || self.ending {
+    fn handle_answer_finished(&mut self, id: u64, title: String, text: String) {
+        if self
+            .active_answer
+            .as_ref()
+            .is_some_and(|active| active.id == id)
+        {
+            self.active_answer = None;
+        }
+        if self.discarded.remove(&id) || text.trim().is_empty() {
             return;
         }
-        let id = self.next_question;
-        self.next_question += 1;
-        self.pending_question = Some(PendingQuestion {
+        // A draft that finished unseen joins the notes only if it is shown.
+        if let Some(draft) = self
+            .pending_turn
+            .as_mut()
+            .and_then(|turn| turn.draft.as_mut())
+            .filter(|draft| draft.id == id && draft.gate.is_hidden())
+        {
+            draft.finished = Some((title, text));
+            return;
+        }
+        self.answers.push((title, text));
+    }
+
+    /// Judges whether a line from the other side calls for the user to
+    /// respond. A line worded like a question gets its answer drafted at once,
+    /// hidden until the judgment and a pause confirm it, so confirming adds no
+    /// delay; other lines are answered once the judge asks for it.
+    fn consider_turn(&mut self, text: String, end_ms: u64) {
+        if !self.settings.auto_answer
+            || self.ending
+            || !self.insights.situation.user_takes_part()
+            || !worth_judging(&text)
+        {
+            return;
+        }
+        self.drop_turn();
+        let id = self.next_turn;
+        self.next_turn += 1;
+        self.request_turn_verdict(id, &text);
+        let likely = looks_like_question(&text);
+        let draft = if likely && self.active_answer.is_none() && self.may_auto_answer(&text) {
+            self.answer_with(
+                AnswerKind::Detected {
+                    question: text.clone(),
+                    automatic: true,
+                },
+                true,
+            )
+            .map(|(id, gate)| Draft {
+                id,
+                gate,
+                finished: None,
+            })
+        } else {
+            None
+        };
+        self.pending_turn = Some(PendingTurn {
             id,
-            text: question.clone(),
+            text,
             end_ms,
-            directed: None,
-            asked: Instant::now(),
+            verdict: None,
+            likely,
+            draft,
+            heard: Instant::now(),
         });
+    }
+
+    fn request_turn_verdict(&self, id: u64, latest: &str) {
         let mut settings = self.settings.clone();
         settings.set_answer_model(self.settings.fast_model());
+        let now_ms = self.elapsed_ms();
+        let context = TurnContext {
+            situation: self.insights.situation,
+            me_last_spoke_secs: self
+                .transcript
+                .iter()
+                .rev()
+                .find(|line| line.speaker == Speaker::Me)
+                .map(|line| now_ms.saturating_sub(line.at_ms) / 1_000),
+        };
         let request = AnswerRequest {
-            system: question_classifier_system_prompt().to_owned(),
-            user: question_classifier_user_prompt(
+            system: turn_judge_system_prompt().to_owned(),
+            user: turn_judge_user_prompt(
                 &render_transcript(&self.transcript, INSIGHTS_TRANSCRIPT_CHARS),
-                &question,
+                latest,
+                context,
             ),
             image_jpeg: None,
             model: settings.answer_model(),
             effort: CopilotEffort::Low,
             web_search: false,
             max_output_tokens: 200,
-            cache_key: format!("{}-questions", self.session_key),
+            cache_key: format!("{}-turns", self.session_key),
         };
         let providers = Arc::clone(&self.services.providers);
         let messages = self.messages.clone();
         let _ = std::thread::Builder::new()
-            .name("copilot-question".into())
+            .name("copilot-turn".into())
             .spawn(move || {
                 let cancel = AtomicBool::new(false);
-                // If the check fails, the pause rule alone decides.
-                let directed = providers(&settings)
+                let respond = providers(&settings)
                     .and_then(|provider| complete(provider.as_ref(), &request, &cancel))
                     .ok()
-                    .and_then(|text| parse_question_verdict(&text))
-                    .unwrap_or(true);
-                let _ = messages.send(EngineMsg::QuestionVerdict { id, directed });
+                    .and_then(|text| parse_turn_verdict(&text));
+                let _ = messages.send(EngineMsg::TurnVerdict { id, respond });
             });
     }
 
-    /// Answers the pending question once the other side has paused after it
-    /// and the classifier confirmed it; drops it if they kept talking.
-    fn evaluate_question(&mut self) {
-        let Some(pending) = self.pending_question.as_ref() else {
+    /// Shows or starts the answer to the pending turn once the other side has
+    /// paused and the judge agrees; discards it if they kept talking.
+    fn evaluate_turn(&mut self) {
+        let Some(turn) = self.pending_turn.as_ref() else {
             return;
         };
         let resumed = self
             .them_spans
             .iter()
-            .any(|span| span.start_ms >= pending.end_ms + RESUMED_SPEECH_MS);
+            .any(|span| span.start_ms >= turn.end_ms + RESUMED_SPEECH_MS);
         if resumed {
-            tracing::info!("the other side kept talking; not answering their question");
-            self.pending_question = None;
+            tracing::info!("the other side kept talking; not answering");
+            self.drop_turn();
             return;
         }
-        if pending.asked.elapsed() > QUESTION_EXPIRY {
-            self.pending_question = None;
+        if turn.heard.elapsed() > TURN_EXPIRY {
+            self.drop_turn();
             return;
         }
         // A brief sound may be the start of more speech; wait to find out.
-        if self.them_speaking || self.elapsed_ms() < pending.end_ms + QUESTION_PAUSE_MS {
+        if self.them_speaking || self.elapsed_ms() < turn.end_ms + QUESTION_PAUSE_MS {
             return;
         }
-        let directed = match pending.directed {
-            Some(directed) => directed,
-            // A slow check, like a failed one, leaves the pause rule to decide.
-            None if pending.asked.elapsed() >= QUESTION_VERDICT_WAIT => true,
+        let respond = match turn.verdict {
+            Some(respond) => respond,
+            None if turn.heard.elapsed() >= TURN_VERDICT_WAIT => turn.likely,
             None => return,
         };
-        if !directed {
-            tracing::info!("question was not aimed at the user; not answering");
-            self.pending_question = None;
+        if !respond {
+            tracing::info!("the line was not aimed at the user; not answering");
+            self.drop_turn();
             return;
         }
-        if let Some(pending) = self.pending_question.take() {
-            self.maybe_auto_answer(pending.text);
+        let Some(turn) = self.pending_turn.take() else {
+            return;
+        };
+        if let Some(draft) = turn.draft
+            && draft.gate.reveal()
+        {
+            tracing::info!(
+                waited_ms = turn.heard.elapsed().as_millis() as u64,
+                "answering the other side automatically"
+            );
+            self.last_auto_question = Some((turn.text, Instant::now()));
+            if let Some(finished) = draft.finished {
+                self.answers.push(finished);
+            }
+            return;
+        }
+        self.maybe_auto_answer(turn.text);
+    }
+
+    /// Forgets the pending turn, discarding its hidden draft unseen.
+    fn drop_turn(&mut self) {
+        let Some(draft) = self.pending_turn.take().and_then(|turn| turn.draft) else {
+            return;
+        };
+        if draft.gate.discard() {
+            self.discarded.insert(draft.id);
+            if let Some(active) = self.active_answer.take_if(|active| active.id == draft.id) {
+                active.cancel.store(true, Ordering::Relaxed);
+            }
         }
     }
 
-    fn maybe_auto_answer(&mut self, question: String) {
-        if !self.settings.auto_answer || self.ending {
-            return;
-        }
+    /// Whether an automatic answer may start now: not a repeat of the last
+    /// one, and never over an answer the user asked for.
+    fn may_auto_answer(&self, question: &str) -> bool {
         if let Some((previous, at)) = &self.last_auto_question
             && (at.elapsed() < AUTO_ANSWER_COOLDOWN
-                || utterance_similarity(previous, &question) >= 0.6)
+                || utterance_similarity(previous, question) >= 0.6)
         {
-            return;
+            return false;
         }
-        if self
-            .active_answer
+        self.active_answer
             .as_ref()
-            .is_some_and(|active| !active.automatic)
-        {
+            .is_none_or(|active| active.automatic)
+    }
+
+    fn maybe_auto_answer(&mut self, question: String) {
+        if !self.settings.auto_answer || self.ending || !self.may_auto_answer(&question) {
             return;
         }
-        tracing::info!("answering the other side's question automatically");
+        tracing::info!("answering the other side automatically");
         self.last_auto_question = Some((question.clone(), Instant::now()));
         self.answer(AnswerKind::Detected {
             question,
@@ -850,16 +945,25 @@ impl Engine {
     fn cancel_answer(&mut self) {
         if let Some(active) = self.active_answer.take() {
             active.cancel.store(true, Ordering::Relaxed);
-            (self.ui)(CopilotEvent::AnswerStatus {
-                id: active.id,
-                status: AnswerStatus::Done,
-            });
+            if active.gate.discard() {
+                self.discarded.insert(active.id);
+            } else {
+                active.gate.send(CopilotEvent::AnswerStatus {
+                    id: active.id,
+                    status: AnswerStatus::Done,
+                });
+            }
         }
     }
 
     fn answer(&mut self, kind: AnswerKind) {
+        self.answer_with(kind, false);
+    }
+
+    /// Starts an answer, shown at once or held hidden for [`RevealGate::reveal`].
+    fn answer_with(&mut self, kind: AnswerKind, hidden: bool) -> Option<(u64, Arc<RevealGate>)> {
         if self.ending {
-            return;
+            return None;
         }
         self.cancel_answer();
         let id = self.next_answer;
@@ -890,12 +994,19 @@ impl Engine {
         let use_screen = wants_screen && self.settings.screen_context;
         let model = self.settings.answer_model();
         let cancel = Arc::new(AtomicBool::new(false));
+        let ui = Arc::clone(&self.ui);
+        let gate = Arc::new(if hidden {
+            RevealGate::hidden(ui)
+        } else {
+            RevealGate::shown(ui)
+        });
         self.active_answer = Some(ActiveAnswer {
             id,
             automatic,
             cancel: Arc::clone(&cancel),
+            gate: Arc::clone(&gate),
         });
-        (self.ui)(CopilotEvent::AnswerStarted {
+        gate.send(CopilotEvent::AnswerStarted {
             id,
             title: title.clone(),
             used_screen: use_screen,
@@ -908,12 +1019,13 @@ impl Engine {
         let instant = settings.instant_answers && fast_model != model;
         let providers = Arc::clone(&self.services.providers);
         let platform = Arc::clone(&self.services.platform);
-        let ui = Arc::clone(&self.ui);
+        let thread_gate = Arc::clone(&gate);
         let messages = self.messages.clone();
         let session_key = self.session_key.clone();
         let spawned = std::thread::Builder::new()
             .name("copilot-answer".into())
             .spawn(move || {
+                let gate = thread_gate;
                 let started = Instant::now();
                 let image = if use_screen {
                     match platform.capture_screen() {
@@ -943,7 +1055,7 @@ impl Engine {
                         cache_key: format!("{session_key}-instant"),
                     };
                     let providers = Arc::clone(&providers);
-                    let ui = Arc::clone(&ui);
+                    let gate = Arc::clone(&gate);
                     let cancel = Arc::clone(&cancel);
                     let instant_text = Arc::clone(&instant_text);
                     let _ = std::thread::Builder::new()
@@ -967,14 +1079,14 @@ impl Engine {
                                         if let Ok(mut text) = instant_text.lock() {
                                             text.push_str(&delta);
                                         }
-                                        ui(CopilotEvent::InstantDelta { id, text: delta });
+                                        gate.send(CopilotEvent::InstantDelta { id, text: delta });
                                     }
                                 })
                             });
                             if let Err(error) = result {
                                 tracing::warn!(%error, "copilot instant draft failed");
                             }
-                            ui(CopilotEvent::InstantFinished { id });
+                            gate.send(CopilotEvent::InstantFinished { id });
                         });
                 }
                 let request = AnswerRequest {
@@ -1006,20 +1118,22 @@ impl Engine {
                                         first_text_ms = started.elapsed().as_millis() as u64,
                                         "copilot answer streaming"
                                     );
-                                    ui(CopilotEvent::AnswerStatus {
+                                    gate.send(CopilotEvent::AnswerStatus {
                                         id,
                                         status: AnswerStatus::Streaming,
                                     });
                                 }
                                 text.push_str(&delta);
-                                ui(CopilotEvent::AnswerDelta { id, text: delta });
+                                gate.send(CopilotEvent::AnswerDelta { id, text: delta });
                             }
-                            StreamEvent::Searching(query) => ui(CopilotEvent::AnswerStatus {
-                                id,
-                                status: AnswerStatus::Searching(query),
-                            }),
+                            StreamEvent::Searching(query) => {
+                                gate.send(CopilotEvent::AnswerStatus {
+                                    id,
+                                    status: AnswerStatus::Searching(query),
+                                })
+                            }
                             StreamEvent::Source(source) => {
-                                ui(CopilotEvent::AnswerSource { id, source });
+                                gate.send(CopilotEvent::AnswerSource { id, source });
                             }
                             StreamEvent::Done | StreamEvent::Error(_) => {}
                         }
@@ -1036,7 +1150,7 @@ impl Engine {
                             AnswerStatus::Failed(error)
                         }
                     };
-                    ui(CopilotEvent::AnswerStatus { id, status });
+                    gate.send(CopilotEvent::AnswerStatus { id, status });
                 }
                 tracing::info!(
                     total_ms = started.elapsed().as_millis() as u64,
@@ -1048,18 +1162,23 @@ impl Engine {
                 {
                     text = instant.clone();
                 }
+                if gate.is_discarded() {
+                    text.clear();
+                }
                 let _ = messages.send(EngineMsg::AnswerFinished { id, title, text });
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start copilot answer");
+            return None;
         }
+        Some((id, gate))
     }
 
     fn tick(&mut self) {
         if !self.pending_mine.is_empty() {
             self.resolve_pending_mine(false);
         }
-        self.evaluate_question();
+        self.evaluate_turn();
         self.maybe_request_insights();
     }
 
@@ -1123,8 +1242,16 @@ impl Engine {
         };
         // A detected question is offered as a click-to-answer card; only the
         // other side's own pause-confirmed questions are answered unprompted.
+        let before = self.insights.situation;
         self.insights = insights.clone();
         (self.ui)(CopilotEvent::Insights(insights));
+        let after = self.insights.situation;
+        if before.user_takes_part() && !after.user_takes_part() {
+            tracing::info!(situation = ?after, "automatic answers paused");
+            self.drop_turn();
+        } else if !before.user_takes_part() && after.user_takes_part() {
+            tracing::info!(situation = ?after, "automatic answers resumed");
+        }
     }
 
     /// Ends the session: drains audio and transcription, then writes notes.
@@ -1290,6 +1417,8 @@ fn is_noise_transcript(text: &str, duration_ms: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use agentdictate_core::Situation;
+
     use super::*;
 
     struct FakeAudio;
@@ -1330,7 +1459,7 @@ mod tests {
                 sink(StreamEvent::Text(
                     r#"{"topic":"Pricing","summary":["Discussing plans"],"question":null,"suggestions":["Suggest a reply"]}"#.into(),
                 ));
-            } else if request.system == question_classifier_system_prompt() {
+            } else if request.system == turn_judge_system_prompt() {
                 // Tag questions in these fixtures are rhetorical.
                 let directed = !request.user.contains("isn't it");
                 sink(StreamEvent::Text(format!(r#"{{"answer": {directed}}}"#)));
@@ -1390,12 +1519,19 @@ mod tests {
                 Err(_)
                     if engine.active_answer.is_none()
                         && !engine.insights_in_flight
-                        && engine.pending_question.is_none() =>
+                        && engine.pending_turn.is_none() =>
                 {
                     return;
                 }
-                Err(_) => engine.evaluate_question(),
+                Err(_) => engine.evaluate_turn(),
             }
+        }
+    }
+
+    fn wait_for_requests(requests: &Arc<Mutex<Vec<AnswerRequest>>>, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while requests.lock().unwrap().len() < count && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -1462,16 +1598,17 @@ mod tests {
             CopilotEvent::AnswerStatus { status: AnswerStatus::Searching(query), .. } if query == "pricing"
         )));
         let requests = requests.lock().unwrap();
-        let classifier = requests
+        let judge = requests
             .iter()
-            .find(|request| request.system == question_classifier_system_prompt())
-            .expect("the question is confirmed before answering");
-        assert_eq!(classifier.model, "gpt-6-luna");
+            .find(|request| request.system == turn_judge_system_prompt())
+            .expect("the question is judged before it is shown");
+        assert_eq!(judge.model, "gpt-6-luna");
+        assert!(judge.user.contains("Me has not spoken yet."));
         let researched: Vec<_> = requests
             .iter()
             .filter(|request| {
                 !request.user.contains(INSTANT_GUIDANCE)
-                    && request.system != question_classifier_system_prompt()
+                    && request.system != turn_judge_system_prompt()
             })
             .collect();
         assert!(researched[0].user.contains("They just asked"));
@@ -1510,7 +1647,7 @@ mod tests {
         });
         drain(&mut engine, &incoming);
         assert_eq!(answers_started(&events), 0);
-        assert!(engine.pending_question.is_none());
+        assert!(engine.pending_turn.is_none());
     }
 
     #[test]
@@ -1556,7 +1693,7 @@ mod tests {
         let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
         engine.handle(message);
         assert_eq!(answers_started(&events), 0);
-        assert!(engine.pending_question.is_some());
+        assert!(engine.pending_turn.is_some());
         // The sound was not speech: the question stands and is answered.
         engine.handle_audio(AudioMsg::Speaking {
             speaker: Speaker::Them,
@@ -1567,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn questions_the_classifier_rejects_are_not_answered() {
+    fn questions_the_judge_rejects_are_discarded_unseen() {
         let (mut engine, incoming, events, requests, _directory) =
             harness(CopilotSettings::default());
         after_a_pause(&mut engine);
@@ -1579,7 +1716,89 @@ mod tests {
         );
         drain(&mut engine, &incoming);
         assert_eq!(answers_started(&events), 0);
-        assert_eq!(requests.lock().unwrap().len(), 1, "only the classifier ran");
+        // The draft started early, but never reaches the window or the notes.
+        assert!(requests.lock().unwrap().len() > 1);
+        assert!(events.lock().unwrap().iter().all(|event| !matches!(
+            event,
+            CopilotEvent::AnswerDelta { .. } | CopilotEvent::InstantDelta { .. }
+        )));
+        assert!(engine.answers.is_empty());
+    }
+
+    #[test]
+    fn answers_are_drafted_unseen_and_appear_once_the_judge_agrees() {
+        let (mut engine, incoming, events, requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("What does pricing look like for a team of ten?".into()),
+        );
+        // The judge and both answer lanes run at once.
+        wait_for_requests(&requests, 3);
+        assert_eq!(answers_started(&events), 0, "drafted out of sight");
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 1);
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::AnswerDelta { text, .. } if text.contains("$20")
+        )));
+        assert_eq!(engine.answers.len(), 1);
+    }
+
+    #[test]
+    fn requests_without_a_question_mark_are_answered_once_judged() {
+        let (mut engine, incoming, events, requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("I'd love to understand how you handle security reviews.".into()),
+        );
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 1);
+        assert_eq!(
+            requests.lock().unwrap()[0].system,
+            turn_judge_system_prompt()
+        );
+    }
+
+    #[test]
+    fn automatic_answers_pause_while_the_user_watches_a_recording() {
+        let (mut engine, incoming, events, requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        engine.handle_insights(Ok(Some(CopilotInsights {
+            topic: "Scaling a service business".into(),
+            situation: Situation::Media,
+            ..CopilotInsights::default()
+        })));
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("How do these numbers get pulled out of thin air?".into()),
+        );
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 0);
+        assert!(requests.lock().unwrap().is_empty(), "nothing is judged");
+        // Back in a conversation, questions are judged again.
+        engine.handle_insights(Ok(Some(CopilotInsights {
+            situation: Situation::Conversation,
+            ..CopilotInsights::default()
+        })));
+        engine.handle_transcribed(
+            Speaker::Them,
+            4_000,
+            6_000,
+            Ok("What does pricing look like for a team of ten?".into()),
+        );
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 1);
     }
 
     #[test]
@@ -1591,6 +1810,7 @@ mod tests {
             summary: vec!["Advice on daily check-ins".into()],
             question: Some("Instead of weekly, meet with them every single day".into()),
             suggestions: Vec::new(),
+            situation: Situation::Unclear,
         })));
         drain(&mut engine, &incoming);
         assert_eq!(answers_started(&events), 0);

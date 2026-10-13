@@ -12,7 +12,7 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings,
-    ListenState, QuickAction,
+    ListenState, QuickAction, Situation,
 };
 use agentdictate_ui::{
     CopilotShape, CopilotViewModel, CopilotWindow, CopilotWindowHost, test_support,
@@ -228,7 +228,9 @@ fn quick_actions_and_detected_questions_reach_the_engine(cx: &mut TestAppContext
         summary: vec!["Discussing seats".into()],
         question: Some("What is the annual price?".into()),
         suggestions: Vec::new(),
+        situation: Situation::Unclear,
     }));
+    assert!(!harness.has("copilot-situation"));
     // Insights open the panel once, unless the user collapsed it.
     harness.click(&*Box::leak(
         format!("copilot-quick-{}", QuickAction::Recap as usize).into_boxed_str(),
@@ -241,6 +243,18 @@ fn quick_actions_and_detected_questions_reach_the_engine(cx: &mut TestAppContext
             CopilotAction::AnswerQuestion("What is the annual price?".into()),
         ]
     );
+}
+
+#[gpui::test]
+fn the_panel_says_when_a_recording_pauses_automatic_answers(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Insights(CopilotInsights {
+        topic: "Scaling a service business".into(),
+        summary: vec!["Two hosts discuss pricing".into()],
+        situation: Situation::Media,
+        ..CopilotInsights::default()
+    }));
+    assert!(harness.has("copilot-situation"));
 }
 
 #[gpui::test]

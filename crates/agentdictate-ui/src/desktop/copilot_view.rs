@@ -10,7 +10,7 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode, CopilotProvider,
-    CopilotSettings, ListenState, QuickAction, Speaker, format_offset,
+    CopilotSettings, ListenState, QuickAction, Situation, Speaker, format_offset,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
@@ -146,6 +146,19 @@ fn icon_button(id: &'static str, name: &'static str, tint: u32) -> Stateful<Div>
 
 fn divider() -> impl IntoElement + use<> {
     div().w(px(1.)).h(px(16.)).mx(px(2.)).bg(color(BORDER))
+}
+
+/// What the panel says the copilot is listening to, and whether that has
+/// paused automatic answers.
+fn situation_label(situation: Situation, auto_answer: bool) -> Option<&'static str> {
+    match (situation, auto_answer) {
+        (Situation::Unclear, _) => None,
+        (Situation::Conversation, _) => Some("Conversation"),
+        (Situation::Presentation, true) => Some("Presentation \u{00b7} automatic answers paused"),
+        (Situation::Presentation, false) => Some("Presentation"),
+        (Situation::Media, true) => Some("Video or podcast \u{00b7} automatic answers paused"),
+        (Situation::Media, false) => Some("Video or podcast"),
+    }
 }
 
 fn section_label(text: &'static str) -> impl IntoElement + use<> {
@@ -1036,15 +1049,27 @@ impl CopilotWindow {
         }
         if has_insights {
             let suggestions = insights.suggestions.clone();
+            let situation = situation_label(insights.situation, self.model.settings.auto_answer);
             content = content.child(
                 v_flex()
                     .w_full()
                     .gap(px(8.))
                     .child(
                         h_flex()
+                            .w_full()
                             .gap(px(6.))
                             .child(icon("activity", 12., DIM))
-                            .child(section_label("Live insights")),
+                            .child(section_label("Live insights"))
+                            .when_some(situation, |row, label| {
+                                row.child(
+                                    div()
+                                        .debug_selector(|| "copilot-situation".to_owned())
+                                        .ml_auto()
+                                        .text_size(px(11.))
+                                        .text_color(color(DIM))
+                                        .child(label),
+                                )
+                            }),
                     )
                     .when(!insights.topic.is_empty(), |section| {
                         section.child(

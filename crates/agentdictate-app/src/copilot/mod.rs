@@ -13,6 +13,7 @@ mod check;
 mod engine;
 mod meeting;
 mod providers;
+mod reveal;
 mod store;
 mod stream;
 mod vad;
