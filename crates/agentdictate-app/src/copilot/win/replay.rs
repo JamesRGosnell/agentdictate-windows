@@ -79,24 +79,11 @@ fn replay(samples: &[f32], sink: &AudioSink, stop: &AtomicBool, paused: &AtomicB
     let speaker = Speaker::Them;
     let mut segmenter = Segmenter::new(SegmenterConfig::system_audio());
     let emit = |events: Vec<SegmentEvent>| {
-        for event in events {
-            match event {
-                SegmentEvent::SpeechStarted => sink(AudioMsg::Speaking {
-                    speaker,
-                    active: true,
-                }),
-                SegmentEvent::SpeechDiscarded => sink(AudioMsg::Speaking {
-                    speaker,
-                    active: false,
-                }),
-                SegmentEvent::Utterance(utterance) => {
-                    sink(AudioMsg::Speaking {
-                        speaker,
-                        active: false,
-                    });
-                    sink(AudioMsg::Utterance { speaker, utterance });
-                }
-            }
+        for message in events
+            .into_iter()
+            .flat_map(|event| AudioMsg::from_segment(speaker, event))
+        {
+            sink(message);
         }
     };
     // Let the window open before the "call" begins.

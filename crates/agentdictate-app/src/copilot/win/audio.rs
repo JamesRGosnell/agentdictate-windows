@@ -621,24 +621,11 @@ fn process(
     let mut gated_blocks = 0_u32;
     let mut was_paused = false;
     let emit = |events: Vec<SegmentEvent>| {
-        for event in events {
-            match event {
-                SegmentEvent::SpeechStarted => sink(AudioMsg::Speaking {
-                    speaker,
-                    active: true,
-                }),
-                SegmentEvent::SpeechDiscarded => sink(AudioMsg::Speaking {
-                    speaker,
-                    active: false,
-                }),
-                SegmentEvent::Utterance(utterance) => {
-                    sink(AudioMsg::Speaking {
-                        speaker,
-                        active: false,
-                    });
-                    sink(AudioMsg::Utterance { speaker, utterance });
-                }
-            }
+        for message in events
+            .into_iter()
+            .flat_map(|event| AudioMsg::from_segment(speaker, event))
+        {
+            sink(message);
         }
     };
     let mut received_audio = false;
@@ -652,11 +639,7 @@ fn process(
             was_paused = is_paused;
             if is_paused {
                 if let Some(utterance) = segmenter.flush() {
-                    sink(AudioMsg::Speaking {
-                        speaker,
-                        active: false,
-                    });
-                    sink(AudioMsg::Utterance { speaker, utterance });
+                    emit(vec![SegmentEvent::Utterance(utterance)]);
                 }
                 sink(AudioMsg::Level {
                     speaker,
@@ -743,11 +726,7 @@ fn process(
         }
     }
     if let Some(utterance) = segmenter.flush() {
-        sink(AudioMsg::Speaking {
-            speaker,
-            active: false,
-        });
-        sink(AudioMsg::Utterance { speaker, utterance });
+        emit(vec![SegmentEvent::Utterance(utterance)]);
     }
 }
 

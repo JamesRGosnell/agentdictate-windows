@@ -29,7 +29,7 @@ use agentdictate_core::{
 use super::{
     providers::{AnswerProvider, AnswerRequest, complete},
     stream::StreamEvent,
-    vad::{Utterance, wav_bytes},
+    vad::{SegmentEvent, Utterance, wav_bytes},
 };
 
 const TRANSCRIPTION_WORKERS: usize = 3;
@@ -41,8 +41,8 @@ const INSIGHTS_MIN_NEW_LINES: usize = 2;
 const AUTO_ANSWER_COOLDOWN: Duration = Duration::from_secs(6);
 const ECHO_WAIT: Duration = Duration::from_secs(4);
 /// Longest a microphone line waits for the other side to finish speaking;
-/// covers the longest system-audio utterance plus its transcription.
-const ECHO_WAIT_WHILE_SPEAKING: Duration = Duration::from_secs(15);
+/// covers the longest system-audio utterance (18 s) plus its transcription.
+const ECHO_WAIT_WHILE_SPEAKING: Duration = Duration::from_secs(30);
 /// System-audio speech within this much of a microphone line can be its
 /// source. Echo is heard while they speak, so this only absorbs timing drift
 /// between the two captures; a reply that starts after they finish is kept.
@@ -78,6 +78,31 @@ pub(crate) enum AudioMsg {
     Problem(String),
     /// Informational capture state, such as active echo cancellation.
     Status(String),
+}
+
+impl AudioMsg {
+    /// Messages for a segmenter event. A finished utterance is sent before the
+    /// end of speech, so the engine never sees a speaker go quiet without the
+    /// speech it judges echo and questions against.
+    pub(crate) fn from_segment(speaker: Speaker, event: SegmentEvent) -> Vec<Self> {
+        match event {
+            SegmentEvent::SpeechStarted => vec![Self::Speaking {
+                speaker,
+                active: true,
+            }],
+            SegmentEvent::SpeechDiscarded => vec![Self::Speaking {
+                speaker,
+                active: false,
+            }],
+            SegmentEvent::Utterance(utterance) => vec![
+                Self::Utterance { speaker, utterance },
+                Self::Speaking {
+                    speaker,
+                    active: false,
+                },
+            ],
+        }
+    }
 }
 
 pub(crate) trait AudioControl: Send {
@@ -814,6 +839,7 @@ impl Engine {
         {
             return;
         }
+        tracing::info!("answering the other side's question automatically");
         self.last_auto_question = Some((question.clone(), Instant::now()));
         self.answer(AnswerKind::Detected {
             question,
@@ -1379,6 +1405,24 @@ mod tests {
         engine.started = Instant::now() - Duration::from_secs(30);
     }
 
+    /// Feeds the capture thread's messages for a finished system-audio
+    /// utterance, checking pending work between them as the engine loop does.
+    fn them_finish_speaking(engine: &mut Engine, seconds: u64) {
+        let utterance = Utterance {
+            samples: vec![0; (seconds * 16_000) as usize],
+            start_sample: 0,
+            voiced_blocks: (seconds * 50) as usize,
+            peak_rms: 0.2,
+            lead_ms: 0,
+            tail_ms: 0,
+            released_after_ms: 0,
+        };
+        for message in AudioMsg::from_segment(Speaker::Them, SegmentEvent::Utterance(utterance)) {
+            engine.handle_audio(message);
+            engine.tick();
+        }
+    }
+
     fn answers_started(events: &Arc<Mutex<Vec<CopilotEvent>>>) -> usize {
         events
             .lock()
@@ -1467,6 +1511,30 @@ mod tests {
         drain(&mut engine, &incoming);
         assert_eq!(answers_started(&events), 0);
         assert!(engine.pending_question.is_none());
+    }
+
+    #[test]
+    fn a_rhetorical_question_is_not_answered_as_their_next_sentence_ends() {
+        let (mut engine, incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("How do these numbers get pulled out of thin air?".into()),
+        );
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: true,
+        });
+        let verdict = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(verdict);
+        // The moment their next sentence ends must not look like a pause
+        // after the question.
+        them_finish_speaking(&mut engine, 3);
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 0);
     }
 
     #[test]
@@ -1702,6 +1770,44 @@ mod tests {
             |event| matches!(event, CopilotEvent::Transcript(line) if line.speaker == Speaker::Me),
         );
         assert!(!mine, "speaker echo must not appear as the user");
+    }
+
+    #[test]
+    fn echo_heard_mid_sentence_waits_for_the_sentence_to_be_transcribed() {
+        let (mut engine, _incoming, events, _requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        after_a_pause(&mut engine);
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: true,
+        });
+        let now = engine.elapsed_ms();
+        engine.handle_transcribed(
+            Speaker::Me,
+            now - 2_500,
+            now - 1_500,
+            Ok("And we want full".into()),
+        );
+        them_finish_speaking(&mut engine, 4);
+        let mine = |events: &Arc<Mutex<Vec<CopilotEvent>>>| {
+            events.lock().unwrap().iter().any(
+                |event| matches!(event, CopilotEvent::Transcript(line) if line.speaker == Speaker::Me),
+            )
+        };
+        assert!(!mine(&events), "held until their sentence is known");
+        assert_eq!(engine.pending_mine.len(), 1);
+        let span = engine.them_spans.back().unwrap();
+        let (start_ms, end_ms) = (span.start_ms, span.end_ms);
+        engine.handle_transcribed(
+            Speaker::Them,
+            start_ms,
+            end_ms,
+            Ok("We're doing a 1,000-person event in Vegas, and we want full AV.".into()),
+        );
+        assert!(engine.pending_mine.is_empty());
+        assert!(!mine(&events), "speaker echo must not appear as the user");
     }
 
     #[test]
