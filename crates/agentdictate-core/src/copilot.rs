@@ -62,7 +62,9 @@ impl CopilotProvider {
         }
     }
 
-    /// Low-latency model for insights, question detection, and notes.
+    /// The provider's quickest model. Besides being the default for instant
+    /// drafts, it always judges turns and writes insights, whatever model the
+    /// user picks for drafts, because those must keep pace with the call.
     #[must_use]
     pub const fn default_fast_model(self) -> &'static str {
         match self {
@@ -114,6 +116,41 @@ impl CopilotProvider {
     #[must_use]
     pub const fn supports_screen(self) -> bool {
         true
+    }
+}
+
+/// How quickly a model responds in the copilot, from measured requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelPace {
+    Fastest,
+    Balanced,
+    Slower,
+}
+
+impl ModelPace {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fastest => "Fastest",
+            Self::Balanced => "Balanced",
+            Self::Slower => "Slower",
+        }
+    }
+}
+
+/// The pace of a known model; `None` for models not yet measured.
+#[must_use]
+pub fn model_pace(id: &str) -> Option<ModelPace> {
+    let id = id.trim().to_ascii_lowercase();
+    match id.as_str() {
+        "gpt-6-luna" | "gpt-5.6-luna" | "gpt-5.4-mini" | "haiku" | "claude-haiku-5-5" => {
+            Some(ModelPace::Fastest)
+        }
+        "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" | "sonnet" | "claude-sonnet-5-5" => {
+            Some(ModelPace::Balanced)
+        }
+        "gpt-6.1-sol" | "gpt-6-astra" | "opus" | "claude-opus-5-5" => Some(ModelPace::Slower),
+        _ => None,
     }
 }
 
@@ -292,7 +329,7 @@ pub struct CopilotSettings {
     pub provider: CopilotProvider,
     /// Answer model per provider; missing entries use the provider default.
     pub answer_models: BTreeMap<CopilotProvider, String>,
-    /// Fast model per provider for insights, detection, and notes.
+    /// Fast model per provider for instant drafts and meeting notes.
     pub fast_models: BTreeMap<CopilotProvider, String>,
     pub effort: CopilotEffort,
     /// A fast model drafts a reply while the answer model researches.
@@ -316,6 +353,8 @@ pub struct CopilotSettings {
     pub anthropic_api_key: String,
     pub openai_api_key: String,
     pub save_notes: bool,
+    /// Answers may draw on notes from earlier meetings.
+    pub use_past_meetings: bool,
     /// Optional ISO-639-1 transcription language; empty means automatic.
     pub language: String,
 }
@@ -342,6 +381,7 @@ impl Default for CopilotSettings {
             anthropic_api_key: String::new(),
             openai_api_key: String::new(),
             save_notes: true,
+            use_past_meetings: true,
             language: String::new(),
         }
     }
@@ -458,6 +498,17 @@ impl AnswerStatus {
 pub struct AnswerSource {
     pub title: String,
     pub url: String,
+}
+
+/// What the copilot can draw on beyond the conversation: the user's own
+/// documents and notes from earlier meetings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeSummary {
+    pub documents: usize,
+    pub meetings: usize,
+    pub words: usize,
+    /// Files in the knowledge folder that cannot be read, such as PDFs.
+    pub unreadable: Vec<String>,
 }
 
 /// Rolling meeting understanding from the fast model.
@@ -593,8 +644,14 @@ pub enum CopilotEvent {
     Show,
     /// Focus the ask box (global shortcut).
     FocusAsk,
+    Knowledge(KnowledgeSummary),
     Ending,
-    NotesSaved(String),
+    NotesSaved {
+        path: String,
+        /// Overview, key points, decisions, and action items, in Markdown.
+        summary: Option<String>,
+        follow_up: Option<String>,
+    },
     Exit,
 }
 
@@ -610,6 +667,9 @@ pub enum CopilotAction {
     ClearAnswers,
     UpdateSettings(Box<CopilotSettings>),
     OpenNotesFolder,
+    /// Opens the notes file written when the session ended.
+    OpenNotes,
+    OpenKnowledgeFolder,
     OpenUrl(String),
     CopyText(String),
     End,
@@ -688,7 +748,15 @@ How to respond:\n\
 
 /// The user turn for an answer request.
 #[must_use]
-pub fn answer_user_prompt(transcript: &str, instruction: &str, has_screen: bool) -> String {
+///
+/// `knowledge` holds excerpts from the user's documents and earlier meetings,
+/// which take precedence over general knowledge about the user's business.
+pub fn answer_user_prompt(
+    transcript: &str,
+    instruction: &str,
+    has_screen: bool,
+    knowledge: &str,
+) -> String {
     let transcript = if transcript.trim().is_empty() {
         "(No one has spoken yet.)"
     } else {
@@ -699,7 +767,18 @@ pub fn answer_user_prompt(transcript: &str, instruction: &str, has_screen: bool)
     } else {
         ""
     };
-    format!("<transcript>\n{transcript}\n</transcript>\n\n{screen}{instruction}")
+    let knowledge = knowledge.trim();
+    let knowledge = if knowledge.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<my_knowledge>\n{knowledge}\n</my_knowledge>\n\
+These are excerpts from my own documents and from notes of my earlier meetings. When they cover what is asked, \
+answer from them: they override web results and general knowledge about me and my business. Mention the document \
+briefly when you rely on it. Never invent facts about me or my business that are not in them or my profile.\n\n"
+        )
+    };
+    format!("{knowledge}<transcript>\n{transcript}\n</transcript>\n\n{screen}{instruction}")
 }
 
 /// Added to the instant draft's request: the fast model has no web access and
@@ -980,7 +1059,31 @@ pub fn meeting_notes_markdown(
 pub const fn notes_system_prompt() -> &'static str {
     "You write concise meeting notes from a transcript where \"Me\" is the user and \"Them\" is everyone else. \
 Use Markdown with these sections: a one-sentence overview, **Key points** (bullets), **Decisions** (bullets, or \"None\"), \
-and **Action items** (bullets with an owner when known, or \"None\"). Be factual and brief; do not invent details."
+and **Action items** (bullets with an owner when known, or \"None\"). If Me took part in a conversation with Them, \
+finish with **Follow-up email**: a short, ready-to-send email from Me to Them, in Me's voice, that thanks them, recaps \
+what was agreed, and lists next steps; omit it for presentations or recordings Me only listened to. \
+Be factual and brief; do not invent details."
+}
+
+/// Separates the follow-up email from the rest of a notes summary.
+#[must_use]
+pub fn split_follow_up(summary: &str) -> (String, Option<String>) {
+    let lines: Vec<&str> = summary.lines().collect();
+    let heading = lines.iter().position(|line| {
+        let label: String = line
+            .chars()
+            .filter(|character| character.is_alphanumeric() || character.is_whitespace())
+            .collect::<String>()
+            .to_lowercase();
+        let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+        matches!(label.as_str(), "followup email" | "follow up email")
+    });
+    let Some(heading) = heading else {
+        return (summary.trim().to_owned(), None);
+    };
+    let before = lines[..heading].join("\n").trim().to_owned();
+    let email = lines[heading + 1..].join("\n").trim().to_owned();
+    (before, (!email.is_empty()).then_some(email))
 }
 
 #[cfg(test)]
@@ -1075,7 +1178,7 @@ mod tests {
 
     #[test]
     fn user_prompt_marks_screens_and_empty_transcripts() {
-        let prompt = answer_user_prompt("", QuickAction::Recap.instruction(), true);
+        let prompt = answer_user_prompt("", QuickAction::Recap.instruction(), true, "");
         assert!(prompt.contains("(No one has spoken yet.)"));
         assert!(prompt.contains("screenshot of my screen is attached"));
     }
@@ -1191,6 +1294,52 @@ mod tests {
         assert!(Situation::Unclear.user_takes_part());
         assert!(Situation::Conversation.user_takes_part());
         assert!(!Situation::Presentation.user_takes_part());
+    }
+
+    #[test]
+    fn answers_draw_on_the_users_knowledge_first() {
+        let without = answer_user_prompt("[0:01] Them: Price?", "Answer.", false, "  ");
+        assert!(!without.contains("<my_knowledge>"));
+        let with = answer_user_prompt(
+            "[0:01] Them: Price?",
+            "Answer.",
+            false,
+            "[pricing.md] Growth plan: $49 per seat.",
+        );
+        assert!(with.starts_with("<my_knowledge>\n[pricing.md] Growth plan: $49 per seat."));
+        assert!(with.contains("override web results"));
+        assert!(with.find("<my_knowledge>") < with.find("<transcript>"));
+    }
+
+    #[test]
+    fn follow_up_emails_are_split_from_the_notes() {
+        let summary = "Overview.\n\n**Action items**\n- Send deck\n\n**Follow-up email**\nHi Sam,\n\nThanks for today.";
+        let (notes, email) = split_follow_up(summary);
+        assert_eq!(notes, "Overview.\n\n**Action items**\n- Send deck");
+        assert_eq!(email.as_deref(), Some("Hi Sam,\n\nThanks for today."));
+        let (notes, email) = split_follow_up("## Follow up email:\n");
+        assert_eq!((notes.as_str(), email), ("", None));
+        assert_eq!(split_follow_up("Just notes.").1, None);
+    }
+
+    #[test]
+    fn known_models_are_labeled_by_pace() {
+        assert_eq!(model_pace("gpt-6-luna"), Some(ModelPace::Fastest));
+        assert_eq!(model_pace("gpt-6-sol"), Some(ModelPace::Balanced));
+        assert_eq!(model_pace("gpt-6.1-sol"), Some(ModelPace::Slower));
+        assert_eq!(model_pace("gpt-6-astra"), Some(ModelPace::Slower));
+        assert_eq!(model_pace("some-new-model"), None);
+        assert_eq!(
+            model_pace(CopilotProvider::ChatgptSubscription.default_fast_model()),
+            Some(ModelPace::Fastest)
+        );
+    }
+
+    #[test]
+    fn past_meetings_are_used_unless_turned_off() {
+        assert!(CopilotSettings::default().use_past_meetings);
+        let saved: CopilotSettings = serde_json::from_str("{\"save_notes\": false}").unwrap();
+        assert!(saved.use_past_meetings);
     }
 
     #[test]

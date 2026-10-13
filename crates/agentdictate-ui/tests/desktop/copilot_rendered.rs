@@ -12,7 +12,7 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings,
-    ListenState, QuickAction, Situation,
+    KnowledgeSummary, ListenState, QuickAction, Situation,
 };
 use agentdictate_ui::{
     CopilotShape, CopilotViewModel, CopilotWindow, CopilotWindowHost, test_support,
@@ -255,6 +255,74 @@ fn the_panel_says_when_a_recording_pauses_automatic_answers(cx: &mut TestAppCont
         ..CopilotInsights::default()
     }));
     assert!(harness.has("copilot-situation"));
+}
+
+#[gpui::test]
+fn ending_shows_a_wrap_up_with_the_follow_up_ready_to_copy(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Ending);
+    assert!(
+        !harness.has("copilot-wrap-up"),
+        "notes are still being written"
+    );
+    harness.send(CopilotEvent::NotesSaved {
+        path: "C:/notes/2026-10-13 0900 Pilot.md".into(),
+        summary: Some("Agreed on a **30-day pilot**.".into()),
+        follow_up: Some("Hi Sam,\n\nThanks for today.".into()),
+    });
+    assert!(harness.has("copilot-wrap-up"));
+    assert!(harness.has("copilot-wrap-up-summary"));
+    assert!(harness.has("copilot-follow-up"));
+    harness.click("copilot-copy-follow-up");
+    harness.click("copilot-open-notes");
+    harness.click("copilot-done");
+    assert_eq!(
+        harness.actions(),
+        vec![
+            CopilotAction::CopyText("Hi Sam,\n\nThanks for today.".into()),
+            CopilotAction::OpenNotes,
+            CopilotAction::End,
+        ]
+    );
+}
+
+#[gpui::test]
+fn settings_show_the_knowledge_and_what_cannot_be_read(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.click("copilot-settings");
+    assert!(!harness.has("copilot-knowledge-unreadable"));
+    harness.send(CopilotEvent::Knowledge(KnowledgeSummary {
+        documents: 2,
+        meetings: 5,
+        words: 4_200,
+        unreadable: vec!["deck.pdf".into()],
+    }));
+    assert!(harness.has("copilot-knowledge-status"));
+    assert!(harness.has("copilot-knowledge-unreadable"));
+    harness.reveal_setting("copilot-open-knowledge");
+    harness.click("copilot-open-knowledge");
+    assert_eq!(harness.actions(), vec![CopilotAction::OpenKnowledgeFolder]);
+}
+
+#[gpui::test]
+fn an_untaught_copilot_invites_the_user_to_add_their_context(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.click("copilot-panel");
+    assert!(harness.has("copilot-teach"));
+    harness.click("copilot-teach");
+    assert!(harness.has("copilot-settings-body"));
+}
+
+#[gpui::test]
+fn a_copilot_that_knows_the_user_does_not_ask_to_be_taught(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Knowledge(KnowledgeSummary {
+        documents: 1,
+        ..KnowledgeSummary::default()
+    }));
+    harness.click("copilot-panel");
+    assert!(harness.has("copilot-live-body"));
+    assert!(!harness.has("copilot-teach"));
 }
 
 #[gpui::test]

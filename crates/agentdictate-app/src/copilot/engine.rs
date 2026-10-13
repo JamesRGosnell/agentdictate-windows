@@ -22,11 +22,12 @@ use agentdictate_core::{
     Speaker, TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt,
     detected_question_instruction, insights_system_prompt, insights_user_prompt, is_echo_of,
     looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_insights,
-    parse_turn_verdict, render_transcript, turn_judge_system_prompt, turn_judge_user_prompt,
-    typed_question_instruction, utterance_similarity, worth_judging,
+    parse_turn_verdict, render_transcript, split_follow_up, turn_judge_system_prompt,
+    turn_judge_user_prompt, typed_question_instruction, utterance_similarity, worth_judging,
 };
 
 use super::{
+    knowledge::{Knowledge, fingerprint},
     providers::{AnswerProvider, AnswerRequest, complete},
     reveal::RevealGate,
     stream::StreamEvent,
@@ -40,6 +41,10 @@ const INSIGHTS_INTERVAL: Duration = Duration::from_secs(20);
 /// New transcript lines required before insights are refreshed.
 const INSIGHTS_MIN_NEW_LINES: usize = 2;
 const AUTO_ANSWER_COOLDOWN: Duration = Duration::from_secs(6);
+/// How often the knowledge folders are checked for added or edited files.
+const KNOWLEDGE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+/// How long the wrap-up stays open when the user leaves it alone.
+const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(180);
 const ECHO_WAIT: Duration = Duration::from_secs(4);
 /// Longest a microphone line waits for the other side to finish speaking;
 /// covers the longest system-audio utterance (18 s) plus its transcription.
@@ -141,6 +146,8 @@ pub(crate) struct Services {
     pub models: ModelLoader,
     pub settings_path: PathBuf,
     pub notes_dir: PathBuf,
+    /// Documents the user wants answers to draw on.
+    pub knowledge_dir: PathBuf,
     pub language: String,
 }
 
@@ -174,6 +181,10 @@ pub(crate) enum EngineMsg {
     Hotkey(HotkeyCommand),
     ShowRequested,
     ModelsLoaded(CopilotProvider, Vec<ModelChoice>),
+    KnowledgeLoaded {
+        knowledge: Arc<Knowledge>,
+        fingerprint: u64,
+    },
 }
 
 struct TranscriptionJob {
@@ -243,6 +254,11 @@ pub(crate) struct Engine {
     next_turn: u64,
     /// Drafts discarded unseen, kept out of the meeting notes.
     discarded: HashSet<u64>,
+    knowledge: Arc<Knowledge>,
+    knowledge_fingerprint: Option<u64>,
+    knowledge_loading: bool,
+    knowledge_checked_at: Instant,
+    notes_path: Option<PathBuf>,
     next_answer: u64,
     active_answer: Option<ActiveAnswer>,
     answers: Vec<(String, String)>,
@@ -281,6 +297,11 @@ impl Engine {
             pending_turn: None,
             next_turn: 1,
             discarded: HashSet::new(),
+            knowledge: Arc::new(Knowledge::default()),
+            knowledge_fingerprint: None,
+            knowledge_loading: false,
+            knowledge_checked_at: Instant::now(),
+            notes_path: None,
             next_answer: 1,
             active_answer: None,
             answers: Vec::new(),
@@ -302,6 +323,7 @@ impl Engine {
     pub(crate) fn run(mut self, incoming: Receiver<EngineMsg>) {
         self.start_transcription_workers();
         self.load_models(self.settings.provider);
+        self.load_knowledge();
         self.start_audio();
         loop {
             match incoming.recv_timeout(Duration::from_millis(250)) {
@@ -377,6 +399,54 @@ impl Engine {
             });
     }
 
+    /// The folders answers draw on: the knowledge folder, plus meeting notes
+    /// when the user allows it.
+    fn knowledge_folders(&self) -> (PathBuf, Option<PathBuf>) {
+        (
+            self.services.knowledge_dir.clone(),
+            self.settings
+                .use_past_meetings
+                .then(|| self.services.notes_dir.clone()),
+        )
+    }
+
+    fn load_knowledge(&mut self) {
+        if self.knowledge_loading {
+            return;
+        }
+        self.knowledge_loading = true;
+        self.knowledge_checked_at = Instant::now();
+        let (documents, meetings) = self.knowledge_folders();
+        let messages = self.messages.clone();
+        let _ = std::thread::Builder::new()
+            .name("copilot-knowledge".into())
+            .spawn(move || {
+                let mut folders = vec![documents.as_path()];
+                folders.extend(meetings.as_deref());
+                let fingerprint = fingerprint(&folders);
+                let knowledge = Arc::new(Knowledge::load(&documents, meetings.as_deref()));
+                let _ = messages.send(EngineMsg::KnowledgeLoaded {
+                    knowledge,
+                    fingerprint,
+                });
+            });
+    }
+
+    /// Reloads the knowledge when its files have changed.
+    fn check_knowledge(&mut self) {
+        if self.knowledge_loading || self.knowledge_checked_at.elapsed() < KNOWLEDGE_CHECK_INTERVAL
+        {
+            return;
+        }
+        self.knowledge_checked_at = Instant::now();
+        let (documents, meetings) = self.knowledge_folders();
+        let mut folders = vec![documents.as_path()];
+        folders.extend(meetings.as_deref());
+        if self.knowledge_fingerprint != Some(fingerprint(&folders)) {
+            self.load_knowledge();
+        }
+    }
+
     fn start_audio(&mut self) {
         if self.audio.is_some() {
             return;
@@ -448,6 +518,23 @@ impl Engine {
                 (self.ui)(CopilotEvent::FocusAsk);
             }
             EngineMsg::ShowRequested => (self.ui)(CopilotEvent::Show),
+            EngineMsg::KnowledgeLoaded {
+                knowledge,
+                fingerprint,
+            } => {
+                let summary = knowledge.summary();
+                tracing::info!(
+                    documents = summary.documents,
+                    meetings = summary.meetings,
+                    words = summary.words,
+                    unreadable = summary.unreadable.len(),
+                    "copilot knowledge loaded"
+                );
+                self.knowledge = knowledge;
+                self.knowledge_fingerprint = Some(fingerprint);
+                self.knowledge_loading = false;
+                (self.ui)(CopilotEvent::Knowledge(summary));
+            }
             EngineMsg::ModelsLoaded(provider, models) => {
                 if provider == CopilotProvider::ChatgptSubscription {
                     self.chatgpt_models = models.iter().map(|model| model.id.clone()).collect();
@@ -499,6 +586,21 @@ impl Engine {
                     .platform
                     .open(&self.services.notes_dir.to_string_lossy());
             }
+            CopilotAction::OpenNotes => {
+                if let Some(path) = &self.notes_path {
+                    self.services.platform.open(&path.to_string_lossy());
+                }
+            }
+            CopilotAction::OpenKnowledgeFolder => {
+                let _ = std::fs::create_dir_all(&self.services.knowledge_dir);
+                self.services
+                    .platform
+                    .open(&self.services.knowledge_dir.to_string_lossy());
+                // Pick up new files soon after the user adds them.
+                self.knowledge_checked_at = Instant::now()
+                    .checked_sub(KNOWLEDGE_CHECK_INTERVAL - Duration::from_secs(3))
+                    .unwrap_or_else(Instant::now);
+            }
             CopilotAction::OpenUrl(url) => {
                 if url.starts_with("https://") || url.starts_with("http://") {
                     self.services.platform.open(&url);
@@ -523,6 +625,10 @@ impl Engine {
         (self.ui)(CopilotEvent::Settings(Box::new(self.settings.clone())));
         if previous.provider != self.settings.provider {
             self.load_models(self.settings.provider);
+        }
+        if previous.use_past_meetings != self.settings.use_past_meetings {
+            self.knowledge_fingerprint = None;
+            self.load_knowledge();
         }
         if previous.capture_microphone != self.settings.capture_microphone
             || previous.capture_system_audio != self.settings.capture_system_audio
@@ -812,7 +918,8 @@ impl Engine {
 
     fn request_turn_verdict(&self, id: u64, latest: &str) {
         let mut settings = self.settings.clone();
-        settings.set_answer_model(self.settings.fast_model());
+        // Judging keeps pace with the call whatever model drafts answers.
+        settings.set_answer_model(self.settings.provider.default_fast_model());
         let now_ms = self.elapsed_ms();
         let context = TurnContext {
             situation: self.insights.situation,
@@ -1014,6 +1121,7 @@ impl Engine {
             automatic,
         });
         let transcript = render_transcript(&self.transcript, ANSWER_TRANSCRIPT_CHARS);
+        let knowledge = self.knowledge_for(&kind);
         let settings = self.settings.clone();
         let fast_model = settings.fast_model();
         let instant = settings.instant_answers && fast_model != model;
@@ -1039,7 +1147,8 @@ impl Engine {
                     None
                 };
                 let system = answer_system_prompt(&settings);
-                let user = answer_user_prompt(&transcript, &instruction, image.is_some());
+                let user =
+                    answer_user_prompt(&transcript, &instruction, image.is_some(), &knowledge);
                 let instant_text = Arc::new(Mutex::new(String::new()));
                 if instant {
                     let mut fast_settings = settings.clone();
@@ -1174,7 +1283,28 @@ impl Engine {
         Some((id, gate))
     }
 
+    /// Excerpts from the user's documents and meetings for an answer: the
+    /// question itself leads the search, the latest conversation informs it.
+    fn knowledge_for(&self, kind: &AnswerKind) -> String {
+        let recent = |count: usize| {
+            let lines: Vec<&str> = self
+                .transcript
+                .iter()
+                .rev()
+                .take(count)
+                .map(|line| line.text.as_str())
+                .collect();
+            lines.into_iter().rev().collect::<Vec<_>>().join(" ")
+        };
+        let focus = match kind {
+            AnswerKind::Typed(question) | AnswerKind::Detected { question, .. } => question.clone(),
+            AnswerKind::Quick(_) => recent(2),
+        };
+        self.knowledge.excerpts(&focus, &recent(6))
+    }
+
     fn tick(&mut self) {
+        self.check_knowledge();
         if !self.pending_mine.is_empty() {
             self.resolve_pending_mine(false);
         }
@@ -1203,7 +1333,7 @@ impl Engine {
         self.last_insights_at = Some(Instant::now());
         self.lines_at_last_insights = self.transcript.len();
         let mut settings = self.settings.clone();
-        settings.set_answer_model(self.settings.fast_model());
+        settings.set_answer_model(self.settings.provider.default_fast_model());
         let request = AnswerRequest {
             system: insights_system_prompt().to_owned(),
             user: insights_user_prompt(&render_transcript(
@@ -1260,6 +1390,7 @@ impl Engine {
         self.cancel_answer();
         self.stop_audio();
         let deadline = Instant::now() + Duration::from_secs(6);
+        let mut close_requested = false;
         loop {
             // Flushed utterances arrive as audio messages; transcripts follow.
             match incoming.recv_timeout(Duration::from_millis(100)) {
@@ -1272,9 +1403,11 @@ impl Engine {
                     end_ms,
                     text,
                 }) => self.handle_transcribed(speaker, start_ms, end_ms, text),
-                Ok(EngineMsg::AnswerFinished { title, text, .. }) if !text.trim().is_empty() => {
-                    self.answers.push((title, text));
+                Ok(EngineMsg::AnswerFinished { id, title, text }) => {
+                    self.handle_answer_finished(id, title, text);
                 }
+                // Ending again while notes are written skips the wrap-up.
+                Ok(EngineMsg::Action(CopilotAction::End)) => close_requested = true,
                 Ok(_) | Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -1293,15 +1426,49 @@ impl Engine {
         match self.write_notes(summary.as_deref()) {
             Ok(path) => {
                 tracing::info!(path = %path.display(), "meeting notes saved");
-                (self.ui)(CopilotEvent::NotesSaved(
-                    path.to_string_lossy().into_owned(),
-                ));
-                // Leave time to open the notes folder before the window closes.
-                std::thread::sleep(Duration::from_secs(6));
+                let (summary, follow_up) = summary
+                    .as_deref()
+                    .map(split_follow_up)
+                    .map_or((None, None), |(notes, email)| {
+                        ((!notes.is_empty()).then_some(notes), email)
+                    });
+                (self.ui)(CopilotEvent::NotesSaved {
+                    path: path.to_string_lossy().into_owned(),
+                    summary,
+                    follow_up,
+                });
+                self.notes_path = Some(path);
+                if !close_requested {
+                    self.wrap_up(incoming);
+                }
             }
             Err(error) => tracing::error!(%error, "could not save meeting notes"),
         }
         (self.ui)(CopilotEvent::Exit);
+    }
+
+    /// Keeps the wrap-up open for copying the follow-up and opening the
+    /// notes, until the user is done with it.
+    fn wrap_up(&mut self, incoming: &Receiver<EngineMsg>) {
+        let deadline = Instant::now() + WRAP_UP_TIMEOUT;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match incoming.recv_timeout(left) {
+                Ok(EngineMsg::Action(CopilotAction::End)) => return,
+                Ok(EngineMsg::Action(
+                    action @ (CopilotAction::CopyText(_)
+                    | CopilotAction::OpenNotes
+                    | CopilotAction::OpenNotesFolder
+                    | CopilotAction::OpenUrl(_)),
+                )) => {
+                    self.handle_action(action);
+                }
+                Ok(EngineMsg::ShowRequested | EngineMsg::Hotkey(_)) => {
+                    (self.ui)(CopilotEvent::Show);
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
     }
 
     fn summarize(&self) -> Option<String> {
@@ -1459,6 +1626,11 @@ mod tests {
                 sink(StreamEvent::Text(
                     r#"{"topic":"Pricing","summary":["Discussing plans"],"question":null,"suggestions":["Suggest a reply"]}"#.into(),
                 ));
+            } else if request.system == notes_system_prompt() {
+                sink(StreamEvent::Text(
+                    "Agreed on a pilot.\n\n**Follow-up email**\nHi Sam,\n\nThanks for today."
+                        .into(),
+                ));
             } else if request.system == turn_judge_system_prompt() {
                 // Tag questions in these fixtures are rhetorical.
                 let directed = !request.user.contains("isn't it");
@@ -1498,6 +1670,7 @@ mod tests {
             models: Arc::new(|provider| provider.suggested_models()),
             settings_path: directory.path().join("copilot.json"),
             notes_dir: directory.path().join("meetings"),
+            knowledge_dir: directory.path().join("knowledge"),
             language: String::new(),
         };
         let engine = Engine::new(
@@ -1818,6 +1991,126 @@ mod tests {
             event,
             CopilotEvent::Insights(insights) if insights.question.is_some()
         )));
+    }
+
+    #[test]
+    fn answers_draw_on_the_users_documents() {
+        let (mut engine, incoming, _events, requests, directory) =
+            harness(CopilotSettings::default());
+        let knowledge = directory.path().join("knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        std::fs::write(knowledge.join("pricing.md"), "Growth plan: $49 per seat.").unwrap();
+        engine.load_knowledge();
+        let loaded = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(loaded);
+        engine.handle_action(CopilotAction::Ask("What do we charge per seat?".into()));
+        drain(&mut engine, &incoming);
+        let requests = requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| {
+            request
+                .user
+                .contains("<my_knowledge>\n[pricing.md]\nGrowth plan: $49 per seat.")
+        }));
+    }
+
+    #[test]
+    fn knowledge_summaries_reach_the_panel() {
+        let (mut engine, incoming, events, _requests, directory) =
+            harness(CopilotSettings::default());
+        let knowledge = directory.path().join("knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        std::fs::write(knowledge.join("offer.txt"), "Done-for-you outbound.").unwrap();
+        std::fs::write(knowledge.join("deck.pdf"), "%PDF").unwrap();
+        engine.load_knowledge();
+        let loaded = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(loaded);
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::Knowledge(summary)
+                if summary.documents == 1 && summary.unreadable == ["deck.pdf"]
+        )));
+    }
+
+    #[test]
+    fn judging_and_insights_use_the_quickest_model_whatever_drafts_use() {
+        let mut settings = CopilotSettings::default();
+        settings.set_fast_model("gpt-6-astra");
+        let (mut engine, incoming, _events, requests, _directory) = harness(settings);
+        after_a_pause(&mut engine);
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("What does pricing look like for a team of ten?".into()),
+        );
+        engine.handle_transcribed(Speaker::Me, 4_000, 5_000, Ok("Happy to explain.".into()));
+        engine.tick();
+        drain(&mut engine, &incoming);
+        let requests = requests.lock().unwrap();
+        let model_for = |marker: &dyn Fn(&AnswerRequest) -> bool| {
+            requests
+                .iter()
+                .find(|request| marker(request))
+                .map(|request| request.model.clone())
+        };
+        assert_eq!(
+            model_for(&|request| request.system == turn_judge_system_prompt()).as_deref(),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(
+            model_for(&|request| request.system.contains("monitor a live meeting")).as_deref(),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(
+            model_for(&|request| request.user.contains(INSTANT_GUIDANCE)).as_deref(),
+            Some("gpt-6-astra")
+        );
+    }
+
+    #[test]
+    fn ending_writes_notes_and_offers_the_follow_up_email() {
+        let (mut engine, incoming, events, _requests, directory) =
+            harness(CopilotSettings::default());
+        for (index, (speaker, text)) in [
+            (Speaker::Them, "Can we start with a pilot?"),
+            (Speaker::Me, "Yes, thirty days with ten seats."),
+            (Speaker::Them, "Great, send the details."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine.publish(TranscriptLine {
+                id: index as u64 + 1,
+                speaker,
+                text: text.into(),
+                at_ms: index as u64 * 2_000,
+            });
+        }
+        // Ending twice skips the wrap-up's wait.
+        engine
+            .messages
+            .send(EngineMsg::Action(CopilotAction::End))
+            .unwrap();
+        engine.finish(&incoming);
+        let events = events.lock().unwrap();
+        let saved = events
+            .iter()
+            .find_map(|event| match event {
+                CopilotEvent::NotesSaved {
+                    path,
+                    summary,
+                    follow_up,
+                } => Some((path.clone(), summary.clone(), follow_up.clone())),
+                _ => None,
+            })
+            .expect("notes are saved");
+        assert!(std::path::Path::new(&saved.0).starts_with(directory.path().join("meetings")));
+        assert_eq!(saved.1.as_deref(), Some("Agreed on a pilot."));
+        assert_eq!(saved.2.as_deref(), Some("Hi Sam,\n\nThanks for today."));
+        assert!(matches!(events.last(), Some(CopilotEvent::Exit)));
+        let notes = std::fs::read_to_string(&saved.0).unwrap();
+        assert!(notes.contains("Hi Sam,"));
     }
 
     #[test]

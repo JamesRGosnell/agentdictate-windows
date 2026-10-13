@@ -2,7 +2,7 @@
 
 use agentdictate_core::{
     AnswerSource, AnswerStatus, CopilotEvent, CopilotInsights, CopilotSettings, CopilotShortcuts,
-    ListenState, ModelChoice, Speaker, TranscriptLine,
+    KnowledgeSummary, ListenState, ModelChoice, Speaker, TranscriptLine,
 };
 
 /// Logical window metrics. The window resizes between the bar alone and the
@@ -105,6 +105,10 @@ pub struct CopilotViewModel {
     pub notice: Option<String>,
     pub ending: bool,
     pub notes_path: Option<String>,
+    /// The meeting summary shown when the session ends.
+    pub wrap_up: Option<String>,
+    pub follow_up: Option<String>,
+    pub knowledge: KnowledgeSummary,
     pub session_started_unix_ms: i64,
 }
 
@@ -127,6 +131,9 @@ impl CopilotViewModel {
             notice: None,
             ending: false,
             notes_path: None,
+            wrap_up: None,
+            follow_up: None,
+            knowledge: KnowledgeSummary::default(),
             session_started_unix_ms,
         }
     }
@@ -282,7 +289,16 @@ impl CopilotViewModel {
             CopilotEvent::Show => return CopilotEffect::Show,
             CopilotEvent::FocusAsk => return CopilotEffect::FocusAsk,
             CopilotEvent::Ending => self.ending = true,
-            CopilotEvent::NotesSaved(path) => self.notes_path = Some(path),
+            CopilotEvent::Knowledge(knowledge) => self.knowledge = knowledge,
+            CopilotEvent::NotesSaved {
+                path,
+                summary,
+                follow_up,
+            } => {
+                self.notes_path = Some(path);
+                self.wrap_up = summary;
+                self.follow_up = follow_up;
+            }
             CopilotEvent::Exit => return CopilotEffect::Exit,
         }
         CopilotEffect::None

@@ -205,7 +205,7 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
     let transcript_text = render_transcript(&transcript, 24_000);
     let request = AnswerRequest {
         system: answer_system_prompt(&settings),
-        user: answer_user_prompt(&transcript_text, &instruction, false),
+        user: answer_user_prompt(&transcript_text, &instruction, false, ""),
         image_jpeg: None,
         model: settings.answer_model(),
         effort: settings.effort,

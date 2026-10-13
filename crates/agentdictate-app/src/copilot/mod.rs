@@ -11,6 +11,7 @@
 #[cfg(windows)]
 mod check;
 mod engine;
+mod knowledge;
 mod meeting;
 mod providers;
 mod reveal;
@@ -266,6 +267,10 @@ pub fn run_copilot() -> anyhow::Result<()> {
             .database_file
             .parent()
             .map_or_else(|| paths.logs.join("meetings"), |root| root.join("meetings")),
+        knowledge_dir: paths.database_file.parent().map_or_else(
+            || paths.logs.join("knowledge"),
+            |root| root.join("knowledge"),
+        ),
         language,
     };
     let engine = Engine::new(

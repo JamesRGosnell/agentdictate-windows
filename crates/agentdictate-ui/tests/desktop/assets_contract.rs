@@ -16,10 +16,13 @@ fn desktop_controls_ship_every_icon_they_request() {
         // Meeting copilot controls.
         "icons/activity.svg",
         "icons/arrow-up.svg",
+        "icons/book.svg",
+        "icons/check.svg",
         "icons/chevron-up.svg",
         "icons/copy.svg",
         "icons/eye-off.svg",
         "icons/file-text.svg",
+        "icons/folder.svg",
         "icons/globe.svg",
         "icons/message-question.svg",
         "icons/mic.svg",

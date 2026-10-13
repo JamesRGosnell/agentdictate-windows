@@ -10,7 +10,8 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode, CopilotProvider,
-    CopilotSettings, ListenState, QuickAction, Situation, Speaker, format_offset,
+    CopilotSettings, ListenState, ModelChoice, QuickAction, Situation, Speaker, format_offset,
+    model_pace,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
@@ -110,6 +111,21 @@ fn chip(id: impl Into<gpui::ElementId>, selected: bool) -> Stateful<Div> {
         })
 }
 
+/// A model chip's label with its measured pace, like "GPT-6 Luna  Fastest".
+fn model_label(model: &ModelChoice) -> impl IntoElement + use<> {
+    h_flex()
+        .gap(px(6.))
+        .child(model.label.clone())
+        .when_some(model_pace(&model.id), |row, pace| {
+            row.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(color(DIM))
+                    .child(pace.label()),
+            )
+        })
+}
+
 /// Bar buttons occlude the bar's drag area so clicks reach them.
 fn bar_button(id: &'static str) -> Stateful<Div> {
     div()
@@ -146,6 +162,29 @@ fn icon_button(id: &'static str, name: &'static str, tint: u32) -> Stateful<Div>
 
 fn divider() -> impl IntoElement + use<> {
     div().w(px(1.)).h(px(16.)).mx(px(2.)).bg(color(BORDER))
+}
+
+/// How much the copilot knows beyond the conversation.
+fn knowledge_status(knowledge: &agentdictate_core::KnowledgeSummary) -> String {
+    let plural =
+        |count: usize, word: &str| format!("{count} {word}{}", if count == 1 { "" } else { "s" });
+    if knowledge.documents == 0 && knowledge.meetings == 0 {
+        return "Add pricing, product docs, case studies, or your resume to the knowledge \
+folder as Word, Markdown, or text files. Answers about you and your business come from them first."
+            .to_owned();
+    }
+    let mut parts = Vec::new();
+    if knowledge.documents > 0 {
+        parts.push(plural(knowledge.documents, "document"));
+    }
+    if knowledge.meetings > 0 {
+        parts.push(plural(knowledge.meetings, "past meeting"));
+    }
+    parts.push(plural(knowledge.words, "word"));
+    format!(
+        "{}. Answers about you and your business come from these first.",
+        parts.join(" \u{00b7} ")
+    )
 }
 
 /// What the panel says the copilot is listening to, and whether that has
@@ -433,6 +472,10 @@ impl CopilotWindow {
         let settings_event = matches!(event, CopilotEvent::Settings(_));
         let answer_started = matches!(event, CopilotEvent::AnswerStarted { .. });
         let insights = matches!(event, CopilotEvent::Insights(_));
+        let ending = matches!(
+            event,
+            CopilotEvent::Ending | CopilotEvent::NotesSaved { .. }
+        );
         match self.model.apply(event) {
             CopilotEffect::None => {}
             CopilotEffect::ToggleVisibility => self.set_visible(!self.visible, cx),
@@ -461,6 +504,14 @@ impl CopilotWindow {
         }
         if insights && !self.panel_open && !self.user_collapsed {
             self.panel_open = true;
+        }
+        if ending {
+            // The wrap-up is shown even if the copilot was hidden or collapsed.
+            self.panel_open = true;
+            self.settings_open = false;
+            self.tab = Tab::Live;
+            self.stop_typing(false, cx);
+            self.set_visible(true, cx);
         }
         if settings_event && !self.settings_open {
             self.load_text_settings(window, cx);
@@ -838,12 +889,13 @@ impl CopilotWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let body: AnyElement = if self.model.ending || self.model.notes_path.is_some() {
-            self.render_ending(cx).into_any_element()
-        } else if self.settings_open {
+        // After the meeting, the transcript stays one tab away from the wrap-up.
+        let body: AnyElement = if self.settings_open {
             self.render_settings(cx).into_any_element()
         } else if self.tab == Tab::Transcript {
             self.render_transcript().into_any_element()
+        } else if self.model.ending || self.model.notes_path.is_some() {
+            self.render_ending(window, cx).into_any_element()
         } else {
             self.render_live(window, cx).into_any_element()
         };
@@ -928,12 +980,19 @@ impl CopilotWindow {
             h_flex()
                 .gap(px(4.))
                 .child(
-                    tab_button("copilot-tab-live", "Live insights", tab == Tab::Live).on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.tab = Tab::Live;
-                            cx.notify();
-                        }),
-                    ),
+                    tab_button(
+                        "copilot-tab-live",
+                        if self.model.notes_path.is_some() {
+                            "Wrap-up"
+                        } else {
+                            "Live insights"
+                        },
+                        tab == Tab::Live,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.tab = Tab::Live;
+                        cx.notify();
+                    })),
                 )
                 .child(
                     tab_button(
@@ -1115,7 +1174,7 @@ impl CopilotWindow {
             );
         }
         if self.model.answers.is_empty() && !has_insights {
-            content = content.child(self.render_empty_state());
+            content = content.child(self.render_empty_state(cx));
         }
         if !earlier.is_empty() {
             content = content.child(section_label("Earlier"));
@@ -1174,6 +1233,7 @@ impl CopilotWindow {
             }
         }
         div()
+            .debug_selector(|| "copilot-live-body".to_owned())
             .id("copilot-live-body")
             .size_full()
             .overflow_y_scroll()
@@ -1181,7 +1241,9 @@ impl CopilotWindow {
             .child(content)
     }
 
-    fn render_empty_state(&self) -> impl IntoElement + use<> {
+    fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let untaught =
+            self.model.knowledge.documents == 0 && self.model.settings.profile.trim().is_empty();
         let shortcut = self
             .model
             .shortcuts
@@ -1238,6 +1300,21 @@ impl CopilotWindow {
                     .text_color(color(MUTED))
                     .child(detail),
             )
+            .when(untaught, |column| {
+                column.child(
+                    chip("copilot-teach", false)
+                        .debug_selector(|| "copilot-teach".to_owned())
+                        .mt(px(6.))
+                        .child(icon("book", 12., ACCENT))
+                        .child("Teach it about you and your business")
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.settings_open = true;
+                            this.panel_open = true;
+                            this.load_text_settings(window, cx);
+                            cx.notify();
+                        })),
+                )
+            })
     }
 
     fn render_answer(
@@ -1679,8 +1756,163 @@ impl CopilotWindow {
             )
     }
 
-    fn render_ending(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let saved = self.model.notes_path.clone();
+    fn render_ending(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.model.notes_path.is_some() {
+            return self.render_wrap_up(window, cx).into_any_element();
+        }
+        self.render_writing_notes().into_any_element()
+    }
+
+    /// The end of a session: the summary, the follow-up email ready to copy,
+    /// and the notes one click away.
+    fn render_wrap_up(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let style = TextViewStyle {
+            is_dark: true,
+            highlight_theme: HighlightTheme::default_dark(),
+            ..TextViewStyle::default()
+        }
+        .paragraph_gap(rems(0.55));
+        let topic = self.model.insights.topic.trim().to_owned();
+        let summary = self.model.wrap_up.clone();
+        let follow_up = self.model.follow_up.clone();
+        let mut content = v_flex().w_full().gap(px(16.)).p(px(18.)).child(
+            h_flex()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .size(px(36.))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(color(ACCENT_SOFT))
+                        .child(icon("check", 18., ACCENT)),
+                )
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(15.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Meeting wrapped up"),
+                        )
+                        .child(div().text_size(px(12.)).text_color(color(MUTED)).child(
+                            if topic.is_empty() {
+                                "Notes saved with the full transcript".to_owned()
+                            } else {
+                                topic
+                            },
+                        )),
+                ),
+        );
+        if let Some(summary) = summary {
+            content = content.child(
+                div()
+                    .debug_selector(|| "copilot-wrap-up-summary".to_owned())
+                    .w_full()
+                    .text_size(px(13.5))
+                    .line_height(rems(1.45))
+                    .child(
+                        TextView::markdown("copilot-wrap-up-summary", summary, window, cx)
+                            .style(style.clone())
+                            .selectable(true),
+                    ),
+            );
+        }
+        if let Some(email) = follow_up.clone() {
+            content = content.child(
+                v_flex()
+                    .debug_selector(|| "copilot-follow-up".to_owned())
+                    .w_full()
+                    .gap(px(8.))
+                    .p(px(14.))
+                    .rounded(px(12.))
+                    .bg(color(GLASS_RAISED))
+                    .border_1()
+                    .border_color(color(HAIRLINE))
+                    .child(section_label("Follow-up email"))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(13.5))
+                            .line_height(rems(1.45))
+                            .child(
+                                TextView::markdown("copilot-follow-up-text", email, window, cx)
+                                    .style(style)
+                                    .selectable(true),
+                            ),
+                    ),
+            );
+        }
+        let footer = h_flex()
+            .w_full()
+            .flex_none()
+            .gap(px(8.))
+            .px(px(16.))
+            .py(px(12.))
+            .border_t_1()
+            .border_color(color(HAIRLINE))
+            .when_some(follow_up, |row, email| {
+                row.child(
+                    chip("copilot-copy-follow-up", true)
+                        .debug_selector(|| "copilot-copy-follow-up".to_owned())
+                        .child(icon("copy", 12., ACCENT))
+                        .child("Copy follow-up email")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                            this.act(CopilotAction::CopyText(email.clone()));
+                        })),
+                )
+            })
+            .child(
+                chip("copilot-open-notes", false)
+                    .debug_selector(|| "copilot-open-notes".to_owned())
+                    .child(icon("file-text", 12., MUTED))
+                    .child("Open notes")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                        this.act(CopilotAction::OpenNotes);
+                    })),
+            )
+            .child(
+                chip("copilot-open-notes-folder", false)
+                    .child(icon("folder", 12., MUTED))
+                    .child("Notes folder")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                        this.act(CopilotAction::OpenNotesFolder);
+                    })),
+            )
+            .child(div().flex_1())
+            .child(
+                chip("copilot-done", true)
+                    .debug_selector(|| "copilot-done".to_owned())
+                    .child("Done")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.act(CopilotAction::End);
+                        cx.notify();
+                    })),
+            );
+        v_flex()
+            .debug_selector(|| "copilot-wrap-up".to_owned())
+            .size_full()
+            .child(
+                div()
+                    .id("copilot-wrap-up-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(content),
+            )
+            .child(footer)
+    }
+
+    fn render_writing_notes(&self) -> impl IntoElement + use<> {
         v_flex()
             .size_full()
             .items_center()
@@ -1701,11 +1933,7 @@ impl CopilotWindow {
                 div()
                     .text_size(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(if saved.is_some() {
-                        "Meeting notes saved"
-                    } else {
-                        "Writing your meeting notes\u{2026}"
-                    }),
+                    .child("Writing your meeting notes\u{2026}"),
             )
             .child(
                 div()
@@ -1713,20 +1941,10 @@ impl CopilotWindow {
                     .text_center()
                     .text_size(px(12.5))
                     .text_color(color(MUTED))
-                    .child(saved.clone().unwrap_or_else(|| {
-                        "Summarizing key points, decisions, and action items.".to_owned()
-                    })),
+                    .child(
+                        "Summarizing key points, decisions, action items, and a follow-up email.",
+                    ),
             )
-            .when(saved.is_some(), |column| {
-                column.child(
-                    chip("copilot-open-notes", true)
-                        .child(icon("file-text", 12., ACCENT))
-                        .child("Open notes folder")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
-                            this.act(CopilotAction::OpenNotesFolder);
-                        })),
-                )
-            })
     }
 
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1857,7 +2075,7 @@ impl CopilotWindow {
                         models.iter().cloned().enumerate().map(|(index, model)| {
                             let id = model.id.clone();
                             chip(("copilot-model", index), model.id == current_model)
-                                .child(model.label)
+                                .child(model_label(&model))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     let id = id.clone();
                                     this.update_settings(|settings| settings.set_answer_model(id));
@@ -1869,12 +2087,12 @@ impl CopilotWindow {
             .child(
                 v_flex()
                     .gap(px(8.))
-                    .child(section_label("Instant answers and insights"))
+                    .child(section_label("Instant answers"))
                     .child(h_flex().flex_wrap().gap(px(6.)).children(
                         models.into_iter().enumerate().map(|(index, model)| {
                             let id = model.id.clone();
                             chip(("copilot-fast-model", index), model.id == current_fast_model)
-                                .child(model.label)
+                                .child(model_label(&model))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     let id = id.clone();
                                     this.update_settings(|settings| settings.set_fast_model(id));
@@ -2004,6 +2222,49 @@ impl CopilotWindow {
                         settings.save_notes,
                         cx,
                         |settings| settings.save_notes = !settings.save_notes,
+                    )),
+            )
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(section_label("Your knowledge"))
+                    .child(
+                        div()
+                            .debug_selector(|| "copilot-knowledge-status".to_owned())
+                            .text_size(px(12.))
+                            .text_color(color(MUTED))
+                            .child(knowledge_status(&self.model.knowledge)),
+                    )
+                    .when(!self.model.knowledge.unreadable.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .debug_selector(|| "copilot-knowledge-unreadable".to_owned())
+                                .text_size(px(11.5))
+                                .text_color(color(ACCENT))
+                                .child(format!(
+                                    "Can't read yet: {}. Save them as Word (.docx), Markdown, or text.",
+                                    self.model.knowledge.unreadable.join(", ")
+                                )),
+                        )
+                    })
+                    .child(
+                        h_flex().child(
+                            chip("copilot-open-knowledge", true)
+                                .debug_selector(|| "copilot-open-knowledge".to_owned())
+                                .child(icon("folder", 12., ACCENT))
+                                .child("Open knowledge folder")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                                    this.act(CopilotAction::OpenKnowledgeFolder);
+                                })),
+                        ),
+                    )
+                    .child(toggle(
+                        "copilot-past-meetings",
+                        "Remember past meetings",
+                        "Answers can draw on notes from your earlier meetings.",
+                        settings.use_past_meetings,
+                        cx,
+                        |settings| settings.use_past_meetings = !settings.use_past_meetings,
                     )),
             )
             .child(

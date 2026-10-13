@@ -68,14 +68,39 @@ does not reach other apps, including chat apps that use it to send.
   Fact-check, and Explain my screen.
 - **Transcript.** Everything said, labeled **You** (your microphone) and
   **Them** (system audio).
-- **Meeting notes.** When you end the session with **✕**, the copilot writes a
-  summary with key points, decisions, and action items, followed by the
-  copilot's answers and the full transcript. Notes are saved in
+- **Wrap-up.** When you end the session with **✕**, the copilot writes notes
+  with a summary, key points, decisions, action items, and, when you took part
+  in a conversation, a ready-to-send follow-up email. The wrap-up shows them
+  with **Copy follow-up email**, **Open notes**, and the full transcript one
+  tab away; press **Done** when you are finished. Press **✕** again while the
+  notes are being written to close as soon as they are saved. Notes, with the
+  copilot's answers and the transcript, are saved in
   `%LOCALAPPDATA%\AgentDictate\meetings`; open the folder from the tray with
   **Meeting notes**.
 
 The panel opens when there is something to show and collapses to the bar with
 the chevron. While collapsed, new answers reopen it.
+
+## Your knowledge
+
+Answers about you and your business come from your own material first, so the
+copilot quotes your real prices, offer, and results instead of guessing.
+
+- **Knowledge folder.** In the copilot settings, choose **Open knowledge
+  folder** and add pricing sheets, product docs, case studies, FAQs, or your
+  resume as Word (`.docx`), Markdown, text, or CSV files. Subfolders are read
+  too. The folder is `%LOCALAPPDATA%\AgentDictate\knowledge`. A small set of
+  documents is given whole to every answer; a larger one is searched for the
+  parts that match the question. Changes are picked up within seconds, even
+  mid-call. PDFs and slides cannot be read yet; settings lists any it skipped
+  so you can save them as Word or text.
+- **Past meetings.** With **Remember past meetings** on, answers can also draw
+  on notes from your earlier meetings, such as what a client asked last time.
+- **About you** and **Standing instructions** describe your role and how you
+  like answers written; they apply to every answer.
+
+When nothing in your material covers a question, the copilot answers from
+general knowledge and web search, and never invents facts about your business.
 
 ## Speakers and echo
 
@@ -108,10 +133,16 @@ Choose the engine and models in the copilot settings (the sliders button).
 
 | Engine | Setup | Notes |
 | --- | --- | --- |
-| **ChatGPT** (default) | None. Uses the ChatGPT sign-in AgentDictate already uses. | Default models: GPT-6 Sol for researched answers, GPT-6 Luna for instant answers and insights. The model list comes from your account. |
+| **ChatGPT** (default) | None. Uses the ChatGPT sign-in AgentDictate already uses. | Default models: GPT-6 Sol for researched answers, GPT-6 Luna for instant answers. The model list comes from your account. |
 | **Claude API** | Paste an Anthropic API key in settings. | Claude Opus 5.5 by default, with Anthropic's web search tool. Sonnet 5.5, Haiku 5.5, and Fable 5.1 are also offered. |
 | **Claude Code** | Install Claude Code and run `claude auth login`. | Uses your Claude subscription through the `claude` CLI with its web tools. Opus by default. |
 | **OpenAI API** | Paste an OpenAI API key, or reuse the dictation key. | Uses the OpenAI Responses API with web search. |
+
+Models are labeled **Fastest**, **Balanced**, or **Slower** from measured
+response times. The fastest models suit instant answers; Balanced ones suit
+researched answers during live calls. Judging what to answer and live insights
+always use the engine's fastest model, whatever you pick, so they keep pace
+with the call.
 
 **Speed** sets how much the researched model reasons before answering. Fast is
 recommended during live calls.

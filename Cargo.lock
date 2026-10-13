@@ -47,6 +47,7 @@ dependencies = [
  "image",
  "ksni",
  "libc",
+ "miniz_oxide",
  "notify 8.2.0",
  "reqwest",
  "rusqlite",

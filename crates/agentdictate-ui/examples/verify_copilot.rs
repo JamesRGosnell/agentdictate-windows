@@ -4,8 +4,8 @@
 #[cfg(all(windows, feature = "desktop"))]
 fn main() {
     use agentdictate_core::{
-        AnswerSource, AnswerStatus, CopilotEvent, CopilotInsights, CopilotSettings, ListenState,
-        Situation, Speaker, TranscriptLine,
+        AnswerSource, AnswerStatus, CopilotEvent, CopilotInsights, CopilotSettings,
+        KnowledgeSummary, ListenState, Situation, Speaker, TranscriptLine,
     };
     use agentdictate_ui::{
         AgentDictateAssets, COPILOT_BAR_HEIGHT, COPILOT_PANEL_GAP, COPILOT_PANEL_HEIGHT,
@@ -39,6 +39,12 @@ fn main() {
         model.apply(event);
     };
     if state != "empty" {
+        feed(CopilotEvent::Knowledge(KnowledgeSummary {
+            documents: 3,
+            meetings: 4,
+            words: 5_240,
+            unreadable: vec!["Sales deck.pdf".into()],
+        }));
         feed(CopilotEvent::Listen(ListenState::Listening));
         for (index, level) in [
             0.1, 0.3, 0.55, 0.8, 0.6, 0.35, 0.7, 0.9, 0.5, 0.25, 0.4, 0.65, 0.3, 0.15,
@@ -158,6 +164,14 @@ fn main() {
                 status: AnswerStatus::Done,
             });
         }
+    }
+    if state == "wrapup" {
+        feed(CopilotEvent::Ending);
+        feed(CopilotEvent::NotesSaved {
+            path: "C:/Users/me/AppData/Local/AgentDictate/meetings/2026-10-13 0900 Enterprise pricing.md".into(),
+            summary: Some("Acme is evaluating dictation for about 200 engineers and asked for annual pricing.\n\n**Key points**\n- Needs strong technical vocabulary and terminal support\n- 200 seats on annual billing: **$18 per seat per month**\n\n**Decisions**\n- Start with a 30-day pilot for 25 engineers\n\n**Action items**\n- Me: send the pilot agreement and pricing by Friday\n- Them: name a pilot lead".into()),
+            follow_up: Some("Hi Sam,\n\nThanks for the time today. As discussed, we'll start with a **30-day pilot for 25 engineers**, then move to annual billing at $18 per seat per month.\n\nNext steps:\n- I'll send the pilot agreement and pricing by Friday\n- You'll name a pilot lead\n\nBest,\nJames".into()),
+        });
     }
     if state == "overview" {
         // The Settings window's Overview card that starts the copilot.
