@@ -133,16 +133,17 @@ Choose the engine and models in the copilot settings (the sliders button).
 
 | Engine | Setup | Notes |
 | --- | --- | --- |
-| **ChatGPT** (default) | None. Uses the ChatGPT sign-in AgentDictate already uses. | Default models: GPT-6 Sol for researched answers, GPT-6 Luna for instant answers. The model list comes from your account. |
+| **ChatGPT** (default) | None. Uses the ChatGPT sign-in AgentDictate already uses. | GPT-6 Sol by default for both researched answers (with web search) and instant answers (without, in about a second). The model list comes from your account. |
 | **Claude API** | Paste an Anthropic API key in settings. | Claude Opus 5.5 by default, with Anthropic's web search tool. Sonnet 5.5, Haiku 5.5, and Fable 5.1 are also offered. |
 | **Claude Code** | Install Claude Code and run `claude auth login`. | Uses your Claude subscription through the `claude` CLI with its web tools. Opus by default. |
 | **OpenAI API** | Paste an OpenAI API key, or reuse the dictation key. | Uses the OpenAI Responses API with web search. |
 
-Models are labeled **Fastest**, **Balanced**, or **Slower** from measured
-response times. The fastest models suit instant answers; Balanced ones suit
-researched answers during live calls. Judging what to answer and live insights
-always use the engine's fastest model, whatever you pick, so they keep pace
-with the call.
+Models are labeled from measured instant-draft times: **Fastest** (under a
+second, smaller models), **Fast** (about a second, larger models that know
+more), and **Slower** (several seconds). Fast models make the best instant
+answers: they start as quickly and draw on more world knowledge. Judging what
+to answer and live insights always use the engine's fastest model, whatever
+you pick, so they keep pace with the call.
 
 **Speed** sets how much the researched model reasons before answering. Fast is
 recommended during live calls.

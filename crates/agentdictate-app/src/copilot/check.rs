@@ -241,6 +241,58 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
                 let _ = answer(model_settings, &timed, &label, &mut report);
             }
         }
+        // Instant drafts trade world knowledge against speed: time the same
+        // knowledge question, asked as an instant draft, on each model.
+        let probe = [TranscriptLine {
+            id: 1,
+            speaker: Speaker::Them,
+            text: "Quick one: what's the difference between SOC 2 Type I and Type II, and how long does a Type II audit usually take?".into(),
+            at_ms: 1_000,
+        }];
+        let probe_user = answer_user_prompt(
+            &render_transcript(&probe, 24_000),
+            &detected_question_instruction(&probe[0].text),
+            false,
+            "",
+        );
+        let candidates = [
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+        ];
+        for round in 1..=2 {
+            for model in candidates
+                .iter()
+                .filter(|model| catalog.iter().any(|known| known == *model))
+            {
+                let mut model_settings = settings.clone();
+                model_settings.set_answer_model(*model);
+                let timed = AnswerRequest {
+                    system: answer_system_prompt(&settings),
+                    user: format!("{probe_user}\n\n{}", agentdictate_core::INSTANT_GUIDANCE),
+                    image_jpeg: None,
+                    model: (*model).to_owned(),
+                    effort: CopilotEffort::Low,
+                    web_search: false,
+                    max_output_tokens: 1024,
+                    cache_key: uuid::Uuid::new_v4().to_string(),
+                };
+                let label = format!("Instant draft {model}, round {round}");
+                if let Some(text) = answer(&model_settings, &timed, &label, &mut report)
+                    && round == 1
+                {
+                    report.info(
+                        text.split_whitespace()
+                            .take(45)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+            }
+        }
     }
     if !transcript.is_empty() {
         let insights_request = AnswerRequest {

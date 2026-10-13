@@ -1124,7 +1124,9 @@ impl Engine {
         let knowledge = self.knowledge_for(&kind);
         let settings = self.settings.clone();
         let fast_model = settings.fast_model();
-        let instant = settings.instant_answers && fast_model != model;
+        // The instant draft also helps when it uses the answer model: without
+        // web search it starts in about a second.
+        let instant = settings.instant_answers && (fast_model != model || settings.web_search);
         let providers = Arc::clone(&self.services.providers);
         let platform = Arc::clone(&self.services.platform);
         let thread_gate = Arc::clone(&gate);
@@ -1796,7 +1798,7 @@ mod tests {
             .iter()
             .find(|request| request.user.contains(INSTANT_GUIDANCE))
             .expect("an instant draft request");
-        assert_eq!(instant.model, "gpt-6-luna");
+        assert_eq!(instant.model, "gpt-6-sol");
         assert!(!instant.web_search);
         assert_eq!(engine.answers.len(), 1);
     }

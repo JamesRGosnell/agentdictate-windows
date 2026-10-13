@@ -62,9 +62,9 @@ impl CopilotProvider {
         }
     }
 
-    /// The provider's quickest model. Besides being the default for instant
-    /// drafts, it always judges turns and writes insights, whatever model the
-    /// user picks for drafts, because those must keep pace with the call.
+    /// The provider's quickest model. It always judges turns and writes
+    /// insights, whatever model the user picks for drafts, because those must
+    /// keep pace with the call.
     #[must_use]
     pub const fn default_fast_model(self) -> &'static str {
         match self {
@@ -72,6 +72,17 @@ impl CopilotProvider {
             Self::AnthropicApi => "claude-haiku-5-5",
             Self::ClaudeCode => "haiku",
             Self::OpenaiApi => "gpt-5.4-mini",
+        }
+    }
+
+    /// Default model for instant drafts: the most knowledgeable model that
+    /// still answers in about a second. Measured on ChatGPT, GPT-6 Sol starts
+    /// as fast as GPT-6 Luna (about 1.2 s without web search) and knows more.
+    #[must_use]
+    pub const fn default_instant_model(self) -> &'static str {
+        match self {
+            Self::ChatgptSubscription => "gpt-6-sol",
+            _ => self.default_fast_model(),
         }
     }
 
@@ -119,11 +130,15 @@ impl CopilotProvider {
     }
 }
 
-/// How quickly a model responds in the copilot, from measured requests.
+/// How quickly a model starts answering in the copilot, measured as the
+/// first words of an instant draft (no web search).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelPace {
+    /// Under a second; smaller models with less world knowledge.
     Fastest,
-    Balanced,
+    /// About a second; larger models, the best instant drafts.
+    Fast,
+    /// Several seconds.
     Slower,
 }
 
@@ -132,7 +147,7 @@ impl ModelPace {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Fastest => "Fastest",
-            Self::Balanced => "Balanced",
+            Self::Fast => "Fast",
             Self::Slower => "Slower",
         }
     }
@@ -147,7 +162,7 @@ pub fn model_pace(id: &str) -> Option<ModelPace> {
             Some(ModelPace::Fastest)
         }
         "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" | "sonnet" | "claude-sonnet-5-5" => {
-            Some(ModelPace::Balanced)
+            Some(ModelPace::Fast)
         }
         "gpt-6.1-sol" | "gpt-6-astra" | "opus" | "claude-opus-5-5" => Some(ModelPace::Slower),
         _ => None,
@@ -404,7 +419,7 @@ impl CopilotSettings {
             .get(&self.provider)
             .map(|model| model.trim())
             .filter(|model| !model.is_empty())
-            .unwrap_or(self.provider.default_fast_model())
+            .unwrap_or(self.provider.default_instant_model())
             .to_owned()
     }
 
@@ -783,7 +798,7 @@ briefly when you rely on it. Never invent facts about me or my business that are
 
 /// Added to the instant draft's request: the fast model has no web access and
 /// must not guess facts the researched answer will verify.
-pub const INSTANT_GUIDANCE: &str = "Reply in at most two sentences the user can say right now, then at most two short bullets. You have no web access: never state specific prices, versions, dates, statistics, or recent events unless they appear in the conversation or on screen. If the answer depends on them, give a natural line that buys a moment while the details are confirmed.";
+pub const INSTANT_GUIDANCE: &str = "Reply in at most two sentences the user can say right now, then at most two short bullets. You have no web access: answer from what you reliably know and from my knowledge excerpts. For anything that changes or that you are unsure of, such as current prices, recent events, the latest versions, or exact figures, never guess: give a natural line that buys a moment while the details are confirmed.";
 
 /// Added to the researched answer's request when an instant draft is shown
 /// above it.
@@ -1105,7 +1120,7 @@ mod tests {
         assert_eq!(settings.provider, CopilotProvider::ChatgptSubscription);
         assert_eq!(settings.answer_model(), "gpt-6-sol");
         assert!(settings.instant_answers);
-        assert_eq!(settings.fast_model(), "gpt-6-luna");
+        assert_eq!(settings.fast_model(), "gpt-6-sol");
         assert!(
             settings.web_search && settings.auto_answer && settings.launch_from_dictation_hotkey
         );
@@ -1325,13 +1340,19 @@ mod tests {
     #[test]
     fn known_models_are_labeled_by_pace() {
         assert_eq!(model_pace("gpt-6-luna"), Some(ModelPace::Fastest));
-        assert_eq!(model_pace("gpt-6-sol"), Some(ModelPace::Balanced));
+        assert_eq!(model_pace("gpt-6-sol"), Some(ModelPace::Fast));
         assert_eq!(model_pace("gpt-6.1-sol"), Some(ModelPace::Slower));
         assert_eq!(model_pace("gpt-6-astra"), Some(ModelPace::Slower));
         assert_eq!(model_pace("some-new-model"), None);
         assert_eq!(
             model_pace(CopilotProvider::ChatgptSubscription.default_fast_model()),
             Some(ModelPace::Fastest)
+        );
+        // Instant drafts default to the larger model that is just as quick.
+        assert_eq!(CopilotSettings::default().fast_model(), "gpt-6-sol");
+        assert_eq!(
+            model_pace(&CopilotSettings::default().fast_model()),
+            Some(ModelPace::Fast)
         );
     }
 
