@@ -4,6 +4,10 @@ $ErrorActionPreference = 'Stop'
 $directory = [IO.Path]::GetFullPath($PSScriptRoot)
 $executable = Join-Path $directory 'agentdictate.exe'
 if (!(Test-Path -LiteralPath $executable)) { throw 'Run the uninstaller from the installed AgentDictate directory.' }
+$copilotHost = Join-Path $directory 'agentdictated.exe'
+Get-CimInstance Win32_Process -Filter "Name = 'agentdictated.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -eq $copilotHost -and $_.CommandLine -like '*--copilot*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 $stop = Start-Process -FilePath $executable -ArgumentList 'quit' -WindowStyle Hidden -PassThru
 if (!$stop.WaitForExit(15000)) { throw 'AgentDictate has not closed. Quit from the tray before uninstalling.' }
 # Delete only known installed files. Never recursively remove a supplied path or user data.
@@ -14,7 +18,7 @@ foreach ($name in @('agentdictate.exe','agentdictated.exe','agentdictate.ico','R
 }
 if (!$NoShortcuts) {
     $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'AgentDictate'
-    foreach ($name in @('AgentDictate.lnk','Sign in with ChatGPT.lnk')) {
+    foreach ($name in @('AgentDictate.lnk','Sign in with ChatGPT.lnk','Meeting Copilot.lnk')) {
         $path = Join-Path $menu $name
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
     }

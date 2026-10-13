@@ -66,6 +66,14 @@ fn capitalize(word: &str) -> String {
     })
 }
 
+/// Errors worth retrying: rate limits, outages, and dropped connections.
+fn is_transient_failure(error: &str) -> bool {
+    let error = error.to_lowercase();
+    ["limit", "temporarily unavailable", "could not reach"]
+        .iter()
+        .any(|pattern| error.contains(pattern))
+}
+
 /// Starts the copilot, or brings the running one forward.
 #[cfg(windows)]
 pub fn launch_copilot() -> std::io::Result<()> {
@@ -171,7 +179,20 @@ pub fn run_copilot() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(45))
             .build()?;
         Arc::new(move |wav: Vec<u8>, language: &str| {
-            match transcribe_wav_with_chatgpt(&client, &chatgpt, &wav, language) {
+            // A meeting sends many short requests; ride out brief rate limits
+            // and network blips instead of dropping what was said.
+            let mut attempt = 0;
+            let result = loop {
+                match transcribe_wav_with_chatgpt(&client, &chatgpt, &wav, language) {
+                    Err(error) if attempt < 2 && is_transient_failure(&error) => {
+                        attempt += 1;
+                        tracing::warn!(%error, attempt, "retrying copilot transcription");
+                        std::thread::sleep(std::time::Duration::from_millis(1_500 * attempt));
+                    }
+                    result => break result,
+                }
+            };
+            match result {
                 Ok(text) => Ok(text),
                 Err(error) if !openai_key.is_empty() => {
                     tracing::warn!(%error, "ChatGPT transcription failed; using the OpenAI API");
@@ -301,6 +322,25 @@ mod tests {
         assert_eq!(model_label("gpt-5.6-terra"), "GPT-5.6 Terra");
         assert_eq!(model_label("gpt-5.5"), "GPT-5.5");
         assert_eq!(model_label("o3-mini"), "O3 Mini");
+    }
+
+    #[test]
+    fn rate_limits_and_outages_are_retried_but_rejections_are_not() {
+        assert!(is_transient_failure(
+            "ChatGPT transcription limit reached. Try again later."
+        ));
+        assert!(is_transient_failure(
+            "ChatGPT transcription is temporarily unavailable."
+        ));
+        assert!(is_transient_failure(
+            "Could not reach ChatGPT transcription: timeout"
+        ));
+        assert!(!is_transient_failure(
+            "ChatGPT transcription rejected the recording."
+        ));
+        assert!(!is_transient_failure(
+            "ChatGPT sign-in expired. Open Codex and sign in again."
+        ));
     }
 
     #[test]

@@ -34,9 +34,13 @@ use super::{
 const TRANSCRIPTION_WORKERS: usize = 3;
 const ANSWER_TRANSCRIPT_CHARS: usize = 24_000;
 const INSIGHTS_TRANSCRIPT_CHARS: usize = 8_000;
-const INSIGHTS_INTERVAL: Duration = Duration::from_secs(12);
+const INSIGHTS_INTERVAL: Duration = Duration::from_secs(20);
+/// New transcript lines required before insights are refreshed.
+const INSIGHTS_MIN_NEW_LINES: usize = 2;
 const AUTO_ANSWER_COOLDOWN: Duration = Duration::from_secs(6);
 const ECHO_WAIT: Duration = Duration::from_secs(4);
+/// Longest a microphone line waits for the other side to finish speaking.
+const ECHO_WAIT_WHILE_SPEAKING: Duration = Duration::from_secs(8);
 
 /// Audio pipeline output, independent of the capture backend.
 #[derive(Clone, Debug)]
@@ -161,6 +165,7 @@ pub(crate) struct Engine {
     next_line: u64,
     them_spans: VecDeque<ThemSpan>,
     pending_mine: Vec<PendingMine>,
+    them_speaking: bool,
     next_answer: u64,
     active_answer: Option<ActiveAnswer>,
     answers: Vec<(String, String)>,
@@ -195,6 +200,7 @@ impl Engine {
             next_line: 1,
             them_spans: VecDeque::new(),
             pending_mine: Vec::new(),
+            them_speaking: false,
             next_answer: 1,
             active_answer: None,
             answers: Vec::new(),
@@ -354,6 +360,8 @@ impl Engine {
             }
             EngineMsg::InsightsFinished(result) => self.handle_insights(result),
             EngineMsg::Hotkey(HotkeyCommand::Assist) => {
+                // The shortcut works while the copilot is hidden.
+                (self.ui)(CopilotEvent::Show);
                 self.answer(AnswerKind::Quick(QuickAction::WhatToSay))
             }
             EngineMsg::Hotkey(HotkeyCommand::Toggle) => (self.ui)(CopilotEvent::ToggleVisibility),
@@ -462,6 +470,9 @@ impl Engine {
                 });
             }
             AudioMsg::Speaking { speaker, active } => {
+                if speaker == Speaker::Them {
+                    self.them_speaking = active;
+                }
                 (self.ui)(CopilotEvent::Speaking { speaker, active });
             }
             AudioMsg::Utterance { speaker, utterance } => self.queue_utterance(speaker, utterance),
@@ -554,13 +565,20 @@ impl Engine {
             }
             Speaker::Me => {
                 let overlapping = self.overlapping_them(start_ms, end_ms);
-                if overlapping.is_empty() {
+                if overlapping.is_empty() && !self.them_speaking {
                     self.publish(line);
                 } else {
+                    // While the other side is still mid-utterance, its span
+                    // does not exist yet; wait for it before judging echo.
+                    let wait = if self.them_speaking {
+                        ECHO_WAIT_WHILE_SPEAKING
+                    } else {
+                        ECHO_WAIT
+                    };
                     self.pending_mine.push(PendingMine {
                         line,
                         end_ms,
-                        deadline: Instant::now() + ECHO_WAIT,
+                        deadline: Instant::now() + wait,
                     });
                     self.resolve_pending_mine(false);
                 }
@@ -601,7 +619,7 @@ impl Engine {
             let all_known = overlapping
                 .iter()
                 .all(|index| self.them_spans[*index].text.is_some());
-            if !all_known && !force && now < item.deadline {
+            if (!all_known || self.them_speaking) && !force && now < item.deadline {
                 self.pending_mine.push(item);
                 continue;
             }
@@ -875,7 +893,7 @@ impl Engine {
             .transcript
             .len()
             .saturating_sub(self.lines_at_last_insights);
-        if new_lines == 0 || self.transcript.len() < 2 {
+        if new_lines < INSIGHTS_MIN_NEW_LINES || self.transcript.len() < 2 {
             return;
         }
         if self
@@ -1340,6 +1358,45 @@ mod tests {
             })
             .collect();
         assert_eq!(lines, vec![Speaker::Them]);
+    }
+
+    #[test]
+    fn microphone_lines_wait_while_the_other_side_is_still_speaking() {
+        let (mut engine, _incoming, events, _requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: true,
+        });
+        engine.handle_transcribed(
+            Speaker::Me,
+            1_000,
+            3_000,
+            Ok("the quarterly numbers look strong this time".into()),
+        );
+        assert_eq!(engine.pending_mine.len(), 1);
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: false,
+        });
+        engine.them_spans.push_back(ThemSpan {
+            start_ms: 500,
+            end_ms: 6_000,
+            text: None,
+        });
+        engine.handle_transcribed(
+            Speaker::Them,
+            500,
+            6_000,
+            Ok("I think the quarterly numbers look strong this time around.".into()),
+        );
+        assert!(engine.pending_mine.is_empty());
+        let mine = events.lock().unwrap().iter().any(
+            |event| matches!(event, CopilotEvent::Transcript(line) if line.speaker == Speaker::Me),
+        );
+        assert!(!mine, "echo of the other side must not appear as the user");
     }
 
     #[test]

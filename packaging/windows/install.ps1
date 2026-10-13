@@ -7,6 +7,11 @@ foreach ($name in @('agentdictate.exe', 'agentdictated.exe', 'agentdictate.ico')
     if (!(Test-Path -LiteralPath (Join-Path $PSScriptRoot $name))) { throw "Package is missing $name. Extract the whole ZIP first." }
 }
 $existing = Join-Path $destination 'agentdictate.exe'
+# A running meeting copilot shares agentdictated.exe; end it before replacing files.
+$copilotHost = Join-Path $destination 'agentdictated.exe'
+Get-CimInstance Win32_Process -Filter "Name = 'agentdictated.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -eq $copilotHost -and $_.CommandLine -like '*--copilot*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 if (Test-Path -LiteralPath $existing) {
     $stop = Start-Process -FilePath $existing -ArgumentList 'quit' -WindowStyle Hidden -PassThru
     if (!$stop.WaitForExit(15000)) { throw 'AgentDictate is still closing. Quit it from the tray and run this installer again.' }
@@ -31,6 +36,7 @@ if (!$NoShortcuts) {
     New-AgentDictateShortcut (Join-Path ([Environment]::GetFolderPath('Programs')) 'AgentDictate.lnk') $destination
     New-AgentDictateShortcut (Join-Path ([Environment]::GetFolderPath('Desktop')) 'AgentDictate.lnk') $destination
     New-AgentDictateShortcut (Join-Path $menu 'Sign in with ChatGPT.lnk') $destination 'login'
+    New-AgentDictateShortcut (Join-Path $menu 'Meeting Copilot.lnk') $destination 'copilot'
     $oldShortcut = Join-Path $menu 'AgentDictate.lnk'
     if (Test-Path -LiteralPath $oldShortcut) {
         $oldLink = (New-Object -ComObject WScript.Shell).CreateShortcut($oldShortcut)
