@@ -31,7 +31,9 @@ pub use codex_subscription::sign_in_with_chatgpt;
 pub use copilot::run_copilot;
 pub use copilot::{COPILOT_ARGUMENT, is_copilot_argument};
 #[cfg(windows)]
-pub use copilot::{copilot_launch_reason, launch_copilot, run_copilot_check};
+pub use copilot::{
+    copilot_launch_reason, launch_copilot, run_copilot_check, run_copilot_echo_test,
+};
 pub use daemon::{CapturedRecording, Daemon, DaemonError, RecordingController};
 pub use diagnostics::init_file_logging;
 pub use hotkey_dispatch::{

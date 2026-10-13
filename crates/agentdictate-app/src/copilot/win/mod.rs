@@ -1,6 +1,7 @@
 //! Windows platform services for the meeting copilot.
 
 pub(crate) mod audio;
+pub(crate) mod comms_mic;
 pub(crate) mod desktop;
 pub(crate) mod host;
 pub(crate) mod hotkeys;

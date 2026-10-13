@@ -58,6 +58,8 @@ pub(crate) enum AudioMsg {
         utterance: Utterance,
     },
     Problem(String),
+    /// Informational capture state, such as active echo cancellation.
+    Status(String),
 }
 
 pub(crate) trait AudioControl: Send {
@@ -480,6 +482,7 @@ impl Engine {
                 tracing::warn!(%problem, "copilot audio problem");
                 (self.ui)(CopilotEvent::Notice(problem));
             }
+            AudioMsg::Status(status) => tracing::info!(%status, "copilot audio status"),
         }
     }
 

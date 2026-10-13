@@ -101,6 +101,13 @@ pub fn run_copilot_check(speech: Option<&std::path::Path>, latency: bool) -> any
     check::run(speech, latency)
 }
 
+/// Plays a recording through the speakers and reports any echo that reached
+/// the microphone. Returns the number of failed checks.
+#[cfg(windows)]
+pub fn run_copilot_echo_test(speech: &std::path::Path) -> anyhow::Result<usize> {
+    check::echo_test(speech)
+}
+
 /// When the dictation shortcut should open the copilot instead, returns why.
 #[cfg(windows)]
 pub fn copilot_launch_reason(config_file: &std::path::Path) -> Option<String> {

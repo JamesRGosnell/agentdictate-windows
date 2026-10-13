@@ -367,6 +367,18 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
             for problem in problems {
                 report.info(format!("audio note: {problem}"));
             }
+            for status in messages.iter().filter_map(|message| match message {
+                AudioMsg::Status(status) => Some(status.clone()),
+                _ => None,
+            }) {
+                if status.contains("echo cancellation") {
+                    report.pass("Echo cancellation", status);
+                } else {
+                    report.info(format!(
+                        "{status} (the copilot's own echo gate removes speaker echo)"
+                    ));
+                }
+            }
         }
         Err(error) => report.fail("Audio capture", error),
     }
@@ -380,4 +392,99 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
         report.failures
     );
     Ok(report.failures)
+}
+
+/// Plays `speech` through the default speakers while the copilot captures,
+/// then reports whether any of it leaked into the microphone as "You".
+/// Run it in a quiet room without speaking. Returns the number of failures.
+pub(crate) fn echo_test(speech: &Path) -> anyhow::Result<usize> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let samples = read_speech(speech).map_err(anyhow::Error::msg)?;
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("no playback device"))?;
+    let config: cpal::StreamConfig = device.default_output_config()?.into();
+    let channels = usize::from(config.channels.max(1));
+    let step = 16_000.0 / config.sample_rate.0 as f64;
+    let position = Arc::new(Mutex::new(0.0_f64));
+    let playing = Arc::clone(&position);
+    let source = Arc::new(samples);
+    let played = Arc::clone(&source);
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let sink_messages = Arc::clone(&messages);
+    let platform = win::WindowsPlatform;
+    let audio = platform
+        .start_audio(
+            true,
+            true,
+            Arc::new(move |message| sink_messages.lock().unwrap().push(message)),
+        )
+        .map_err(anyhow::Error::msg)?;
+    // Let echo cancellation and the echo gate start before the call audio.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [f32], _| {
+            let mut position = playing.lock().unwrap();
+            for frame in data.chunks_mut(channels) {
+                let index = *position as usize;
+                let sample = played.get(index).copied().unwrap_or(0.0) * 0.8;
+                frame.fill(sample);
+                *position += step;
+            }
+        },
+        |error| eprintln!("playback error: {error}"),
+        None,
+    )?;
+    println!(
+        "Playing {:.1}s of speech through the speakers. Stay quiet.",
+        source.len() as f32 / 16_000.0
+    );
+    stream.play()?;
+    std::thread::sleep(Duration::from_secs_f32(
+        source.len() as f32 / 16_000.0 + 2.5,
+    ));
+    drop(stream);
+    audio.stop();
+    let messages = messages.lock().unwrap();
+    let utterances = |speaker: Speaker| {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                AudioMsg::Utterance {
+                    speaker: source,
+                    utterance,
+                } if *source == speaker => Some(utterance.duration_ms()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    for status in messages.iter().filter_map(|message| match message {
+        AudioMsg::Status(status) => Some(status),
+        _ => None,
+    }) {
+        println!("      {status}");
+    }
+    let them = utterances(Speaker::Them);
+    let mine = utterances(Speaker::Me);
+    println!(
+        "      system audio heard {} utterance(s): {them:?} ms",
+        them.len()
+    );
+    let mut failures = 0;
+    if them.is_empty() {
+        failures += 1;
+        println!("FAIL  Echo test: the speakers' audio was not captured as \u{201c}Them\u{201d}");
+    }
+    if mine.is_empty() {
+        println!("PASS  Echo test: nothing leaked into \u{201c}You\u{201d}");
+    } else {
+        failures += 1;
+        println!(
+            "FAIL  Echo test: {} microphone utterance(s) {mine:?} ms (speaker echo or room noise)",
+            mine.len()
+        );
+    }
+    Ok(failures)
 }

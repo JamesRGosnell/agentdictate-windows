@@ -69,6 +69,15 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(failures == 0, "{failures} copilot check(s) failed");
                 Ok(())
             }
+            Some("--echo-test") => {
+                let speech = args.get(2).ok_or_else(|| {
+                    anyhow::anyhow!("usage: agentdictate copilot --echo-test speech.wav")
+                })?;
+                let failures =
+                    agentdictate_app::run_copilot_echo_test(std::path::Path::new(speech))?;
+                anyhow::ensure!(failures == 0, "{failures} echo check(s) failed");
+                Ok(())
+            }
             Some(other) => anyhow::bail!("unknown copilot option: {other}"),
         };
     }

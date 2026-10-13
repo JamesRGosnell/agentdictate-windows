@@ -2,8 +2,9 @@
 //! loopbacks of the playback devices where calls are heard ("Them").
 
 use std::{
+    collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
@@ -19,9 +20,136 @@ use crate::copilot::{
     vad::{Resampler, SAMPLE_RATE, SegmentEvent, Segmenter, SegmenterConfig},
 };
 
-struct Chunk {
-    samples: Vec<f32>,
-    rate: u32,
+pub(crate) struct Chunk {
+    pub samples: Vec<f32>,
+    pub rate: u32,
+}
+
+/// A running capture: cpal for loopbacks and the fallback microphone, or the
+/// communications-mode microphone with Windows echo cancellation.
+#[expect(dead_code, reason = "each capture runs until its handle is dropped")]
+enum Capture {
+    Cpal(cpal::Stream),
+    Comms(super::comms_mic::CommsMicrophone),
+}
+
+/// Set to capture the raw microphone without Windows voice processing.
+const RAW_MICROPHONE_VARIABLE: &str = "AGENTDICTATE_COPILOT_RAW_MIC";
+
+/// 20 ms of 16 kHz audio: the unit of echo analysis.
+const BLOCK: usize = SAMPLE_RATE as usize / 50;
+
+/// Recent speaker output energy by capture time, written by the loopback
+/// processors and read by the microphone processor.
+#[derive(Default)]
+pub(crate) struct EchoReference {
+    frames: Mutex<VecDeque<(Instant, f32)>>,
+}
+
+impl EchoReference {
+    fn push(&self, at: Instant, energy: f32) {
+        if let Ok(mut frames) = self.frames.lock() {
+            frames.push_back((at, energy));
+            while frames.front().is_some_and(|(time, _)| {
+                at.saturating_duration_since(*time) > Duration::from_secs(2)
+            }) {
+                frames.pop_front();
+            }
+        }
+    }
+
+    /// Speaker output that could still be echoing at `at`: full weight while
+    /// the playback-to-microphone delay is uncertain, then decaying like room
+    /// reverberation.
+    fn recent_peak(&self, at: Instant) -> f32 {
+        let earliest = at.checked_sub(ECHO_WINDOW).unwrap_or(at);
+        let latest = at + Duration::from_millis(20);
+        self.frames.lock().map_or(0.0, |frames| {
+            frames
+                .iter()
+                .filter(|(time, _)| *time >= earliest && *time <= latest)
+                .map(|(time, energy)| {
+                    let age = at.saturating_duration_since(*time).as_secs_f32();
+                    let weight = if age <= 0.16 {
+                        1.0
+                    } else {
+                        (-(age - 0.16) / 0.1).exp()
+                    };
+                    energy * weight
+                })
+                .fold(0.0, f32::max)
+        })
+    }
+}
+
+/// Speaker-to-microphone delay plus room reverberation covered by the gate.
+const ECHO_WINDOW: Duration = Duration::from_millis(400);
+
+/// Removes microphone audio that is only the speakers' sound coming back.
+///
+/// For each 20 ms block the gate compares microphone energy with the loudest
+/// recent speaker output. It learns the speaker-to-microphone coupling as a
+/// high percentile of that ratio while the other side talks, and treats a
+/// block within a margin of it as echo. Speech louder than the echo, such as
+/// the user talking over the call, passes. With Windows echo cancellation
+/// active the learned coupling is tiny and the gate rarely acts.
+pub(crate) struct EchoGate {
+    log_coupling: f32,
+    active_blocks: u32,
+}
+
+impl Default for EchoGate {
+    fn default() -> Self {
+        // Start by assuming very loud speakers and learn downward: talk-over
+        // protection slows upward learning, so starting low could let echo
+        // through until the estimate caught up.
+        Self {
+            log_coupling: 3.0,
+            active_blocks: 0,
+        }
+    }
+}
+
+impl EchoGate {
+    /// Reference energy below which the speakers count as silent (-55 dBFS).
+    const ACTIVE_REFERENCE: f32 = 3.2e-6;
+    /// Percentile of the echo ratio treated as the coupling.
+    const PERCENTILE: f32 = 0.85;
+    /// Ratios this far (log units, about 4 dB) above the coupling, the gate
+    /// margin, are most likely the user speaking and barely move the estimate.
+    const DOUBLE_TALK: f32 = 0.9;
+    /// Blocks within this factor of the coupling (about 4 dB) are echo.
+    const MARGIN: f32 = 2.5;
+
+    /// Returns true when the block is speaker echo rather than the user.
+    pub(crate) fn is_echo(&mut self, microphone: f32, reference: f32) -> bool {
+        if reference < Self::ACTIVE_REFERENCE {
+            return false;
+        }
+        let log_ratio = (microphone.max(1e-12) / reference).ln();
+        let difference = log_ratio - self.log_coupling;
+        self.active_blocks = self.active_blocks.saturating_add(1);
+        // Learn quickly at first, then settle.
+        let step = if self.active_blocks < 200 { 0.25 } else { 0.08 };
+        let direction = if difference <= 0.0 {
+            Self::PERCENTILE - 1.0
+        } else if difference < Self::DOUBLE_TALK {
+            Self::PERCENTILE
+        } else {
+            Self::PERCENTILE * 0.05
+        };
+        self.log_coupling += step * direction;
+        self.log_coupling = self.log_coupling.clamp(-14.0, 4.0);
+        microphone <= self.log_coupling.exp() * Self::MARGIN * reference
+    }
+
+    pub(crate) fn coupling(&self) -> f32 {
+        self.log_coupling.exp()
+    }
+}
+
+fn energy(block: &[f32]) -> f32 {
+    block.iter().map(|sample| sample * sample).sum::<f32>() / block.len().max(1) as f32
 }
 
 /// Where a capture stream listens.
@@ -116,7 +244,7 @@ impl Drop for WasapiCapture {
 
 struct Source {
     kind: SourceKind,
-    stream: Option<cpal::Stream>,
+    stream: Option<Capture>,
     device_name: String,
     failed: Arc<AtomicBool>,
     chunks: SyncSender<Chunk>,
@@ -143,6 +271,42 @@ fn communications_output_name() -> Option<String> {
         let store = device.OpenPropertyStore(STGM_READ).ok()?;
         let name = store.GetValue(&PKEY_Device_FriendlyName).ok()?.to_string();
         (!name.is_empty()).then_some(name)
+    }
+}
+
+/// Friendly name of the default communications microphone.
+fn communications_input_name() -> Option<String> {
+    use windows::Win32::{
+        Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
+        Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eCommunications},
+        System::Com::{
+            CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STGM_READ,
+        },
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eCommunications)
+            .ok()?;
+        let store = device.OpenPropertyStore(STGM_READ).ok()?;
+        let name = store.GetValue(&PKEY_Device_FriendlyName).ok()?.to_string();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+fn raw_microphone() -> bool {
+    std::env::var_os(RAW_MICROPHONE_VARIABLE).is_some()
+}
+
+/// The device each source would capture now.
+fn current_device_name(kind: SourceKind) -> Option<String> {
+    match kind {
+        SourceKind::Microphone if !raw_microphone() => communications_input_name()
+            .or_else(|| device_for(kind).ok().and_then(|device| device.name().ok())),
+        SourceKind::CallPlayback => separate_call_device(),
+        kind => device_for(kind).ok().and_then(|device| device.name().ok()),
     }
 }
 
@@ -194,7 +358,37 @@ fn device_for(kind: SourceKind) -> Result<cpal::Device, String> {
     }
 }
 
+/// Starts a capture and reports the device and, for the microphone, the
+/// Windows voice processing applied to it.
 fn build_stream(
+    kind: SourceKind,
+    chunks: SyncSender<Chunk>,
+    failed: Arc<AtomicBool>,
+) -> Result<(Capture, String, Option<String>), String> {
+    if kind == SourceKind::Microphone && !raw_microphone() {
+        match super::comms_mic::CommsMicrophone::start(
+            chunks.clone(),
+            Arc::clone(&failed),
+            separate_call_device(),
+        ) {
+            Ok((microphone, processing)) => {
+                let name = processing.device.clone();
+                return Ok((
+                    Capture::Comms(microphone),
+                    name,
+                    Some(processing.describe()),
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "communications microphone unavailable; using the raw microphone");
+            }
+        }
+    }
+    let (stream, name) = build_cpal_stream(kind, chunks, failed)?;
+    Ok((Capture::Cpal(stream), name, None))
+}
+
+fn build_cpal_stream(
     kind: SourceKind,
     chunks: SyncSender<Chunk>,
     failed: Arc<AtomicBool>,
@@ -268,6 +462,7 @@ fn run_controller(
     let mut sources = Vec::new();
     let mut processors = Vec::new();
     let mut errors = Vec::new();
+    let echo = Arc::new(EchoReference::default());
     for (enabled, kind) in [
         (microphone, SourceKind::Microphone),
         (system_audio, SourceKind::Playback),
@@ -281,8 +476,11 @@ fn run_controller(
         let wanted = kind != SourceKind::CallPlayback || separate_call_device().is_some();
         let (stream, device_name) = if wanted {
             match build_stream(kind, chunks.clone(), Arc::clone(&failed)) {
-                Ok((stream, name)) => {
+                Ok((stream, name, processing)) => {
                     tracing::info!(source = kind.label(), device = %name, "copilot audio source started");
+                    if let Some(processing) = processing {
+                        sink(AudioMsg::Status(format!("Microphone {processing}")));
+                    }
                     (Some(stream), name)
                 }
                 Err(error) => {
@@ -300,9 +498,10 @@ fn run_controller(
             let sink = Arc::clone(&sink);
             let stop = Arc::clone(&stop);
             let paused = Arc::clone(&paused);
+            let echo = Arc::clone(&echo);
             std::thread::Builder::new()
                 .name(format!("copilot-audio-{}", kind.label().replace(' ', "-")))
-                .spawn(move || process(kind.speaker(), incoming, sink, stop, paused))
+                .spawn(move || process(kind.speaker(), incoming, sink, stop, paused, echo))
         };
         match processor {
             Ok(handle) => processors.push(handle),
@@ -341,18 +540,14 @@ fn run_controller(
             // Between device checks, only rebuild streams that failed.
             for source in &mut sources {
                 if source.failed.load(Ordering::Relaxed) {
-                    restart(source);
+                    restart(source, &sink);
                 }
             }
             continue;
         }
         last_device_check = Instant::now();
-        let call_device = separate_call_device();
         for source in &mut sources {
-            let current = match source.kind {
-                SourceKind::CallPlayback => call_device.clone(),
-                kind => device_for(kind).ok().and_then(|device| device.name().ok()),
-            };
+            let current = current_device_name(source.kind);
             match (current, source.stream.is_some()) {
                 // The call device now matches the default; one loopback is enough.
                 (None, true) if source.kind == SourceKind::CallPlayback => {
@@ -360,9 +555,9 @@ fn run_controller(
                     source.stream = None;
                     source.device_name.clear();
                 }
-                (Some(name), true) if name != source.device_name => restart(source),
-                (Some(_), false) => restart(source),
-                _ if source.failed.load(Ordering::Relaxed) => restart(source),
+                (Some(name), true) if name != source.device_name => restart(source, &sink),
+                (Some(_), false) => restart(source, &sink),
+                _ if source.failed.load(Ordering::Relaxed) => restart(source, &sink),
                 _ => {}
             }
         }
@@ -378,7 +573,7 @@ fn run_controller(
     }
 }
 
-fn restart(source: &mut Source) {
+fn restart(source: &mut Source, sink: &AudioSink) {
     if source.last_attempt.elapsed() < Duration::from_secs(2) {
         return;
     }
@@ -390,8 +585,11 @@ fn restart(source: &mut Source) {
         source.chunks.clone(),
         Arc::clone(&source.failed),
     ) {
-        Ok((stream, name)) => {
+        Ok((stream, name, processing)) => {
             tracing::info!(source = source.kind.label(), device = %name, "copilot audio source started");
+            if let Some(processing) = processing {
+                sink(AudioMsg::Status(format!("Microphone {processing}")));
+            }
             source.stream = Some(stream);
             source.device_name = name;
         }
@@ -407,16 +605,20 @@ fn process(
     sink: AudioSink,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    echo: Arc<EchoReference>,
 ) {
     let config = match speaker {
         Speaker::Me => SegmenterConfig::microphone(),
         Speaker::Them => SegmenterConfig::system_audio(),
     };
     let mut segmenter = Segmenter::new(config);
+    let mut gate = EchoGate::default();
     let mut resampler: Option<(u32, Resampler)> = None;
-    let mut resampled = Vec::new();
+    let mut pending: Vec<f32> = Vec::with_capacity(BLOCK * 4);
     let mut last_data = Instant::now();
     let mut last_level = Instant::now();
+    let mut last_report = Instant::now();
+    let mut gated_blocks = 0_u32;
     let mut was_paused = false;
     let emit = |events: Vec<SegmentEvent>| {
         for event in events {
@@ -464,7 +666,8 @@ fn process(
         }
         match message {
             Ok(chunk) => {
-                last_data = Instant::now();
+                let arrived = Instant::now();
+                last_data = arrived;
                 received_audio = true;
                 if is_paused {
                     continue;
@@ -475,11 +678,46 @@ fn process(
                 {
                     resampler = Some((chunk.rate, Resampler::new(chunk.rate)));
                 }
-                resampled.clear();
                 if let Some((_, resampler)) = resampler.as_mut() {
-                    resampler.process(&chunk.samples, &mut resampled);
+                    resampler.process(&chunk.samples, &mut pending);
                 }
-                emit(segmenter.push(&resampled));
+                let blocks = pending.len() / BLOCK;
+                for index in 0..blocks {
+                    let block = &mut pending[index * BLOCK..(index + 1) * BLOCK];
+                    // Time the block by how much buffered audio follows it.
+                    let after = (blocks - index - 1) * BLOCK;
+                    let at = arrived
+                        .checked_sub(Duration::from_micros(
+                            after as u64 * 1_000_000 / u64::from(SAMPLE_RATE),
+                        ))
+                        .unwrap_or(arrived);
+                    let level = energy(block);
+                    match speaker {
+                        Speaker::Them => echo.push(at, level),
+                        Speaker::Me => {
+                            if gate.is_echo(level, echo.recent_peak(at)) {
+                                for sample in block.iter_mut() {
+                                    *sample *= 0.03;
+                                }
+                                gated_blocks += 1;
+                            }
+                        }
+                    }
+                }
+                let used = blocks * BLOCK;
+                emit(segmenter.push(&pending[..used]));
+                pending.drain(..used);
+                if speaker == Speaker::Me && last_report.elapsed() >= Duration::from_secs(30) {
+                    if gated_blocks > 0 {
+                        tracing::info!(
+                            gated_ms = gated_blocks * 20,
+                            coupling = gate.coupling(),
+                            "removed speaker echo from the microphone"
+                        );
+                    }
+                    gated_blocks = 0;
+                    last_report = Instant::now();
+                }
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Loopback goes quiet when nothing plays; treat the gap as
@@ -510,5 +748,134 @@ fn process(
             active: false,
         });
         sink(AudioMsg::Utterance { speaker, utterance });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic speech-like bursts: noise shaped by a syllable envelope.
+    fn speech(seconds: f32, amplitude: f32, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        (0..(seconds * SAMPLE_RATE as f32) as usize)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (state >> 8) as f32 / (1 << 24) as f32 * 2.0 - 1.0;
+                let envelope = (0.5 + 0.5 * (index as f32 / 1_600.0).sin()).powi(2);
+                noise * envelope * amplitude
+            })
+            .collect()
+    }
+
+    /// Microphone = delayed, attenuated, reverberant speaker output (+ near end).
+    fn echo_of(reference: &[f32], delay: usize, gain: f32) -> Vec<f32> {
+        let mut output = vec![0.0; reference.len()];
+        for (index, sample) in reference.iter().enumerate() {
+            for (tap, weight) in [(0, 1.0), (160, 0.5), (800, 0.25)] {
+                let at = index + delay + tap;
+                if at < output.len() {
+                    output[at] += sample * gain * weight;
+                }
+            }
+        }
+        output
+    }
+
+    /// Runs the gate over aligned reference and microphone signals and
+    /// returns, per block, whether it was treated as echo.
+    fn gate_blocks(reference: &[f32], microphone: &[f32]) -> Vec<bool> {
+        let echo = EchoReference::default();
+        let mut gate = EchoGate::default();
+        let start = Instant::now();
+        reference
+            .chunks(BLOCK)
+            .zip(microphone.chunks(BLOCK))
+            .enumerate()
+            .map(|(index, (reference, microphone))| {
+                let at = start + Duration::from_millis(20 * index as u64);
+                echo.push(at, energy(reference));
+                gate.is_echo(energy(microphone), echo.recent_peak(at))
+            })
+            .collect()
+    }
+
+    fn share(flags: &[bool]) -> f32 {
+        flags.iter().filter(|flag| **flag).count() as f32 / flags.len().max(1) as f32
+    }
+
+    #[test]
+    fn loud_speaker_echo_is_removed_once_the_coupling_is_learned() {
+        let reference = speech(8.0, 0.3, 7);
+        let microphone = echo_of(&reference, 960, 0.6);
+        let flags = gate_blocks(&reference, &microphone);
+        // After the first two seconds every echo block is gated.
+        let late = &flags[100..];
+        let active: Vec<bool> = late
+            .iter()
+            .zip(reference.chunks(BLOCK).skip(100))
+            .filter(|(_, block)| energy(block) > EchoGate::ACTIVE_REFERENCE)
+            .map(|(flag, _)| *flag)
+            .collect();
+        assert!(share(&active) > 0.97, "gated {:.2}", share(&active));
+    }
+
+    #[test]
+    fn the_user_talking_over_the_call_is_kept() {
+        let reference = speech(8.0, 0.2, 11);
+        let mut microphone = echo_of(&reference, 960, 0.15);
+        // The user speaks over the call for the last three seconds.
+        let user = speech(3.0, 0.5, 23);
+        let offset = microphone.len() - user.len();
+        for (index, sample) in user.iter().enumerate() {
+            microphone[offset + index] += sample;
+        }
+        let flags = gate_blocks(&reference, &microphone);
+        // Blocks where the user is clearly louder than the echo must pass.
+        let echo = echo_of(&reference, 960, 0.15);
+        let dominant: Vec<bool> = flags
+            .iter()
+            .enumerate()
+            .skip(flags.len() - 150)
+            .filter(|(index, _)| {
+                let range = index * BLOCK..(index + 1) * BLOCK;
+                energy(&microphone[range.clone()]) > 10.0 * energy(&echo[range])
+            })
+            .map(|(_, flag)| *flag)
+            .collect();
+        assert!(dominant.len() > 50);
+        assert!(
+            share(&dominant) < 0.1,
+            "gated {:.2} of the user",
+            share(&dominant)
+        );
+    }
+
+    #[test]
+    fn the_user_alone_is_never_gated() {
+        let reference = vec![0.0; 3 * SAMPLE_RATE as usize];
+        let microphone = speech(3.0, 0.3, 5);
+        assert!(
+            gate_blocks(&reference, &microphone)
+                .iter()
+                .all(|flag| !flag)
+        );
+    }
+
+    #[test]
+    fn echo_tails_after_the_other_side_stops_are_removed() {
+        let mut reference = speech(4.0, 0.3, 3);
+        reference.extend(vec![0.0; SAMPLE_RATE as usize]);
+        let microphone = echo_of(&reference, 960, 0.5);
+        let flags = gate_blocks(&reference, &microphone);
+        // Blocks within 300 ms after the reference stops still carry echo.
+        let tail_start = 4 * 50;
+        let tail: Vec<bool> = flags[tail_start..tail_start + 15]
+            .iter()
+            .zip(microphone.chunks(BLOCK).skip(tail_start))
+            .filter(|(_, block)| energy(block) > 1e-5)
+            .map(|(flag, _)| *flag)
+            .collect();
+        assert!(share(&tail) > 0.9, "gated {:.2} of the tail", share(&tail));
     }
 }
