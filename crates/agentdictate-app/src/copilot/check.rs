@@ -19,8 +19,8 @@ use super::{
     providers::{self, AnswerRequest},
     store,
     stream::StreamEvent,
-    vad::{Resampler, SegmentEvent, Segmenter, SegmenterConfig, wav_bytes},
-    win,
+    vad::{SegmentEvent, Segmenter, SegmenterConfig, wav_bytes},
+    win::{self, replay::read_speech},
 };
 use crate::codex_subscription::{ChatGptCredentials, transcribe_wav_with_chatgpt};
 
@@ -41,31 +41,6 @@ impl Report {
     fn info(&self, detail: impl AsRef<str>) {
         println!("      {}", detail.as_ref());
     }
-}
-
-fn read_speech(path: &Path) -> Result<Vec<f32>, String> {
-    let mut reader = hound::WavReader::open(path).map_err(|error| error.to_string())?;
-    let spec = reader.spec();
-    let channels = usize::from(spec.channels.max(1));
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
-        hound::SampleFormat::Int => {
-            let scale = (1_i64 << (spec.bits_per_sample.saturating_sub(1))) as f32;
-            reader
-                .samples::<i32>()
-                .filter_map(Result::ok)
-                .map(|sample| sample as f32 / scale)
-                .collect()
-        }
-    };
-    let mono: Vec<f32> = samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect();
-    let mut resampler = Resampler::new(spec.sample_rate);
-    let mut output = Vec::new();
-    resampler.process(&mono, &mut output);
-    Ok(output)
 }
 
 /// Runs the checks and returns the number of failures.

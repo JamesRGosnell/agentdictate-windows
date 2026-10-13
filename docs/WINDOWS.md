@@ -137,6 +137,8 @@ capture under `target`; the gate runs it for every UI state.
 window is a top-center, topmost, non-activating tool window excluded from
 screen capture (add `-Visible` to capture its pixels). The process probe opens
 the real microphone and system audio briefly and does not upload audio unless
-someone speaks.
+someone speaks. `-Replay path	o\call.wav` instead plays a recording into the
+real copilot as the other side of a call, using the installed ChatGPT sign-in,
+and captures the live answer; it uploads only that recording.
 See [Windows parity verification](windows-parity.md) for completed and pending
 acceptance checks.

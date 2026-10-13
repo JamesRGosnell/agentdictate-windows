@@ -5,6 +5,7 @@ pub(crate) mod desktop;
 pub(crate) mod host;
 pub(crate) mod hotkeys;
 pub(crate) mod instance;
+pub(crate) mod replay;
 pub(crate) mod signals;
 
 use super::engine::{AudioControl, AudioSink, Platform};
@@ -18,6 +19,10 @@ impl Platform for WindowsPlatform {
         system_audio: bool,
         sink: AudioSink,
     ) -> Result<Box<dyn AudioControl>, String> {
+        if let Some(path) = std::env::var_os(replay::REPLAY_VARIABLE) {
+            return replay::ReplayAudio::start(path.into(), sink)
+                .map(|replay| Box::new(replay) as Box<dyn AudioControl>);
+        }
         audio::WasapiCapture::start(microphone, system_audio, sink)
             .map(|capture| Box::new(capture) as Box<dyn AudioControl>)
     }

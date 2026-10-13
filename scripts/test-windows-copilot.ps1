@@ -4,7 +4,10 @@ param(
     [ValidateSet('live','streaming','transcript','settings','collapsed','empty','overview','process')][string]$State = 'live',
     [string]$Output,
     # With 'process': leave the window visible to capture so it can be inspected.
-    [switch]$Visible
+    [switch]$Visible,
+    # With 'process': replay this WAV as the other side of a call through the
+    # real engine and ChatGPT account, then capture the live result.
+    [string]$Replay
 )
 # 'process' launches the real `agentdictated --copilot` with isolated data and
 # verifies its native window contract; other states render the UI fixture.
@@ -53,7 +56,7 @@ public class AgentDictateCopilotProbe {
    if(rect.right-rect.left<100||rect.bottom-rect.top<40)return true;result=hwnd;return false;},IntPtr.Zero);
   return result;
  }
- public static string Run(string exe,string state,string output,bool visible) {
+ public static string Run(string exe,string state,string output,bool visible,int settleMilliseconds) {
   var dpiContext=SetThreadDpiAwarenessContext(new IntPtr(-4));
   var original=GetForegroundWindow();
   var name="AgentDictateCopilotProbe-"+Guid.NewGuid().ToString("N");
@@ -77,7 +80,7 @@ public class AgentDictateCopilotProbe {
      if(WaitForSingleObject(pi.process,0)==0)throw new Exception("Copilot exited before opening its window");
      System.Threading.Thread.Sleep(100);
     }
-    System.Threading.Thread.Sleep(3000);
+    System.Threading.Thread.Sleep(settleMilliseconds);
    } else {
     var status=new StringBuilder();var deadline=DateTime.UtcNow.AddSeconds(40);
     using(var read=new FileStream(new Microsoft.Win32.SafeHandles.SafeFileHandle(parentRead,true),FileAccess.Read)){
@@ -131,5 +134,16 @@ try {
             Set-Content -LiteralPath (Join-Path $env:AGENTDICTATE_DATA_HOME 'copilot.json') -Value '{"hide_from_screen_share": false}' -Encoding ascii
         }
     }
-    [AgentDictateCopilotProbe]::Run([IO.Path]::GetFullPath($Binary), $State, [IO.Path]::GetFullPath($Output), [bool]$Visible)
-} finally { $env:AGENTDICTATE_DATA_HOME = $previousDataHome }
+    $settle = 3000
+    if ($Replay) {
+        $env:AGENTDICTATE_COPILOT_REPLAY = [IO.Path]::GetFullPath($Replay)
+        # The isolated data folder has no sign-in; use the installed one.
+        $env:AGENTDICTATE_CODEX_HOME = Join-Path $env:LOCALAPPDATA 'AgentDictate\codex-login'
+        $settle = 32000
+    }
+    [AgentDictateCopilotProbe]::Run([IO.Path]::GetFullPath($Binary), $State, [IO.Path]::GetFullPath($Output), [bool]$Visible, $settle)
+} finally {
+    $env:AGENTDICTATE_DATA_HOME = $previousDataHome
+    Remove-Item Env:AGENTDICTATE_COPILOT_REPLAY -ErrorAction SilentlyContinue
+    Remove-Item Env:AGENTDICTATE_CODEX_HOME -ErrorAction SilentlyContinue
+}
