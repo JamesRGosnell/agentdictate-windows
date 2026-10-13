@@ -89,6 +89,7 @@ pub(super) fn surface(
         .when(history.recovery.has_items(), |page| {
             page.child(recovery_notice(&history, theme, cx))
         })
+        .child(copilot_card(theme, cx))
         .child(recent_history(
             recent_transcripts,
             recent_history_expanded,
@@ -341,6 +342,83 @@ fn tooltip_row(label: &'static str, value: String, cx: &App) -> gpui::Div {
                 .child(label),
         )
         .child(gpui::div().font_semibold().child(value))
+}
+
+fn copilot_card(theme: ThemeTokens, cx: &mut Context<SettingsShell>) -> gpui::Div {
+    let key = |label: &'static str| {
+        gpui::div()
+            .px_1p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(gpui_color(theme.border))
+            .text_xs()
+            .text_color(gpui_color(theme.text_muted))
+            .child(label)
+    };
+    h_flex()
+        .debug_selector(|| "overview-copilot".to_owned())
+        .justify_between()
+        .items_center()
+        .gap_4()
+        .rounded_xl()
+        .border_1()
+        .border_color(gpui_color(theme.border))
+        .bg(gpui_color(theme.surface))
+        .px_4()
+        .py_3()
+        .child(
+            v_flex()
+                .gap_1()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            gpui::div()
+                                .size_2()
+                                .rounded_full()
+                                .bg(gpui_color(theme.accent)),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child("Meeting Copilot"),
+                        ),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(gpui_color(theme.text_muted))
+                        .child(
+                            "Live answers during calls, hidden from screen sharing. \
+                             In a call, your dictation shortcut opens it.",
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .text_xs()
+                        .text_color(gpui_color(theme.text_muted))
+                        .child(key("Ctrl"))
+                        .child(key("Enter"))
+                        .child(gpui::div().pr_2().child("Ask AI"))
+                        .child(key("Ctrl"))
+                        .child(key("\\"))
+                        .child(gpui::div().child("Show/Hide")),
+                ),
+        )
+        .child(
+            action_button("overview-copilot-start")
+                .debug_selector(|| "overview-copilot-start".to_owned())
+                .small()
+                .label("Start copilot")
+                .on_click(cx.listener(|shell, _, _, cx| {
+                    shell.emit_workspace_action(WorkspaceAction::OpenCopilot, cx);
+                })),
+        )
 }
 
 fn recovery_notice(

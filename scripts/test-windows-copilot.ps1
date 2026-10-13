@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Binary,
-    [ValidateSet('live','streaming','transcript','settings','collapsed','empty','process')][string]$State = 'live',
+    [ValidateSet('live','streaming','transcript','settings','collapsed','empty','overview','process')][string]$State = 'live',
     [string]$Output,
     # With 'process': leave the window visible to capture so it can be inspected.
     [switch]$Visible

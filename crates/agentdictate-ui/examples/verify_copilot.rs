@@ -158,6 +158,60 @@ fn main() {
             });
         }
     }
+    if state == "overview" {
+        // The Settings window's Overview card that starts the copilot.
+        use agentdictate_core::{WorkflowPhase, WorkflowSnapshot};
+        use agentdictate_ui::{AgentDictateWindowFrame, Route, SettingsShell, ShellViewModel};
+        Application::new()
+            .with_assets(AgentDictateAssets)
+            .run(|cx| {
+                gpui_component::init(cx);
+                gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+                let model = ShellViewModel::from_snapshot(
+                    Route::Overview,
+                    WorkflowSnapshot {
+                        phase: WorkflowPhase::Ready,
+                    },
+                );
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(40.), px(40.)),
+                            size(px(1_100.), px(760.)),
+                        ))),
+                        focus: false,
+                        ..Default::default()
+                    },
+                    move |window, cx| {
+                        let shell = cx.new(|cx| {
+                            SettingsShell::connected(
+                                model,
+                                agentdictate_core::Settings::default(),
+                                false,
+                                Arc::new(|_| Ok(())),
+                                window,
+                                cx,
+                            )
+                        });
+                        let frame = cx.new(|_| AgentDictateWindowFrame::new(shell));
+                        cx.new(|cx| Root::new(frame, window, cx))
+                    },
+                )
+                .expect("overview fixture opens");
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(2_000))
+                        .await;
+                    println!("READY");
+                    cx.background_executor()
+                        .timer(Duration::from_secs(20))
+                        .await;
+                    cx.update(|cx| cx.quit())
+                })
+                .detach();
+            });
+        return;
+    }
     let collapsed = state == "collapsed";
     let height = COPILOT_TOP_MARGIN
         + COPILOT_BAR_HEIGHT

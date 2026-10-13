@@ -59,6 +59,37 @@ fn overlay_failure_notice_follows_workspace_health(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn overview_starts_the_meeting_copilot(cx: &mut TestAppContext) {
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured_actions = Arc::clone(&actions);
+    let model = ShellViewModel::from_snapshot(
+        Route::Overview,
+        WorkflowSnapshot {
+            phase: WorkflowPhase::Ready,
+        },
+    );
+    let refreshed = model.workspace.clone();
+    let mut harness = Harness::open_model_with_actions(
+        cx,
+        size(px(1_100.), px(780.)),
+        model,
+        Arc::new(move |action| {
+            captured_actions.lock().expect("action lock").push(action);
+            Ok(refreshed.clone())
+        }),
+    );
+
+    assert!(harness.has("overview-copilot"));
+    harness.scroll_to("overview-copilot-start");
+    harness.click("overview-copilot-start");
+
+    assert_eq!(
+        *actions.lock().expect("action lock"),
+        vec![WorkspaceAction::OpenCopilot]
+    );
+}
+
+#[gpui::test]
 fn gpui_root_uses_the_tokscope_dark_palette(cx: &mut TestAppContext) {
     test_support::initialize(cx);
 

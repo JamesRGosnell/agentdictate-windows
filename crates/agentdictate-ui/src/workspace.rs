@@ -7,17 +7,40 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceAction {
-    RetryRecovery { id: String, stage: RecoveryStage },
-    DeleteRecovery { id: String },
-    CopyRecovery { id: String },
-    CopyTranscript { id: i64 },
-    SearchHistory { query: String },
+    RetryRecovery {
+        id: String,
+        stage: RecoveryStage,
+    },
+    DeleteRecovery {
+        id: String,
+    },
+    CopyRecovery {
+        id: String,
+    },
+    CopyTranscript {
+        id: i64,
+    },
+    SearchHistory {
+        query: String,
+    },
     LoadMoreHistory,
-    CreateReplacement { draft: ReplacementDraft },
-    UpdateReplacement { id: i64, draft: ReplacementDraft },
-    SetReplacementEnabled { id: i64, enabled: bool },
-    DeleteReplacement { id: i64 },
+    CreateReplacement {
+        draft: ReplacementDraft,
+    },
+    UpdateReplacement {
+        id: i64,
+        draft: ReplacementDraft,
+    },
+    SetReplacementEnabled {
+        id: i64,
+        enabled: bool,
+    },
+    DeleteReplacement {
+        id: i64,
+    },
     SelectUsagePeriod(UsagePeriod),
+    /// Starts the meeting copilot, or shows the running one.
+    OpenCopilot,
 }
 
 impl WorkspaceAction {
@@ -34,6 +57,7 @@ impl WorkspaceAction {
             Self::SetReplacementEnabled { id, .. } => format!("replacement-toggle-{id}"),
             Self::DeleteReplacement { id } => format!("replacement-delete-{id}"),
             Self::SelectUsagePeriod(period) => format!("usage-period-{}", period.slug()),
+            Self::OpenCopilot => "overview-copilot-start".to_owned(),
         }
     }
 }

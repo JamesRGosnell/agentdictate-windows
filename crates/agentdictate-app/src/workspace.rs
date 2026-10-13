@@ -125,6 +125,17 @@ impl WorkspaceClient {
             }
             return self.refresh_history_page(true);
         }
+        if matches!(action, WorkspaceAction::OpenCopilot) {
+            #[cfg(windows)]
+            crate::launch_copilot().map_err(|error| WorkspaceError::CommandRejected {
+                message: format!("Could not start the meeting copilot: {error}"),
+            })?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| WorkspaceError::StateUnavailable)?;
+            return Ok(workspace_view_model(&state.snapshot, state.period));
+        }
         if let WorkspaceAction::SelectUsagePeriod(period) = action {
             let mut state = self
                 .state
@@ -207,7 +218,9 @@ impl WorkspaceClient {
             WorkspaceAction::DeleteReplacement { id } => {
                 ClientCommand::delete_replacement(request_id, id)
             }
-            WorkspaceAction::SelectUsagePeriod(_) => unreachable!("handled above"),
+            WorkspaceAction::SelectUsagePeriod(_) | WorkspaceAction::OpenCopilot => {
+                unreachable!("handled above")
+            }
         };
 
         self.send_workspace_command(command)
