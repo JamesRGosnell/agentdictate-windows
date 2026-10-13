@@ -28,8 +28,8 @@ mod workspace;
 pub use assets::AgentDictateAssets;
 pub use copilot::{
     AnswerCardModel, COPILOT_BAR_HEIGHT, COPILOT_PANEL_GAP, COPILOT_PANEL_HEIGHT,
-    COPILOT_TOP_MARGIN, COPILOT_WIDTH, CopilotEffect, CopilotViewModel, CopilotWindowHost,
-    LEVEL_HISTORY, source_host,
+    COPILOT_TOP_MARGIN, COPILOT_WIDTH, CopilotEffect, CopilotShape, CopilotViewModel,
+    CopilotWindowHost, LEVEL_HISTORY, source_host,
 };
 #[cfg(feature = "desktop")]
 pub use desktop::{

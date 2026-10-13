@@ -19,8 +19,11 @@ is open. Turn this off with **Open with the dictation shortcut in meetings** in
 the copilot settings.
 
 The copilot appears as a small bar at the top center of the primary monitor.
-Drag it by the round logo. It starts listening immediately; the timer shows the
-session length and the meter shows audio from both sides.
+Drag any empty part of the bar to move it; it stays where you put it, and the
+panel moves up if it would open past the bottom of the screen. Clicks beside
+the bar and panel reach the window underneath. The copilot starts listening
+immediately; the timer shows the session length and the meter shows audio from
+both sides.
 
 ## Shortcuts
 
@@ -33,7 +36,10 @@ session length and the meter shows audio from both sides.
 
 These shortcuts exist only while the copilot runs. If another app already owns
 one, the copilot uses <kbd>Alt</kbd> as an extra modifier and shows the actual
-keys on its buttons. While the copilot runs, <kbd>Ctrl</kbd> + <kbd>Enter</kbd>
+keys on its buttons. <kbd>\\</kbd> means the key that types a backslash in your
+current keyboard layout: on Canadian French, show or hide is <kbd>Ctrl</kbd> +
+<kbd>Shift</kbd> + the key left of <kbd>1</kbd>. Switching layouts moves the
+shortcut with it. While the copilot runs, <kbd>Ctrl</kbd> + <kbd>Enter</kbd>
 does not reach other apps, including chat apps that use it to send.
 
 ## What you see
@@ -43,11 +49,15 @@ does not reach other apps, including chat apps that use it to send.
   researches, using web search when needed, and streams a verified answer with
   sources underneath. The instant draft never states specific prices, versions,
   dates, or news it cannot verify.
-- **Automatic answers.** When the other side asks you a question, an answer
-  starts without a keypress. Turn this off with **Answer questions
+- **Automatic answers.** When the other side asks you a question and pauses
+  for your reply, an answer starts without a keypress. Rhetorical questions,
+  questions they go on to answer themselves, and advice are skipped: the
+  copilot waits a moment to see whether they keep talking, and the fast model
+  confirms the question is aimed at you. Turn this off with **Answer questions
   automatically**.
 - **Live insights.** The current topic, a short summary, any unanswered
-  question directed at you, and suggested prompts you can click.
+  question directed at you as a card you can click to answer, and suggested
+  prompts.
 - **Quick actions.** What should I say?, Follow-up questions, Recap so far,
   Fact-check, and Explain my screen.
 - **Transcript.** Everything said, labeled **You** (your microphone) and
@@ -76,8 +86,10 @@ words are not written as **You**:
   20 ms it compares the microphone with that output and removes audio the
   speakers explain, while your voice, even over the other side, passes. This
   covers PCs without Windows echo cancellation and any residue.
-- **Transcript check.** A line from the microphone that repeats what the
-  other side just said is dropped.
+- **Transcript check.** A line from the microphone whose words mostly repeat
+  what the other side was saying at that moment is dropped, including fragments
+  that span two of their sentences. Replies you start after they finish are
+  kept, even when they repeat their words.
 
 `agentdictate copilot --check` reports whether Windows echo cancellation is
 active. `agentdictate copilot --echo-test path\to\speech.wav` plays a recording

@@ -1,9 +1,10 @@
 //! Native window behavior for the copilot: hidden from screen capture,
-//! always on top, never stealing focus unless the user is typing.
+//! always on top, never stealing focus unless the user is typing, and
+//! clickable only where the bar and panel are drawn.
 
 use std::cell::Cell;
 
-use agentdictate_ui::CopilotWindowHost;
+use agentdictate_ui::{CopilotShape, CopilotWindowHost};
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
@@ -72,6 +73,39 @@ impl Win32CopilotHost {
         }
     }
 
+    /// Moves the window up when growing it would push the panel off the
+    /// bottom of the monitor the user dragged it to.
+    fn keep_on_screen(&self) {
+        unsafe {
+            let mut rect: RECT = std::mem::zeroed();
+            if GetWindowRect(self.handle(), &mut rect) == 0 {
+                return;
+            }
+            let monitor = MonitorFromWindow(self.handle(), MONITOR_DEFAULTTONEAREST);
+            let mut info: MONITORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return;
+            }
+            let work = info.rcWork;
+            let height = rect.bottom - rect.top;
+            let width = rect.right - rect.left;
+            let y = rect.top.min(work.bottom - height).max(work.top);
+            let x = rect.left.min(work.right - width).max(work.left);
+            if (x, y) != (rect.left, rect.top) {
+                SetWindowPos(
+                    self.handle(),
+                    HWND_TOPMOST,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
     fn set_no_activate(&self, enabled: bool) {
         unsafe {
             let style = GetWindowLongPtrW(self.handle(), GWL_EXSTYLE);
@@ -125,6 +159,8 @@ impl CopilotWindowHost for Win32CopilotHost {
                 SWP_NOMOVE | SWP_NOACTIVATE,
             );
         }
+        // The window keeps wherever the user dragged it.
+        self.keep_on_screen();
     }
 
     fn set_visible(&self, visible: bool) {
@@ -167,6 +203,44 @@ impl CopilotWindowHost for Win32CopilotHost {
                 && GetForegroundWindow() == self.handle()
             {
                 force_foreground(previous);
+            }
+        }
+    }
+
+    fn set_shape(&self, shapes: &[CopilotShape]) {
+        if shapes.is_empty() {
+            return;
+        }
+        let scale = self.scale();
+        let at = |value: f32| (value * scale).round() as i32;
+        unsafe {
+            let region = CreateRectRgn(0, 0, 0, 0);
+            if region.is_null() {
+                return;
+            }
+            for shape in shapes {
+                let diameter = at(shape.radius * 2.0);
+                // Round-rect regions exclude their right and bottom edges.
+                let part = CreateRoundRectRgn(
+                    at(shape.x),
+                    at(shape.y),
+                    at(shape.x + shape.width) + 1,
+                    at(shape.y + shape.height) + 1,
+                    diameter,
+                    diameter,
+                );
+                if !part.is_null() {
+                    CombineRgn(region, region, part, RGN_OR);
+                    DeleteObject(part);
+                }
+            }
+            // On success the system owns the region.
+            if SetWindowRgn(self.handle(), region, 1) == 0 {
+                DeleteObject(region);
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    "copilot window shape could not be applied"
+                );
             }
         }
     }

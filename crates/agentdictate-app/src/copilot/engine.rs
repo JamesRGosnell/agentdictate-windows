@@ -18,10 +18,11 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights, CopilotProvider,
-    CopilotSettings, ECHO_SIMILARITY, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction,
-    RESEARCHED_GUIDANCE, Speaker, TranscriptLine, answer_system_prompt, answer_user_prompt,
-    detected_question_instruction, insights_system_prompt, insights_user_prompt,
+    CopilotSettings, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction, RESEARCHED_GUIDANCE,
+    Speaker, TranscriptLine, answer_system_prompt, answer_user_prompt,
+    detected_question_instruction, insights_system_prompt, insights_user_prompt, is_echo_of,
     looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_insights,
+    parse_question_verdict, question_classifier_system_prompt, question_classifier_user_prompt,
     render_transcript, typed_question_instruction, utterance_similarity,
 };
 
@@ -39,8 +40,25 @@ const INSIGHTS_INTERVAL: Duration = Duration::from_secs(20);
 const INSIGHTS_MIN_NEW_LINES: usize = 2;
 const AUTO_ANSWER_COOLDOWN: Duration = Duration::from_secs(6);
 const ECHO_WAIT: Duration = Duration::from_secs(4);
-/// Longest a microphone line waits for the other side to finish speaking.
-const ECHO_WAIT_WHILE_SPEAKING: Duration = Duration::from_secs(8);
+/// Longest a microphone line waits for the other side to finish speaking;
+/// covers the longest system-audio utterance plus its transcription.
+const ECHO_WAIT_WHILE_SPEAKING: Duration = Duration::from_secs(15);
+/// System-audio speech within this much of a microphone line can be its
+/// source. Echo is heard while they speak, so this only absorbs timing drift
+/// between the two captures; a reply that starts after they finish is kept.
+const ECHO_WINDOW_MS: u64 = 500;
+/// Silence after the other side's question before answering it: someone
+/// asking you something waits; a rhetorical question runs straight on.
+const QUESTION_PAUSE_MS: u64 = 1_000;
+/// Questions still waiting this long, for example while sound keeps playing,
+/// are dropped as stale.
+const QUESTION_EXPIRY: Duration = Duration::from_secs(8);
+/// Longest the fast model's confirmation is awaited before answering anyway.
+const QUESTION_VERDICT_WAIT: Duration = Duration::from_secs(3);
+/// System-audio speech starting this long after a question ended is new
+/// speech. The segmenter needs over half a second of silence to end an
+/// utterance, while another device's copy of the question starts with it.
+const RESUMED_SPEECH_MS: u64 = 300;
 
 /// Audio pipeline output, independent of the capture backend.
 #[derive(Clone, Debug)]
@@ -121,6 +139,10 @@ pub(crate) enum EngineMsg {
         text: String,
     },
     InsightsFinished(Result<Option<CopilotInsights>, String>),
+    QuestionVerdict {
+        id: u64,
+        directed: bool,
+    },
     Hotkey(HotkeyCommand),
     ShowRequested,
     ModelsLoaded(CopilotProvider, Vec<ModelChoice>),
@@ -137,6 +159,14 @@ struct ThemSpan {
     start_ms: u64,
     end_ms: u64,
     text: Option<String>,
+}
+
+struct PendingQuestion {
+    id: u64,
+    text: String,
+    end_ms: u64,
+    directed: Option<bool>,
+    asked: Instant,
 }
 
 struct PendingMine {
@@ -168,6 +198,8 @@ pub(crate) struct Engine {
     them_spans: VecDeque<ThemSpan>,
     pending_mine: Vec<PendingMine>,
     them_speaking: bool,
+    pending_question: Option<PendingQuestion>,
+    next_question: u64,
     next_answer: u64,
     active_answer: Option<ActiveAnswer>,
     answers: Vec<(String, String)>,
@@ -203,6 +235,8 @@ impl Engine {
             them_spans: VecDeque::new(),
             pending_mine: Vec::new(),
             them_speaking: false,
+            pending_question: None,
+            next_question: 1,
             next_answer: 1,
             active_answer: None,
             answers: Vec::new(),
@@ -361,6 +395,16 @@ impl Engine {
                 }
             }
             EngineMsg::InsightsFinished(result) => self.handle_insights(result),
+            EngineMsg::QuestionVerdict { id, directed } => {
+                if let Some(pending) = self
+                    .pending_question
+                    .as_mut()
+                    .filter(|pending| pending.id == id)
+                {
+                    pending.directed = Some(directed);
+                }
+                self.evaluate_question();
+            }
             EngineMsg::Hotkey(HotkeyCommand::Assist) => {
                 // The shortcut works while the copilot is hidden.
                 (self.ui)(CopilotEvent::Show);
@@ -474,6 +518,9 @@ impl Engine {
             AudioMsg::Speaking { speaker, active } => {
                 if speaker == Speaker::Them {
                     self.them_speaking = active;
+                    if !active {
+                        self.evaluate_question();
+                    }
                 }
                 (self.ui)(CopilotEvent::Speaking { speaker, active });
             }
@@ -487,8 +534,14 @@ impl Engine {
     }
 
     fn queue_utterance(&mut self, speaker: Speaker, utterance: Utterance) {
-        let end_ms = self.elapsed_ms();
-        let start_ms = end_ms.saturating_sub(utterance.duration_ms());
+        // Times bound the speech itself on the session clock, so the two
+        // sides line up: the segmenter releases an utterance after a stretch
+        // of silence, and pads it with audio from before speech began.
+        let released = self
+            .elapsed_ms()
+            .saturating_sub(utterance.released_after_ms);
+        let start_ms = released.saturating_sub(utterance.duration_ms()) + utterance.lead_ms;
+        let end_ms = released.saturating_sub(utterance.tail_ms).max(start_ms);
         if speaker == Speaker::Them {
             self.them_spans.push_back(ThemSpan {
                 start_ms,
@@ -574,12 +627,12 @@ impl Engine {
                 self.publish(line);
                 self.resolve_pending_mine(false);
                 if let Some(question) = question {
-                    self.maybe_auto_answer(question);
+                    self.consider_question(question, end_ms);
                 }
             }
             Speaker::Me => {
-                let overlapping = self.overlapping_them(start_ms, end_ms);
-                if overlapping.is_empty() && !self.them_speaking {
+                let nearby = self.nearby_them(start_ms, end_ms);
+                if nearby.is_empty() && !self.them_speaking {
                     self.publish(line);
                 } else {
                     // While the other side is still mid-utterance, its span
@@ -606,17 +659,14 @@ impl Engine {
         self.resolve_pending_mine(false);
     }
 
-    /// Indices of system-audio spans that overlap a microphone utterance.
-    fn overlapping_them(&self, start_ms: u64, end_ms: u64) -> Vec<usize> {
-        let duration = end_ms.saturating_sub(start_ms).max(1);
+    /// Indices of system-audio spans near enough in time to be the source of
+    /// a microphone utterance.
+    fn nearby_them(&self, start_ms: u64, end_ms: u64) -> Vec<usize> {
         self.them_spans
             .iter()
             .enumerate()
             .filter(|(_, span)| {
-                let overlap = end_ms
-                    .min(span.end_ms)
-                    .saturating_sub(start_ms.max(span.start_ms));
-                overlap * 10 >= duration * 3
+                span.end_ms + ECHO_WINDOW_MS >= start_ms && span.start_ms <= end_ms + ECHO_WINDOW_MS
             })
             .map(|(index, _)| index)
             .collect()
@@ -629,19 +679,21 @@ impl Engine {
         let pending = std::mem::take(&mut self.pending_mine);
         for item in pending {
             let start_ms = item.line.at_ms;
-            let overlapping = self.overlapping_them(start_ms, item.end_ms);
-            let all_known = overlapping
+            let nearby = self.nearby_them(start_ms, item.end_ms);
+            let all_known = nearby
                 .iter()
                 .all(|index| self.them_spans[*index].text.is_some());
             if (!all_known || self.them_speaking) && !force && now < item.deadline {
                 self.pending_mine.push(item);
                 continue;
             }
-            let echo = overlapping.iter().any(|index| {
-                self.them_spans[*index].text.as_deref().is_some_and(|them| {
-                    utterance_similarity(&item.line.text, them) >= ECHO_SIMILARITY
-                })
-            });
+            // Echo fragments can straddle two system-audio utterances.
+            let theirs = nearby
+                .iter()
+                .filter_map(|index| self.them_spans[*index].text.as_deref())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let echo = !theirs.is_empty() && is_echo_of(&item.line.text, &theirs);
             if echo {
                 tracing::info!("dropped microphone echo of system audio");
             } else {
@@ -658,6 +710,91 @@ impl Engine {
             .unwrap_or(self.transcript.len());
         self.transcript.insert(position, line.clone());
         (self.ui)(CopilotEvent::Transcript(line));
+    }
+
+    /// Starts confirming that a question from the other side is aimed at the
+    /// user. It is answered only once they pause and the fast model agrees.
+    fn consider_question(&mut self, question: String, end_ms: u64) {
+        if !self.settings.auto_answer || self.ending {
+            return;
+        }
+        let id = self.next_question;
+        self.next_question += 1;
+        self.pending_question = Some(PendingQuestion {
+            id,
+            text: question.clone(),
+            end_ms,
+            directed: None,
+            asked: Instant::now(),
+        });
+        let mut settings = self.settings.clone();
+        settings.set_answer_model(self.settings.fast_model());
+        let request = AnswerRequest {
+            system: question_classifier_system_prompt().to_owned(),
+            user: question_classifier_user_prompt(
+                &render_transcript(&self.transcript, INSIGHTS_TRANSCRIPT_CHARS),
+                &question,
+            ),
+            image_jpeg: None,
+            model: settings.answer_model(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 200,
+            cache_key: format!("{}-questions", self.session_key),
+        };
+        let providers = Arc::clone(&self.services.providers);
+        let messages = self.messages.clone();
+        let _ = std::thread::Builder::new()
+            .name("copilot-question".into())
+            .spawn(move || {
+                let cancel = AtomicBool::new(false);
+                // If the check fails, the pause rule alone decides.
+                let directed = providers(&settings)
+                    .and_then(|provider| complete(provider.as_ref(), &request, &cancel))
+                    .ok()
+                    .and_then(|text| parse_question_verdict(&text))
+                    .unwrap_or(true);
+                let _ = messages.send(EngineMsg::QuestionVerdict { id, directed });
+            });
+    }
+
+    /// Answers the pending question once the other side has paused after it
+    /// and the classifier confirmed it; drops it if they kept talking.
+    fn evaluate_question(&mut self) {
+        let Some(pending) = self.pending_question.as_ref() else {
+            return;
+        };
+        let resumed = self
+            .them_spans
+            .iter()
+            .any(|span| span.start_ms >= pending.end_ms + RESUMED_SPEECH_MS);
+        if resumed {
+            tracing::info!("the other side kept talking; not answering their question");
+            self.pending_question = None;
+            return;
+        }
+        if pending.asked.elapsed() > QUESTION_EXPIRY {
+            self.pending_question = None;
+            return;
+        }
+        // A brief sound may be the start of more speech; wait to find out.
+        if self.them_speaking || self.elapsed_ms() < pending.end_ms + QUESTION_PAUSE_MS {
+            return;
+        }
+        let directed = match pending.directed {
+            Some(directed) => directed,
+            // A slow check, like a failed one, leaves the pause rule to decide.
+            None if pending.asked.elapsed() >= QUESTION_VERDICT_WAIT => true,
+            None => return,
+        };
+        if !directed {
+            tracing::info!("question was not aimed at the user; not answering");
+            self.pending_question = None;
+            return;
+        }
+        if let Some(pending) = self.pending_question.take() {
+            self.maybe_auto_answer(pending.text);
+        }
     }
 
     fn maybe_auto_answer(&mut self, question: String) {
@@ -896,6 +1033,7 @@ impl Engine {
         if !self.pending_mine.is_empty() {
             self.resolve_pending_mine(false);
         }
+        self.evaluate_question();
         self.maybe_request_insights();
     }
 
@@ -957,18 +1095,10 @@ impl Engine {
                 return;
             }
         };
-        let question = insights.question.clone();
+        // A detected question is offered as a click-to-answer card; only the
+        // other side's own pause-confirmed questions are answered unprompted.
         self.insights = insights.clone();
         (self.ui)(CopilotEvent::Insights(insights));
-        if let Some(question) = question {
-            let already_answered = self
-                .last_auto_question
-                .as_ref()
-                .is_some_and(|(previous, _)| utterance_similarity(previous, &question) >= 0.5);
-            if !already_answered {
-                self.maybe_auto_answer(question);
-            }
-        }
     }
 
     /// Ends the session: drains audio and transcription, then writes notes.
@@ -1174,6 +1304,10 @@ mod tests {
                 sink(StreamEvent::Text(
                     r#"{"topic":"Pricing","summary":["Discussing plans"],"question":null,"suggestions":["Suggest a reply"]}"#.into(),
                 ));
+            } else if request.system == question_classifier_system_prompt() {
+                // Tag questions in these fixtures are rhetorical.
+                let directed = !request.user.contains("isn't it");
+                sink(StreamEvent::Text(format!(r#"{{"answer": {directed}}}"#)));
             } else {
                 sink(StreamEvent::Searching("pricing".into()));
                 sink(StreamEvent::Text("Say: **$20** per seat.".into()));
@@ -1227,16 +1361,38 @@ mod tests {
                 Ok(message) => {
                     engine.handle(message);
                 }
-                Err(_) if engine.active_answer.is_none() && !engine.insights_in_flight => return,
-                Err(_) => {}
+                Err(_)
+                    if engine.active_answer.is_none()
+                        && !engine.insights_in_flight
+                        && engine.pending_question.is_none() =>
+                {
+                    return;
+                }
+                Err(_) => engine.evaluate_question(),
             }
         }
+    }
+
+    /// Places the session clock well past the fixture utterances, as if the
+    /// other side had already been silent for a while.
+    fn after_a_pause(engine: &mut Engine) {
+        engine.started = Instant::now() - Duration::from_secs(30);
+    }
+
+    fn answers_started(events: &Arc<Mutex<Vec<CopilotEvent>>>) -> usize {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, CopilotEvent::AnswerStarted { .. }))
+            .count()
     }
 
     #[test]
     fn question_from_the_other_side_triggers_an_automatic_streamed_answer() {
         let (mut engine, incoming, events, requests, _directory) =
             harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
         engine.handle_transcribed(
             Speaker::Them,
             1_000,
@@ -1262,9 +1418,17 @@ mod tests {
             CopilotEvent::AnswerStatus { status: AnswerStatus::Searching(query), .. } if query == "pricing"
         )));
         let requests = requests.lock().unwrap();
+        let classifier = requests
+            .iter()
+            .find(|request| request.system == question_classifier_system_prompt())
+            .expect("the question is confirmed before answering");
+        assert_eq!(classifier.model, "gpt-6-luna");
         let researched: Vec<_> = requests
             .iter()
-            .filter(|request| !request.user.contains(INSTANT_GUIDANCE))
+            .filter(|request| {
+                !request.user.contains(INSTANT_GUIDANCE)
+                    && request.system != question_classifier_system_prompt()
+            })
             .collect();
         assert!(researched[0].user.contains("They just asked"));
         assert!(
@@ -1281,6 +1445,91 @@ mod tests {
         assert_eq!(instant.model, "gpt-6-luna");
         assert!(!instant.web_search);
         assert_eq!(engine.answers.len(), 1);
+    }
+
+    #[test]
+    fn rhetorical_questions_followed_by_more_speech_are_not_answered() {
+        let (mut engine, incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("So why does a sales team need a daily standup?".into()),
+        );
+        // They carry straight on with their own answer.
+        engine.them_spans.push_back(ThemSpan {
+            start_ms: 3_700,
+            end_ms: 6_000,
+            text: None,
+        });
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 0);
+        assert!(engine.pending_question.is_none());
+    }
+
+    #[test]
+    fn questions_wait_while_the_other_side_might_still_be_talking() {
+        let (mut engine, incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: true,
+        });
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("What does pricing look like for a team of ten?".into()),
+        );
+        // The verdict arrives while a sound is still being judged as speech.
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(message);
+        assert_eq!(answers_started(&events), 0);
+        assert!(engine.pending_question.is_some());
+        // The sound was not speech: the question stands and is answered.
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: false,
+        });
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 1);
+    }
+
+    #[test]
+    fn questions_the_classifier_rejects_are_not_answered() {
+        let (mut engine, incoming, events, requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("Daily coaching is the whole game, isn't it?".into()),
+        );
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 0);
+        assert_eq!(requests.lock().unwrap().len(), 1, "only the classifier ran");
+    }
+
+    #[test]
+    fn detected_insight_questions_are_offered_but_not_answered() {
+        let (mut engine, incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.handle_insights(Ok(Some(CopilotInsights {
+            topic: "Sales cadence".into(),
+            summary: vec!["Advice on daily check-ins".into()],
+            question: Some("Instead of weekly, meet with them every single day".into()),
+            suggestions: Vec::new(),
+        })));
+        drain(&mut engine, &incoming);
+        assert_eq!(answers_started(&events), 0);
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::Insights(insights) if insights.question.is_some()
+        )));
     }
 
     #[test]
@@ -1412,6 +1661,76 @@ mod tests {
             |event| matches!(event, CopilotEvent::Transcript(line) if line.speaker == Speaker::Me),
         );
         assert!(!mine, "echo of the other side must not appear as the user");
+    }
+
+    #[test]
+    fn echo_fragments_spanning_two_utterances_are_dropped() {
+        let (mut engine, _incoming, events, _requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        for (start_ms, end_ms, text) in [
+            (1_000, 3_000, "The thing about pricing is"),
+            (
+                3_400,
+                6_000,
+                "that most founders get it wrong every single time.",
+            ),
+        ] {
+            engine.them_spans.push_back(ThemSpan {
+                start_ms,
+                end_ms,
+                text: None,
+            });
+            engine.handle_transcribed(Speaker::Them, start_ms, end_ms, Ok(text.into()));
+        }
+        // Straddles both lines, and a fragment of the second one.
+        engine.handle_transcribed(
+            Speaker::Me,
+            2_400,
+            4_200,
+            Ok("pricing is that most founders".into()),
+        );
+        engine.handle_transcribed(
+            Speaker::Me,
+            4_800,
+            5_900,
+            Ok("get it wrong every time".into()),
+        );
+        assert!(engine.pending_mine.is_empty());
+        let mine = events.lock().unwrap().iter().any(
+            |event| matches!(event, CopilotEvent::Transcript(line) if line.speaker == Speaker::Me),
+        );
+        assert!(!mine, "speaker echo must not appear as the user");
+    }
+
+    #[test]
+    fn replies_that_repeat_the_question_are_kept() {
+        let (mut engine, _incoming, events, _requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.them_spans.push_back(ThemSpan {
+            start_ms: 1_000,
+            end_ms: 3_000,
+            text: None,
+        });
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("What does pricing look like for a team of ten?".into()),
+        );
+        // A quick reply, starting 0.6 s after they finished.
+        engine.handle_transcribed(
+            Speaker::Me,
+            3_600,
+            5_000,
+            Ok("Pricing for a team of ten, sure.".into()),
+        );
+        assert!(events.lock().unwrap().iter().any(
+            |event| matches!(event, CopilotEvent::Transcript(line) if line.speaker == Speaker::Me),
+        ));
     }
 
     #[test]

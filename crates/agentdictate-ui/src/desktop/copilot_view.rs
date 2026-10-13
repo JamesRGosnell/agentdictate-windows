@@ -1,6 +1,7 @@
 //! The meeting copilot: a floating control bar with a live assistance panel.
 
 use std::{
+    cell::RefCell,
     collections::HashSet,
     rc::Rc,
     sync::Arc,
@@ -12,9 +13,9 @@ use agentdictate_core::{
     CopilotSettings, ListenState, QuickAction, Speaker, format_offset,
 };
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, Render, ScrollHandle, SharedString, Stateful, Subscription,
-    Window, WindowControlArea, div, prelude::*, px, rems, svg,
+    AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render, ScrollHandle, SharedString,
+    Stateful, Subscription, Window, WindowControlArea, canvas, div, prelude::*, px, rems, svg,
 };
 use gpui_component::{
     h_flex,
@@ -26,8 +27,8 @@ use gpui_component::{
 
 use crate::copilot::{
     AnswerCardModel, COPILOT_BAR_HEIGHT, COPILOT_PANEL_GAP, COPILOT_PANEL_HEIGHT,
-    COPILOT_TOP_MARGIN, COPILOT_WIDTH, CopilotEffect, CopilotViewModel, CopilotWindowHost,
-    source_host,
+    COPILOT_TOP_MARGIN, COPILOT_WIDTH, CopilotEffect, CopilotShape, CopilotViewModel,
+    CopilotWindowHost, source_host,
 };
 
 #[cfg(windows)]
@@ -48,6 +49,8 @@ const ACCENT_SOFT: u32 = 0xe6a48a29;
 const ME: u32 = 0x8ab4f8ff;
 const DANGER: u32 = 0xf87171ff;
 const SHADOW_MARGIN: f32 = 14.0;
+const PILL_HEIGHT: f32 = 38.0;
+const PANEL_RADIUS: f32 = 18.0;
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
 fn color(hex: u32) -> Hsla {
@@ -65,17 +68,17 @@ fn icon(name: &str, size: f32, tint: u32) -> impl IntoElement + use<> {
 fn keycaps(labels: &[String]) -> impl IntoElement + use<> {
     h_flex().gap(px(3.)).children(labels.iter().map(|label| {
         div()
-            .min_w(px(18.))
-            .h(px(18.))
-            .px(px(5.))
+            .min_w(px(16.))
+            .h(px(16.))
+            .px(px(4.))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(5.))
+            .rounded(px(4.))
             .bg(color(0xffffff12))
             .border_1()
             .border_color(color(0xffffff1c))
-            .text_size(px(10.5))
+            .text_size(px(10.))
             .text_color(color(MUTED))
             .child(label.clone())
     }))
@@ -107,17 +110,19 @@ fn chip(id: impl Into<gpui::ElementId>, selected: bool) -> Stateful<Div> {
         })
 }
 
+/// Bar buttons occlude the bar's drag area so clicks reach them.
 fn bar_button(id: &'static str) -> Stateful<Div> {
     div()
         .debug_selector(move || id.to_owned())
         .id(id)
-        .h(px(34.))
-        .px(px(10.))
+        .occlude()
+        .h(px(30.))
+        .px(px(8.))
         .flex()
         .flex_none()
         .items_center()
-        .gap(px(8.))
-        .rounded(px(17.))
+        .gap(px(6.))
+        .rounded(px(15.))
         .cursor_pointer()
         .text_color(color(TEXT))
         .hover(|style| style.bg(color(HOVER)))
@@ -127,7 +132,8 @@ fn icon_button(id: &'static str, name: &'static str, tint: u32) -> Stateful<Div>
     div()
         .debug_selector(move || id.to_owned())
         .id(id)
-        .size(px(32.))
+        .occlude()
+        .size(px(28.))
         .flex()
         .flex_none()
         .items_center()
@@ -135,11 +141,11 @@ fn icon_button(id: &'static str, name: &'static str, tint: u32) -> Stateful<Div>
         .rounded_full()
         .cursor_pointer()
         .hover(|style| style.bg(color(HOVER)))
-        .child(icon(name, 15., tint))
+        .child(icon(name, 14., tint))
 }
 
 fn divider() -> impl IntoElement + use<> {
-    div().w(px(1.)).h(px(18.)).mx(px(2.)).bg(color(BORDER))
+    div().w(px(1.)).h(px(16.)).mx(px(2.)).bg(color(BORDER))
 }
 
 fn section_label(text: &'static str) -> impl IntoElement + use<> {
@@ -188,7 +194,83 @@ pub struct CopilotWindow {
     window_size: Option<(f32, f32)>,
     capture_excluded: bool,
     notice_at: Option<Instant>,
+    shape: Rc<RefCell<ShapeTracker>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Measured bounds of the bar and panel, applied to the host as the window's
+/// clickable shape whenever they change.
+#[derive(Default)]
+struct ShapeTracker {
+    bar: Option<Bounds<Pixels>>,
+    panel: Option<Bounds<Pixels>>,
+    /// The window scale; the host region is in device pixels, so moving to a
+    /// monitor with different scaling must reapply the same logical shape.
+    scale: f32,
+    applied: Option<(Vec<CopilotShape>, f32)>,
+}
+
+impl ShapeTracker {
+    fn shapes(&self) -> Vec<CopilotShape> {
+        // Probes measure inside the 1px border of the bar and panel.
+        let shape = |bounds: Bounds<Pixels>, radius: f32| CopilotShape {
+            x: f32::from(bounds.origin.x) - 1.0,
+            y: f32::from(bounds.origin.y) - 1.0,
+            width: f32::from(bounds.size.width) + 2.0,
+            height: f32::from(bounds.size.height) + 2.0,
+            radius,
+        };
+        self.bar
+            .map(|bounds| shape(bounds, PILL_HEIGHT / 2.0))
+            .into_iter()
+            .chain(self.panel.map(|bounds| shape(bounds, PANEL_RADIUS)))
+            .collect()
+    }
+}
+
+/// Applies the tracked shape on a later turn of the event loop, since the
+/// window region change sends Win32 messages back into GPUI.
+fn apply_shape(tracker: &Rc<RefCell<ShapeTracker>>, host: &Rc<dyn CopilotWindowHost>, cx: &App) {
+    let applied = {
+        let tracker = tracker.borrow();
+        (tracker.shapes(), tracker.scale)
+    };
+    if applied.0.is_empty() || tracker.borrow().applied.as_ref() == Some(&applied) {
+        return;
+    }
+    let shapes = applied.0.clone();
+    tracker.borrow_mut().applied = Some(applied);
+    let host = Rc::clone(host);
+    cx.spawn(async move |_| host.set_shape(&shapes)).detach();
+}
+
+/// An invisible element that reports its parent's bounds for the window shape.
+fn shape_probe(
+    tracker: &Rc<RefCell<ShapeTracker>>,
+    host: &Rc<dyn CopilotWindowHost>,
+    panel: bool,
+) -> impl IntoElement + use<> {
+    let tracker = Rc::clone(tracker);
+    let host = Rc::clone(host);
+    canvas(
+        move |bounds, window, cx| {
+            {
+                let mut shape = tracker.borrow_mut();
+                shape.scale = window.scale_factor();
+                if panel {
+                    shape.panel = Some(bounds);
+                } else {
+                    shape.bar = Some(bounds);
+                }
+            }
+            apply_shape(&tracker, &host, cx);
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 impl CopilotWindow {
@@ -274,6 +356,7 @@ impl CopilotWindow {
             window_size: None,
             capture_excluded,
             notice_at: None,
+            shape: Rc::default(),
             _subscriptions: subscriptions,
         };
         view.load_text_settings(window, cx);
@@ -543,19 +626,19 @@ impl CopilotWindow {
                                 spread_radius: px(0.),
                             }]),
                     )
-                    .child(h_flex().h(px(18.)).gap(px(2.)).items_center().children(
+                    .child(h_flex().h(px(14.)).gap(px(2.)).items_center().children(
                         levels.iter().map(|level| {
                             div()
-                                .w(px(2.5))
-                                .h(px(3. + 15. * level))
+                                .w(px(2.))
+                                .h(px(3. + 11. * level))
                                 .rounded_full()
                                 .bg(color(ACCENT).opacity(0.35 + 0.65 * level))
                         }),
                     ))
                     .child(
                         div()
-                            .min_w(px(34.))
-                            .text_size(px(12.5))
+                            .min_w(px(32.))
+                            .text_size(px(12.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(color(TEXT))
                             .child(self.elapsed_label()),
@@ -599,12 +682,17 @@ impl CopilotWindow {
             };
         let panel_open = self.panel_open;
         let pill = h_flex()
-            .h(px(48.))
-            .pl(px(6.))
-            .pr(px(6.))
-            .gap(px(2.))
+            .debug_selector(|| "copilot-bar".to_owned())
+            .id("copilot-bar")
+            .relative()
+            .h(px(PILL_HEIGHT))
+            .pl(px(4.))
+            .pr(px(4.))
+            .gap(px(1.))
             .items_center()
-            .rounded(px(24.))
+            .rounded(px(PILL_HEIGHT / 2.0))
+            // Empty parts of the bar move the window; buttons occlude it.
+            .window_control_area(WindowControlArea::Drag)
             .bg(color(GLASS))
             .border_1()
             .border_color(color(BORDER))
@@ -617,7 +705,7 @@ impl CopilotWindow {
             .child(
                 div()
                     .id("copilot-grip")
-                    .size(px(36.))
+                    .size(px(30.))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -627,7 +715,7 @@ impl CopilotWindow {
                     .window_control_area(WindowControlArea::Drag)
                     .child(
                         div()
-                            .size(px(26.))
+                            .size(px(22.))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -637,7 +725,7 @@ impl CopilotWindow {
                                 gpui::linear_color_stop(color(0xf3c4a9ff), 0.),
                                 gpui::linear_color_stop(color(0xd9826aff), 1.),
                             ))
-                            .child(icon("sparkles", 14., 0x1a1110ff)),
+                            .child(icon("sparkles", 12., 0x1a1110ff)),
                     ),
             )
             .child(
@@ -651,10 +739,10 @@ impl CopilotWindow {
             .child(divider())
             .child(
                 bar_button("copilot-assist")
-                    .child(icon("sparkles", 14., ACCENT))
+                    .child(icon("sparkles", 13., ACCENT))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(12.5))
                             .font_weight(FontWeight::MEDIUM)
                             .child("Ask AI"),
                     )
@@ -669,9 +757,9 @@ impl CopilotWindow {
                 bar_button("copilot-hide")
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(12.5))
                             .text_color(color(MUTED))
-                            .child("Show/Hide"),
+                            .child("Hide"),
                     )
                     .child(keycaps(&shortcuts.toggle))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -722,7 +810,8 @@ impl CopilotWindow {
                     this.stop_typing(true, cx);
                     cx.notify();
                 },
-            )));
+            )))
+            .child(shape_probe(&self.shape, &self.host, false));
         h_flex()
             .w_full()
             .h(px(COPILOT_BAR_HEIGHT))
@@ -753,9 +842,10 @@ impl CopilotWindow {
             .pt(px(COPILOT_PANEL_GAP))
             .child(
                 v_flex()
+                    .relative()
                     .w_full()
                     .h(px(COPILOT_PANEL_HEIGHT))
-                    .rounded(px(18.))
+                    .rounded(px(PANEL_RADIUS))
                     .bg(color(GLASS))
                     .border_1()
                     .border_color(color(BORDER))
@@ -766,6 +856,7 @@ impl CopilotWindow {
                         blur_radius: px(16.),
                         spread_radius: px(0.),
                     }])
+                    .child(shape_probe(&self.shape, &self.host, true))
                     .child(self.render_header(cx))
                     .child(div().flex_1().min_h_0().w_full().child(body))
                     .when(show_footer, |panel| panel.child(self.render_footer(cx))),
@@ -1936,6 +2027,10 @@ impl CopilotWindow {
 impl Render for CopilotWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_host(cx);
+        if !self.panel_open && self.shape.borrow().panel.is_some() {
+            self.shape.borrow_mut().panel = None;
+            apply_shape(&self.shape, &self.host, cx);
+        }
         let bar = self.render_bar(cx);
         let panel = self.panel_open.then(|| self.render_panel(window, cx));
         div()

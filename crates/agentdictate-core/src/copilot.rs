@@ -680,7 +680,8 @@ pub const fn insights_system_prompt() -> &'static str {
 Respond with ONLY one JSON object and no other text, using exactly these keys:\n\
 {\"topic\": string of at most 8 words naming what is being discussed now,\n\
  \"summary\": array of at most 3 very short bullets about the latest discussion,\n\
- \"question\": string or null - the most recent question or request that Them directed at Me and Me has not answered yet, rewritten to be self-contained; null if there is none or if it is small talk,\n\
+ \"question\": string or null - the most recent genuine question Them asked Me and paused for Me to answer, which Me has not answered yet, rewritten to be self-contained; \
+null for advice, opinions, instructions, statements, rhetorical questions, questions Them answered themselves, small talk, or when unsure,\n\
  \"suggestions\": array of at most 3 short clickable prompts (under 6 words) the user may want next, like \"Define <term>\" or \"Suggest a reply\"}"
 }
 
@@ -789,6 +790,60 @@ pub fn utterance_similarity(left: &str, right: &str) -> f32 {
 
 /// Microphone lines this similar to a concurrent system-audio line are echo.
 pub const ECHO_SIMILARITY: f32 = 0.55;
+
+/// Microphone lines whose words mostly appear in what the other side just
+/// said are echo fragments, however short.
+pub const ECHO_CONTAINMENT: f32 = 0.6;
+
+/// Share of a microphone line's words that also appear in `theirs`.
+///
+/// Speaker echo usually reaches the transcript as a fragment of a longer
+/// system-audio line, which word-set similarity scores low because the
+/// fragment is a small part of the union.
+#[must_use]
+pub fn echo_containment(mine: &str, theirs: &str) -> f32 {
+    let mine = word_set(mine);
+    if mine.is_empty() {
+        return 0.0;
+    }
+    let theirs = word_set(theirs);
+    mine.intersection(&theirs).count() as f32 / mine.len() as f32
+}
+
+/// True when a microphone line repeats what the other side said nearby.
+#[must_use]
+pub fn is_echo_of(mine: &str, theirs: &str) -> bool {
+    echo_containment(mine, theirs) >= ECHO_CONTAINMENT
+        || utterance_similarity(mine, theirs) >= ECHO_SIMILARITY
+}
+
+/// System prompt deciding whether the other side's latest question is aimed
+/// at the user and needs an answer now.
+#[must_use]
+pub const fn question_classifier_system_prompt() -> &'static str {
+    "You decide whether the user (\"Me\") should answer right now in a live conversation. \
+Look at the latest line from \"Them\". Answer true only if it asks Me something or asks Me to do or explain something, \
+and Me would be expected to respond next. Answer false for rhetorical questions, questions the speaker goes on to answer, \
+questions to someone else, small talk, and statements. Respond with ONLY {\"answer\": true} or {\"answer\": false}."
+}
+
+/// User turn for the question classifier.
+#[must_use]
+pub fn question_classifier_user_prompt(transcript: &str, latest: &str) -> String {
+    format!(
+        "<transcript>\n{transcript}\n</transcript>\n\nLatest line from Them: \"{}\"",
+        latest.trim()
+    )
+}
+
+/// Reads the classifier's verdict, tolerating prose around the JSON.
+#[must_use]
+pub fn parse_question_verdict(response: &str) -> Option<bool> {
+    let start = response.find('{')?;
+    let end = response.rfind('}')?;
+    let value: serde_json::Value = serde_json::from_str(response.get(start..=end)?).ok()?;
+    value.get("answer").and_then(serde_json::Value::as_bool)
+}
 
 /// Builds the Markdown meeting notes file.
 #[must_use]
@@ -975,6 +1030,47 @@ mod tests {
                 > ECHO_SIMILARITY
         );
         assert!(utterance_similarity("I disagree, Friday works better", them) < ECHO_SIMILARITY);
+    }
+
+    #[test]
+    fn echo_fragments_of_longer_lines_are_recognized() {
+        // Real echo fragments from a laptop-speaker session.
+        let them = "trip with us. It's like the entire wedding party. What's one thing in your life that you can never have enough of? And I thought I'd get some silly answers";
+        assert!(is_echo_of(
+            "in your life that you can never have enough of. And I thought",
+            them
+        ));
+        let them = "of connection, community, tribe, family, belonging. And that's the industry that we're in. So our industry, what we're selling.";
+        assert!(is_echo_of("Tribe. Family. Belonging.", them));
+        assert!(is_echo_of(
+            "And that's the industry that we're in. So our",
+            them
+        ));
+        let them =
+            "or money. And I got some of that, but mostly what people told me was some version.";
+        assert!(is_echo_of("People told me with some version.", them));
+        let them = "All right. I have very few rules of law, but a rule of sales is never present an invoice via email.";
+        assert!(is_echo_of("Role of sales is never presented.", them));
+        // The user's own words are kept.
+        assert!(!is_echo_of(
+            "Sorry, can you repeat the pricing for the annual plan?",
+            them
+        ));
+        assert!(!is_echo_of("", them));
+    }
+
+    #[test]
+    fn question_verdicts_parse_from_json_or_prose() {
+        assert_eq!(parse_question_verdict("{\"answer\": true}"), Some(true));
+        assert_eq!(
+            parse_question_verdict("Sure: {\"answer\": false} done"),
+            Some(false)
+        );
+        assert_eq!(parse_question_verdict("yes"), None);
+        assert!(
+            question_classifier_user_prompt("[0:01] Them: Hi", "How much?")
+                .contains("Latest line from Them: \"How much?\"")
+        );
     }
 
     #[test]

@@ -8,13 +8,23 @@ use agentdictate_core::{
 /// Logical window metrics. The window resizes between the bar alone and the
 /// bar with its panel so the transparent area never blocks the meeting app.
 pub const COPILOT_WIDTH: f32 = 720.0;
-pub const COPILOT_BAR_HEIGHT: f32 = 64.0;
+pub const COPILOT_BAR_HEIGHT: f32 = 54.0;
 pub const COPILOT_PANEL_HEIGHT: f32 = 480.0;
 pub const COPILOT_PANEL_GAP: f32 = 6.0;
 pub const COPILOT_TOP_MARGIN: f32 = 10.0;
 
 /// Number of recent level samples kept for each mini waveform.
 pub const LEVEL_HISTORY: usize = 14;
+
+/// A visible, rounded part of the copilot window in logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CopilotShape {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub radius: f32,
+}
 
 /// Host-window operations the copilot UI needs from the platform.
 pub trait CopilotWindowHost: 'static {
@@ -28,6 +38,9 @@ pub trait CopilotWindowHost: 'static {
     fn end_typing(&self, restore_focus: bool);
     /// Includes or excludes the window from screen capture.
     fn set_capture_excluded(&self, excluded: bool);
+    /// Limits the window to its visible shapes, so clicks on the transparent
+    /// area around the bar and panel reach the windows underneath.
+    fn set_shape(&self, _shapes: &[CopilotShape]) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

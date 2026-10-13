@@ -8,6 +8,9 @@ use std::collections::VecDeque;
 
 pub(crate) const SAMPLE_RATE: u32 = 16_000;
 const BLOCK: usize = 320; // 20 ms
+const BLOCK_MS: usize = 20;
+/// Silent blocks kept at the end of an utterance.
+const TAIL_BLOCKS: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SegmenterConfig {
@@ -71,6 +74,12 @@ pub(crate) struct Utterance {
     pub start_sample: u64,
     pub voiced_blocks: usize,
     pub peak_rms: f32,
+    /// Audio kept from before speech began.
+    pub lead_ms: u64,
+    /// Silence kept after speech ended.
+    pub tail_ms: u64,
+    /// Silence that passed after `samples` before the utterance was released.
+    pub released_after_ms: u64,
 }
 
 impl Utterance {
@@ -94,6 +103,7 @@ pub(crate) enum SegmentEvent {
 struct Active {
     samples: Vec<f32>,
     start_sample: u64,
+    lead_blocks: usize,
     voiced_blocks: usize,
     silent_run: usize,
     blocks: usize,
@@ -213,11 +223,13 @@ impl Segmenter {
         if self.onset_run >= self.config.start_blocks {
             let blocks: Vec<Vec<f32>> = self.pre_roll.drain(..).collect();
             let start_sample = block_start + BLOCK as u64 - (blocks.len() * BLOCK) as u64;
+            let lead_blocks = blocks.len().saturating_sub(self.onset_run);
             let samples: Vec<f32> = blocks.into_iter().flatten().collect();
             self.active = Some(Active {
                 blocks: samples.len() / BLOCK,
                 samples,
                 start_sample,
+                lead_blocks,
                 voiced_blocks: self.onset_run,
                 silent_run: 0,
                 peak_rms: rms,
@@ -234,8 +246,8 @@ impl Segmenter {
             return SegmentEvent::SpeechDiscarded;
         }
         // Keep a little trailing silence; drop the rest of the hangover.
-        let trailing = active.silent_run.saturating_sub(8) * BLOCK;
-        let keep = active.samples.len().saturating_sub(trailing);
+        let dropped_blocks = active.silent_run.saturating_sub(TAIL_BLOCKS);
+        let keep = active.samples.len().saturating_sub(dropped_blocks * BLOCK);
         SegmentEvent::Utterance(Utterance {
             samples: active.samples[..keep]
                 .iter()
@@ -244,6 +256,9 @@ impl Segmenter {
             start_sample: active.start_sample,
             voiced_blocks: active.voiced_blocks,
             peak_rms: active.peak_rms,
+            lead_ms: (active.lead_blocks * BLOCK_MS) as u64,
+            tail_ms: (active.silent_run.min(TAIL_BLOCKS) * BLOCK_MS) as u64,
+            released_after_ms: (dropped_blocks * BLOCK_MS) as u64,
         })
     }
 
@@ -356,6 +371,15 @@ mod tests {
             "{}",
             utterance.duration_ms()
         );
+        // The speech itself, from 500 to 1,700 ms, can be recovered, and the
+        // release came 32 silent blocks (640 ms) after it ended.
+        let speech_start = utterance.start_ms() + utterance.lead_ms;
+        let samples_end = utterance.start_ms() + utterance.duration_ms();
+        let speech_end = samples_end - utterance.tail_ms;
+        assert!(speech_start.abs_diff(500) <= 20, "{speech_start}");
+        assert!(speech_end.abs_diff(1_700) <= 20, "{speech_end}");
+        let released = samples_end + utterance.released_after_ms;
+        assert!(released.abs_diff(2_340) <= 20, "{released}");
         assert!(!segmenter.is_speaking());
     }
 

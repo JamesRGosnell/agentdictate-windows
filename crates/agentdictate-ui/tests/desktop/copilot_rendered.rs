@@ -14,7 +14,9 @@ use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings,
     ListenState, QuickAction,
 };
-use agentdictate_ui::{CopilotViewModel, CopilotWindow, CopilotWindowHost, test_support};
+use agentdictate_ui::{
+    CopilotShape, CopilotViewModel, CopilotWindow, CopilotWindowHost, test_support,
+};
 use gpui::{
     Bounds, Entity, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TestAppContext,
     VisualTestContext, WindowBounds, WindowOptions, point, prelude::*, px, size,
@@ -23,6 +25,7 @@ use gpui_component::Root;
 
 struct RecordingHost {
     calls: Rc<RefCell<Vec<String>>>,
+    shapes: Rc<RefCell<Vec<Vec<CopilotShape>>>>,
 }
 
 impl CopilotWindowHost for RecordingHost {
@@ -47,12 +50,16 @@ impl CopilotWindowHost for RecordingHost {
             .borrow_mut()
             .push(format!("capture excluded {excluded}"));
     }
+    fn set_shape(&self, shapes: &[CopilotShape]) {
+        self.shapes.borrow_mut().push(shapes.to_vec());
+    }
 }
 
 struct Harness {
     view: Entity<CopilotWindow>,
     actions: Arc<Mutex<Vec<CopilotAction>>>,
     host: Rc<RefCell<Vec<String>>>,
+    shapes: Rc<RefCell<Vec<Vec<CopilotShape>>>>,
     cx: &'static mut VisualTestContext,
 }
 
@@ -69,6 +76,8 @@ impl Harness {
         let host = Rc::new(RefCell::new(Vec::new()));
         let sink_actions = Arc::clone(&actions);
         let host_calls = Rc::clone(&host);
+        let shapes = Rc::new(RefCell::new(Vec::new()));
+        let host_shapes = Rc::clone(&shapes);
         let slot = Rc::new(RefCell::new(None));
         let view_slot = Rc::clone(&slot);
         let window = cx.update(|cx| {
@@ -87,7 +96,10 @@ impl Harness {
                         CopilotWindow::new(
                             model,
                             Arc::new(move |action| sink_actions.lock().unwrap().push(action)),
-                            Rc::new(RecordingHost { calls: host_calls }),
+                            Rc::new(RecordingHost {
+                                calls: host_calls,
+                                shapes: host_shapes,
+                            }),
                             window,
                             cx,
                         )
@@ -105,6 +117,7 @@ impl Harness {
             view,
             actions,
             host,
+            shapes,
             cx,
         }
     }
@@ -136,6 +149,10 @@ impl Harness {
     fn host_calls(&self) -> Vec<String> {
         self.host.borrow().clone()
     }
+
+    fn last_shape(&self) -> Vec<CopilotShape> {
+        self.shapes.borrow().last().cloned().unwrap_or_default()
+    }
 }
 
 #[gpui::test]
@@ -153,7 +170,25 @@ fn the_session_starts_as_the_bar_alone(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);
     assert!(harness.has("copilot-assist"));
     assert!(!harness.has("copilot-ask"));
-    assert_eq!(harness.host_calls(), vec!["resize 720x88"]);
+    assert_eq!(harness.host_calls(), vec!["resize 720x78"]);
+}
+
+#[gpui::test]
+fn clicks_beside_the_bar_and_panel_pass_through(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    // The bar alone is clickable, and it is compact.
+    let bar = harness.bounds("copilot-bar");
+    let shape = harness.last_shape();
+    assert_eq!(shape.len(), 1);
+    assert_eq!(shape[0].x, f32::from(bar.origin.x));
+    assert_eq!(shape[0].width, f32::from(bar.size.width));
+    assert_eq!(shape[0].height, 38.0);
+    assert!(shape[0].width < 600.0, "bar is {} wide", shape[0].width);
+    // Opening the panel adds it to the clickable shape; closing removes it.
+    harness.click("copilot-panel");
+    assert_eq!(harness.last_shape().len(), 2);
+    harness.click("copilot-panel");
+    assert_eq!(harness.last_shape().len(), 1);
 }
 
 #[gpui::test]
@@ -181,7 +216,7 @@ fn ask_ai_requests_assistance_and_answers_open_the_panel(cx: &mut TestAppContext
         harness
             .host_calls()
             .iter()
-            .any(|call| call == "resize 720x574")
+            .any(|call| call == "resize 720x564")
     );
 }
 
