@@ -98,6 +98,15 @@ impl Default for ThemeTokens {
     }
 }
 
+/// Theme for the meeting copilot: the shared dark theme with a transparent
+/// root, so only the bar and panel are visible over other windows.
+#[cfg(feature = "desktop")]
+pub(crate) fn initialize_copilot_theme(cx: &mut gpui::App) {
+    initialize_gpui_theme(cx);
+    // GPUI Component's Root paints the theme background across the window.
+    gpui_component::Theme::global_mut(cx).background = gpui::transparent_black();
+}
+
 #[cfg(feature = "desktop")]
 pub(crate) fn initialize_gpui_theme(cx: &mut gpui::App) {
     use gpui::rgb;

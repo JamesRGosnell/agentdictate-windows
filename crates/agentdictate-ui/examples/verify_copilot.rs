@@ -226,6 +226,8 @@ fn main() {
         .run(move |cx| {
             gpui_component::init(cx);
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            // Match the production copilot: transparent around the bar.
+            gpui_component::Theme::global_mut(cx).background = gpui::transparent_black();
             let window = cx
                 .open_window(
                     WindowOptions {

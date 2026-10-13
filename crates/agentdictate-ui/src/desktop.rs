@@ -286,7 +286,7 @@ pub fn run_copilot_window(
     Application::new()
         .with_assets(crate::AgentDictateAssets)
         .run(move |cx: &mut App| {
-            crate::theme::initialize_gpui_theme(cx);
+            crate::theme::initialize_copilot_theme(cx);
             let (sender, mut receiver) = mpsc::unbounded();
             std::thread::Builder::new()
                 .name("agentdictate-copilot-events".into())

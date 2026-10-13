@@ -75,6 +75,11 @@ pub mod test_support {
         cx.update(crate::theme::initialize_gpui_theme);
     }
 
+    /// Initialize the meeting copilot's transparent-root theme.
+    pub fn initialize_copilot(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::initialize_copilot_theme);
+    }
+
     /// Render the production single-line clipping primitive around an
     /// inspectable text element.
     pub fn single_line_clip_element(

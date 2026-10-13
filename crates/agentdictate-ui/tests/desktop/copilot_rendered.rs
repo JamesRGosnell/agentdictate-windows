@@ -64,7 +64,7 @@ impl DesktopHarness for Harness {
 
 impl Harness {
     fn open(cx: &mut TestAppContext) -> Self {
-        test_support::initialize(cx);
+        test_support::initialize_copilot(cx);
         let actions = Arc::new(Mutex::new(Vec::new()));
         let host = Rc::new(RefCell::new(Vec::new()));
         let sink_actions = Arc::clone(&actions);
@@ -136,6 +136,16 @@ impl Harness {
     fn host_calls(&self) -> Vec<String> {
         self.host.borrow().clone()
     }
+}
+
+#[gpui::test]
+fn only_the_bar_and_panel_are_painted_over_other_windows(cx: &mut TestAppContext) {
+    let harness = Harness::open(cx);
+    // GPUI Component's Root fills the window with the theme background; the
+    // copilot window is transparent around its rounded bar and panel.
+    harness.cx.update(|_, cx| {
+        assert_eq!(gpui_component::Theme::global(cx).background.a, 0.0);
+    });
 }
 
 #[gpui::test]
