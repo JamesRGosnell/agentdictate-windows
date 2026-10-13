@@ -44,6 +44,7 @@ dependencies = [
  "embed-resource",
  "evdev",
  "hound",
+ "image",
  "ksni",
  "libc",
  "notify 8.2.0",

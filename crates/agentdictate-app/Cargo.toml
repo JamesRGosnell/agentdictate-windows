@@ -56,6 +56,11 @@ evdev = "0.13.2"
 [target.'cfg(windows)'.dependencies.cpal]
 version = "0.16"
 
+[target.'cfg(windows)'.dependencies.image]
+version = "0.25"
+default-features = false
+features = ["jpeg"]
+
 [target.'cfg(windows)'.dependencies.hound]
 version = "3.5"
 

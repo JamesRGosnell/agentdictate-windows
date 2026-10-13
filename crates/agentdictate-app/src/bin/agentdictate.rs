@@ -54,6 +54,24 @@ fn run() -> anyhow::Result<()> {
     if args.as_slice() == ["login"] {
         return agentdictate_app::sign_in_with_chatgpt();
     }
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some("copilot") {
+        return match args.get(1).map(String::as_str) {
+            None => agentdictate_app::launch_copilot().map_err(Into::into),
+            Some("--check") => {
+                let latency = args.iter().any(|arg| arg == "--latency");
+                let speech = args
+                    .iter()
+                    .skip(2)
+                    .find(|arg| !arg.starts_with("--"))
+                    .map(std::path::PathBuf::from);
+                let failures = agentdictate_app::run_copilot_check(speech.as_deref(), latency)?;
+                anyhow::ensure!(failures == 0, "{failures} copilot check(s) failed");
+                Ok(())
+            }
+            Some(other) => anyhow::bail!("unknown copilot option: {other}"),
+        };
+    }
     if !args.is_empty() {
         let command = match args.as_slice() {
             [command] if command == "quit" => ClientCommand::quit(1),
@@ -65,7 +83,7 @@ fn run() -> anyhow::Result<()> {
                 ClientCommand::start_recording_in_mode(1, mode.parse().map_err(anyhow::Error::msg)?)
             }
             _ => anyhow::bail!(
-                "Usage: agentdictate [start [--mode dictate|literal] | stop | cancel | status | quit | login]"
+                "Usage: agentdictate [start [--mode dictate|literal] | stop | cancel | status | quit | login | copilot]"
             ),
         };
         let (mut client, _) = IpcClient::connect(&paths.runtime)?;

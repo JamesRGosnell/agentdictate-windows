@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use agentdictate_app::{
     AgentProcess, AppPaths, SERVICE_ARGUMENT, START_SERVICE_ARGUMENT, bootstrap_daemon_service,
-    init_file_logging, is_overlay_helper_argument, run_overlay_helper,
+    init_file_logging, is_copilot_argument, is_overlay_helper_argument, run_overlay_helper,
     settings_executable_for_current_process, start_hotkey_listener, start_overlay_presenter,
     start_system_tray,
 };
@@ -21,6 +21,13 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 fn main() -> anyhow::Result<()> {
     let argument = std::env::args().nth(1);
     let paths = AppPaths::from_environment()?;
+    if is_copilot_argument(argument.as_deref()) {
+        let _log_guard = init_file_logging(&paths.logs, "copilot.log")?;
+        #[cfg(windows)]
+        return agentdictate_app::run_copilot();
+        #[cfg(not(windows))]
+        anyhow::bail!("the meeting copilot is available on Windows");
+    }
     let _log_guard = init_file_logging(&paths.logs, "agentdictated.log")?;
     if is_overlay_helper_argument(argument.as_deref()) {
         tracing::info!("transient recording overlay starting");

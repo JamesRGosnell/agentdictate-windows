@@ -345,6 +345,20 @@ fn load_auth_from_app_server(
     codex_binary: &OsString,
     refresh: bool,
 ) -> Result<ChatGptAuth, CodexSubscriptionError> {
+    let result = call_app_server(
+        codex_binary,
+        "getAuthStatus",
+        json!({"includeToken": true, "refreshToken": refresh}),
+    )?;
+    parse_chatgpt_auth(&result)
+}
+
+/// Runs one JSON-RPC request against a short-lived `codex app-server`.
+fn call_app_server(
+    codex_binary: &OsString,
+    method: &str,
+    params: Value,
+) -> Result<Value, CodexSubscriptionError> {
     let mut command = Command::new(codex_binary);
     #[cfg(windows)]
     {
@@ -400,14 +414,8 @@ fn load_auth_from_app_server(
         receive_app_server_response(&receiver, 1)?;
         writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}))
             .map_err(|_| CodexSubscriptionError::AppServerUnavailable)?;
-        send_app_server_request(
-            &mut stdin,
-            2,
-            "getAuthStatus",
-            json!({"includeToken": true, "refreshToken": refresh}),
-        )?;
-        let result = receive_app_server_response(&receiver, 2)?;
-        parse_chatgpt_auth(&result)
+        send_app_server_request(&mut stdin, 2, method, params)?;
+        receive_app_server_response(&receiver, 2)
     })();
 
     drop(stdin);
@@ -500,6 +508,179 @@ fn stop_child(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Long-lived ChatGPT credentials for the meeting copilot. Unlike one-shot
+/// dictation, a meeting issues many requests, so the access token is cached
+/// in memory until it nears expiry or the service rejects it.
+pub(crate) struct ChatGptCredentials {
+    provider: std::sync::Mutex<CodexAppServerAuthProvider>,
+    cached: std::sync::Mutex<Option<CachedChatGptAuth>>,
+}
+
+struct CachedChatGptAuth {
+    token: String,
+    account_id: String,
+    expires_at_unix: Option<u64>,
+}
+
+/// A bearer token and the ChatGPT account it belongs to.
+#[derive(Clone)]
+pub(crate) struct ChatGptBearer {
+    pub token: String,
+    pub account_id: String,
+}
+
+impl ChatGptCredentials {
+    pub(crate) fn discover() -> Self {
+        Self {
+            provider: std::sync::Mutex::new(CodexAppServerAuthProvider::discover()),
+            cached: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Returns cached credentials, loading or refreshing them through Codex.
+    pub(crate) fn bearer(&self, force_refresh: bool) -> Result<ChatGptBearer, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if !force_refresh
+            && let Ok(cached) = self.cached.lock()
+            && let Some(cached) = cached.as_ref()
+            && cached
+                .expires_at_unix
+                .is_none_or(|expires| expires > now + 120)
+        {
+            return Ok(ChatGptBearer {
+                token: cached.token.clone(),
+                account_id: cached.account_id.clone(),
+            });
+        }
+        let auth = self
+            .provider
+            .lock()
+            .map_err(|_| "ChatGPT sign-in state is unavailable".to_owned())?
+            .load(force_refresh)
+            .map_err(|error| error.to_string())?;
+        let expires_at_unix = parse_jwt_claims(auth.access_token.expose())
+            .ok()
+            .and_then(|claims| claims.get("exp").and_then(Value::as_u64));
+        let bearer = ChatGptBearer {
+            token: auth.access_token.expose().to_owned(),
+            account_id: auth.account_id.expose().to_owned(),
+        };
+        if let Ok(mut cached) = self.cached.lock() {
+            *cached = Some(CachedChatGptAuth {
+                token: bearer.token.clone(),
+                account_id: bearer.account_id.clone(),
+                expires_at_unix,
+            });
+        }
+        Ok(bearer)
+    }
+
+    /// Lists models available to the signed-in account as `(id, label)`.
+    pub(crate) fn list_models(&self) -> Result<Vec<(String, String)>, String> {
+        let binary = self
+            .provider
+            .lock()
+            .map_err(|_| "ChatGPT sign-in state is unavailable".to_owned())?
+            .codex_binary
+            .clone();
+        let result =
+            call_app_server(&binary, "model/list", json!({})).map_err(|error| error.to_string())?;
+        Ok(parse_model_list(&result))
+    }
+}
+
+/// Reads `(id, label)` pairs from a Codex `model/list` result.
+pub(crate) fn parse_model_list(result: &Value) -> Vec<(String, String)> {
+    let entries = result
+        .get("data")
+        .or_else(|| result.get("models"))
+        .unwrap_or(result);
+    entries
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let id = ["model", "id", "slug"]
+                        .iter()
+                        .find_map(|key| entry.get(*key).and_then(Value::as_str))?
+                        .to_owned();
+                    let label = ["displayName", "display_name", "name"]
+                        .iter()
+                        .find_map(|key| entry.get(*key).and_then(Value::as_str))
+                        .map_or_else(|| id.clone(), str::to_owned);
+                    Some((id, label))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Transcribes one in-memory WAV utterance through the ChatGPT dictation
+/// endpoint, refreshing credentials once if they were rejected.
+pub(crate) fn transcribe_wav_with_chatgpt(
+    client: &reqwest::blocking::Client,
+    credentials: &ChatGptCredentials,
+    wav: &[u8],
+    language: &str,
+) -> Result<String, String> {
+    let boundary = format!("----codex-transcribe-{}", Uuid::new_v4());
+    let mut refreshed = false;
+    loop {
+        let bearer = credentials.bearer(refreshed)?;
+        let response = client
+            .post(CHATGPT_TRANSCRIPTION_ENDPOINT)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", bearer.token),
+            )
+            .header("ChatGPT-Account-Id", &bearer.account_id)
+            .header("originator", CODEX_DESKTOP_ORIGINATOR)
+            .header(reqwest::header::USER_AGENT, CODEX_DESKTOP_USER_AGENT)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(multipart_body(&boundary, wav, language))
+            .send()
+            .map_err(|error| CodexSubscriptionError::Transport(error).to_string())?;
+        let status = response.status();
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) && !refreshed {
+            refreshed = true;
+            continue;
+        }
+        let payload = response
+            .text()
+            .map_err(|error| CodexSubscriptionError::Transport(error).to_string())?;
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::UNAUTHORIZED => CodexSubscriptionError::Unauthorized,
+                StatusCode::FORBIDDEN => CodexSubscriptionError::NotEntitled,
+                StatusCode::TOO_MANY_REQUESTS => CodexSubscriptionError::RateLimited,
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                    CodexSubscriptionError::RequestRejected
+                }
+                _ => CodexSubscriptionError::ServiceUnavailable,
+            }
+            .to_string());
+        }
+        return Ok(serde_json::from_str::<Value>(&payload)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default()
+            .trim()
+            .to_owned());
+    }
 }
 
 #[cfg(test)]

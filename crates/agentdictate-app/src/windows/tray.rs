@@ -22,6 +22,8 @@ pub enum TrayAction {
     OpenSettings,
     ToggleDictation,
     StartLiteral,
+    OpenCopilot,
+    OpenMeetingNotes,
     Quit,
 }
 
@@ -87,9 +89,17 @@ unsafe extern "system" fn window_proc(
                     (1, "Open AgentDictate"),
                     (2, "Toggle dictation"),
                     (3, "Start literal dictation"),
+                    (0, ""),
+                    (5, "Meeting Copilot"),
+                    (6, "Meeting notes"),
+                    (0, ""),
                     (4, "Quit AgentDictate"),
                 ] {
-                    AppendMenuW(menu, MF_STRING, id, wide(label).as_ptr());
+                    if id == 0 {
+                        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+                    } else {
+                        AppendMenuW(menu, MF_STRING, id, wide(label).as_ptr());
+                    }
                 }
                 let mut point = std::mem::zeroed();
                 GetCursorPos(&mut point);
@@ -110,6 +120,8 @@ unsafe extern "system" fn window_proc(
                     2 => Some(TrayAction::ToggleDictation),
                     3 => Some(TrayAction::StartLiteral),
                     4 => Some(TrayAction::Quit),
+                    5 => Some(TrayAction::OpenCopilot),
+                    6 => Some(TrayAction::OpenMeetingNotes),
                     _ => None,
                 };
             }
@@ -252,6 +264,26 @@ fn execute_tray_action(
                 return Ok(());
             };
             reject_command_error(client.send(command)?.kind)
+        }
+        TrayAction::OpenCopilot => {
+            crate::launch_copilot()?;
+            Ok(())
+        }
+        TrayAction::OpenMeetingNotes => {
+            let notes = runtime_directory.parent().map_or_else(
+                || runtime_directory.join("meetings"),
+                |root| root.join("meetings"),
+            );
+            std::fs::create_dir_all(&notes)?;
+            drop(
+                Command::new("explorer.exe")
+                    .arg(&notes)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+            );
+            Ok(())
         }
         TrayAction::Quit => {
             let (mut client, _) = IpcClient::connect(runtime_directory)?;

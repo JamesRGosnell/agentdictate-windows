@@ -13,6 +13,23 @@ fn desktop_controls_ship_every_icon_they_request() {
         "icons/inbox.svg",
         "icons/minus.svg",
         "icons/plus.svg",
+        // Meeting copilot controls.
+        "icons/activity.svg",
+        "icons/arrow-up.svg",
+        "icons/chevron-up.svg",
+        "icons/copy.svg",
+        "icons/eye-off.svg",
+        "icons/file-text.svg",
+        "icons/globe.svg",
+        "icons/message-question.svg",
+        "icons/mic.svg",
+        "icons/monitor.svg",
+        "icons/pause.svg",
+        "icons/play.svg",
+        "icons/sliders.svg",
+        "icons/sparkles.svg",
+        "icons/square.svg",
+        "icons/x.svg",
     ] {
         let bytes = assets
             .load(path)

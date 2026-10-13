@@ -2,34 +2,42 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
 
-const CHEVRON_DOWN: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/icons/chevron-down.svg"
-));
-const EYE: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/icons/eye.svg"
-));
-const INBOX: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/icons/inbox.svg"
-));
-const MINUS: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/icons/minus.svg"
-));
-const PLUS: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/icons/plus.svg"
-));
+macro_rules! icons {
+    ($($file:literal),+ $(,)?) => {
+        /// Every embedded icon as `(file name, SVG bytes)`.
+        const ICONS: &[(&str, &[u8])] = &[
+            $(($file, include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../assets/icons/",
+                $file
+            )))),+
+        ];
+    };
+}
 
-const ICON_FILES: [&str; 5] = [
+icons!(
+    "activity.svg",
+    "arrow-up.svg",
     "chevron-down.svg",
+    "chevron-up.svg",
+    "copy.svg",
+    "eye-off.svg",
     "eye.svg",
+    "file-text.svg",
+    "globe.svg",
     "inbox.svg",
+    "message-question.svg",
+    "mic.svg",
     "minus.svg",
+    "monitor.svg",
+    "pause.svg",
+    "play.svg",
     "plus.svg",
-];
+    "sliders.svg",
+    "sparkles.svg",
+    "square.svg",
+    "x.svg",
+);
 
 /// Repository-owned desktop assets embedded in every AgentDictate executable.
 ///
@@ -41,15 +49,13 @@ pub struct AgentDictateAssets;
 
 impl AssetSource for AgentDictateAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        let bytes = match path {
-            "icons/chevron-down.svg" => CHEVRON_DOWN,
-            "icons/eye.svg" => EYE,
-            "icons/inbox.svg" => INBOX,
-            "icons/minus.svg" => MINUS,
-            "icons/plus.svg" => PLUS,
-            _ => return Ok(None),
+        let Some(file) = path.strip_prefix("icons/") else {
+            return Ok(None);
         };
-        Ok(Some(Cow::Borrowed(bytes)))
+        Ok(ICONS
+            .iter()
+            .find(|(name, _)| *name == file)
+            .map(|(_, bytes)| Cow::Borrowed(*bytes)))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -57,6 +63,9 @@ impl AssetSource for AgentDictateAssets {
             return Ok(Vec::new());
         }
 
-        Ok(ICON_FILES.into_iter().map(SharedString::from).collect())
+        Ok(ICONS
+            .iter()
+            .map(|(name, _)| SharedString::from(*name))
+            .collect())
     }
 }

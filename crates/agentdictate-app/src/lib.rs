@@ -7,6 +7,7 @@ use std::{io, path::PathBuf};
 mod captured_audio;
 mod chatgpt_dictation_import;
 mod codex_subscription;
+mod copilot;
 mod daemon;
 pub mod diagnostics;
 mod hotkey_dispatch;
@@ -26,6 +27,11 @@ mod workspace;
 pub use codex_subscription::CodexSubscriptionTransport;
 #[cfg(windows)]
 pub use codex_subscription::sign_in_with_chatgpt;
+#[cfg(all(windows, feature = "desktop"))]
+pub use copilot::run_copilot;
+pub use copilot::{COPILOT_ARGUMENT, is_copilot_argument};
+#[cfg(windows)]
+pub use copilot::{copilot_launch_reason, launch_copilot, run_copilot_check};
 pub use daemon::{CapturedRecording, Daemon, DaemonError, RecordingController};
 pub use diagnostics::init_file_logging;
 pub use hotkey_dispatch::{

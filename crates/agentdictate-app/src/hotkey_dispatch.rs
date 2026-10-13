@@ -604,6 +604,19 @@ fn dispatch_hotkey(
     };
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let phase = snapshot.workflow.phase;
+    // In a detected meeting, the dictation shortcut opens the copilot; once
+    // the copilot runs, the shortcut dictates as usual.
+    #[cfg(windows)]
+    if event.signal == HotkeySignal::Pressed
+        && matches!(phase, WorkflowPhase::Ready)
+        && let Some(reason) = crate::AppPaths::from_environment()
+            .ok()
+            .and_then(|paths| crate::copilot_launch_reason(&paths.config_file))
+    {
+        tracing::info!(%reason, "meeting detected; opening the meeting copilot");
+        crate::launch_copilot()?;
+        return Ok(HotkeyActionOutcome::Other);
+    }
     let Some(command) = command_for_hotkey(mode, event.signal, phase, request_id) else {
         tracing::info!(
             request_id,

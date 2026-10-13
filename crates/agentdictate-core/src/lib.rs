@@ -1,5 +1,6 @@
 //! Platform-independent AgentDictate domain types and workflow state.
 
+mod copilot;
 mod costs;
 mod dictation;
 mod protocol;
@@ -9,6 +10,7 @@ mod snapshots;
 mod textfmt;
 mod workflow;
 
+pub use copilot::*;
 pub use costs::*;
 pub use dictation::*;
 pub use protocol::*;

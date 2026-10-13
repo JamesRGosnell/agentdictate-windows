@@ -16,6 +16,7 @@ use crate::{
     WorkspaceViewModel,
 };
 
+mod copilot_view;
 mod history_action_lane;
 mod history_page;
 mod overlay_view;
@@ -34,6 +35,7 @@ use settings_shell::{
     RouteUiState, SettingsCommandState, SettingsEditState, ShellLayoutState, WorkspaceActionState,
 };
 
+pub use copilot_view::{CopilotActionSink, CopilotWindow};
 pub use overlay_view::RecordingOverlay;
 
 const SIDEBAR_WIDTH: f32 = 250.0;
@@ -264,6 +266,97 @@ pub fn run_recording_overlay(
                     .timer(crate::OVERLAY_FADE_HOLD)
                     .await;
                 let _ = overlay_window.update(cx, |_, window, _| window.remove_window());
+                cx.update(|cx| cx.quit())
+            })
+            .detach();
+        });
+}
+
+/// Runs the meeting copilot window until the engine asks it to exit.
+///
+/// `make_host` receives the native window id and scale factor once the
+/// window exists and returns the platform host used for resizing, visibility,
+/// and keyboard activation.
+pub fn run_copilot_window(
+    initial: crate::CopilotViewModel,
+    events: Receiver<agentdictate_core::CopilotEvent>,
+    actions: CopilotActionSink,
+    make_host: impl FnOnce(OverlayWindowId, f32) -> Rc<dyn crate::CopilotWindowHost> + 'static,
+) {
+    Application::new()
+        .with_assets(crate::AgentDictateAssets)
+        .run(move |cx: &mut App| {
+            crate::theme::initialize_gpui_theme(cx);
+            let (sender, mut receiver) = mpsc::unbounded();
+            std::thread::Builder::new()
+                .name("agentdictate-copilot-events".into())
+                .spawn(move || {
+                    while let Ok(event) = events.recv() {
+                        if sender.unbounded_send(event).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .expect("copilot event bridge should start");
+            let height = crate::COPILOT_TOP_MARGIN
+                + crate::COPILOT_BAR_HEIGHT
+                + crate::COPILOT_PANEL_GAP
+                + crate::COPILOT_PANEL_HEIGHT
+                + 14.;
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(crate::COPILOT_WIDTH), px(height)),
+                ))),
+                titlebar: None,
+                focus: false,
+                show: true,
+                kind: WindowKind::PopUp,
+                is_movable: true,
+                is_resizable: false,
+                is_minimizable: false,
+                display_id: None,
+                window_background: WindowBackgroundAppearance::Transparent,
+                app_id: Some(APPLICATION_ID.to_owned()),
+                window_min_size: None,
+                window_decorations: None,
+                tabbing_identifier: None,
+            };
+            let view_slot = Rc::new(RefCell::new(None));
+            let window_view_slot = Rc::clone(&view_slot);
+            let copilot_window = cx
+                .open_window(options, move |window, cx| {
+                    let handle = HasWindowHandle::window_handle(window)
+                        .expect("copilot native window handle should exist");
+                    let id = match handle.as_raw() {
+                        RawWindowHandle::Xcb(handle) => handle.window.get() as OverlayWindowId,
+                        RawWindowHandle::Xlib(handle) => handle.window as OverlayWindowId,
+                        #[cfg(windows)]
+                        RawWindowHandle::Win32(handle) => handle.hwnd.get() as usize,
+                        _ => panic!("unsupported copilot window backend"),
+                    };
+                    #[cfg(windows)]
+                    window.set_window_title("AgentDictate Copilot");
+                    let host = make_host(id, window.scale_factor());
+                    let view = cx.new(|cx| CopilotWindow::new(initial, actions, host, window, cx));
+                    *window_view_slot.borrow_mut() = Some(view.clone());
+                    cx.new(|cx| Root::new(view, window, cx))
+                })
+                .expect("copilot window should open");
+            let view = view_slot
+                .borrow_mut()
+                .take()
+                .expect("copilot view should exist after its window opens");
+            cx.spawn(async move |cx| {
+                while let Some(event) = receiver.next().await {
+                    let exit = matches!(event, agentdictate_core::CopilotEvent::Exit);
+                    let _ = copilot_window.update(cx, |_, window, cx| {
+                        view.update(cx, |view, cx| view.apply(event, window, cx));
+                    });
+                    if exit {
+                        break;
+                    }
+                }
                 cx.update(|cx| cx.quit())
             })
             .detach();

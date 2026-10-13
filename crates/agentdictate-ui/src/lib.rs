@@ -4,6 +4,7 @@
 mod action;
 #[cfg(feature = "desktop")]
 mod assets;
+mod copilot;
 #[cfg(feature = "desktop")]
 mod desktop;
 mod history;
@@ -25,10 +26,15 @@ mod workspace;
 #[cfg(feature = "desktop")]
 #[doc(hidden)]
 pub use assets::AgentDictateAssets;
+pub use copilot::{
+    AnswerCardModel, COPILOT_BAR_HEIGHT, COPILOT_PANEL_GAP, COPILOT_PANEL_HEIGHT,
+    COPILOT_TOP_MARGIN, COPILOT_WIDTH, CopilotEffect, CopilotViewModel, CopilotWindowHost,
+    LEVEL_HISTORY, source_host,
+};
 #[cfg(feature = "desktop")]
 pub use desktop::{
-    APPLICATION_ID, RecordingOverlay, SettingsShell, run_recording_overlay,
-    run_settings_shell_with_workspace_actions,
+    APPLICATION_ID, CopilotActionSink, CopilotWindow, RecordingOverlay, SettingsShell,
+    run_copilot_window, run_recording_overlay, run_settings_shell_with_workspace_actions,
     run_settings_shell_with_workspace_actions_and_updates,
 };
 pub use history::{
