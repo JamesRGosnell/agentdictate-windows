@@ -1010,7 +1010,8 @@ impl Engine {
                 (self.ui)(CopilotEvent::NotesSaved(
                     path.to_string_lossy().into_owned(),
                 ));
-                std::thread::sleep(Duration::from_millis(1_800));
+                // Leave time to open the notes folder before the window closes.
+                std::thread::sleep(Duration::from_secs(6));
             }
             Err(error) => tracing::error!(%error, "could not save meeting notes"),
         }

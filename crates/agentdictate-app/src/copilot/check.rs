@@ -253,6 +253,21 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
             max_output_tokens: 800,
             cache_key: uuid::Uuid::new_v4().to_string(),
         };
+        let notes_request = AnswerRequest {
+            system: agentdictate_core::notes_system_prompt().to_owned(),
+            user: format!("<transcript>\n{transcript_text}\n</transcript>"),
+            image_jpeg: None,
+            model: fast.answer_model(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 2048,
+            cache_key: uuid::Uuid::new_v4().to_string(),
+        };
+        if let Some(text) = answer(&fast, &notes_request, "Meeting notes summary", &mut report)
+            && let Some(first) = text.lines().find(|line| !line.trim().is_empty())
+        {
+            report.info(first);
+        }
         if let Some(text) = answer(
             &fast,
             &insights_request,
