@@ -1,5 +1,7 @@
 #[path = "desktop/assets_contract.rs"]
 mod assets_contract;
+#[path = "desktop/copilot_rendered.rs"]
+mod copilot_rendered;
 #[path = "desktop/desktop_contract.rs"]
 mod desktop_contract;
 #[path = "desktop/focus_dismissal_contract.rs"]

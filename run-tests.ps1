@@ -19,6 +19,12 @@ try {
     if ($LASTEXITCODE) { throw 'Native Settings verification binary failed to build.' }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-settings.ps1
     if ($LASTEXITCODE) { throw 'Isolated native Settings check failed.' }
+    & cargo build --locked -p agentdictate-ui --features desktop --example verify_copilot
+    if ($LASTEXITCODE) { throw 'Copilot verification binary failed to build.' }
+    foreach ($taskCopilotState in @('live','streaming','transcript','settings','collapsed','empty')) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-copilot.ps1 -State $taskCopilotState
+        if ($LASTEXITCODE) { throw "Isolated native copilot check failed: $taskCopilotState" }
+    }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/test-windows.ps1
     if ($LASTEXITCODE) { throw 'Windows packaging checks failed.' }
     if (Get-Command cargo-deny -ErrorAction SilentlyContinue) {

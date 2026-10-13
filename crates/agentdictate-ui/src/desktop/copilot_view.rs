@@ -109,6 +109,7 @@ fn chip(id: impl Into<gpui::ElementId>, selected: bool) -> Stateful<Div> {
 
 fn bar_button(id: &'static str) -> Stateful<Div> {
     div()
+        .debug_selector(move || id.to_owned())
         .id(id)
         .h(px(34.))
         .px(px(10.))
@@ -124,6 +125,7 @@ fn bar_button(id: &'static str) -> Stateful<Div> {
 
 fn icon_button(id: &'static str, name: &'static str, tint: u32) -> Stateful<Div> {
     div()
+        .debug_selector(move || id.to_owned())
         .id(id)
         .size(px(32.))
         .flex()
@@ -787,6 +789,7 @@ impl CopilotWindow {
         );
         let tab_button = |id: &'static str, label: &'static str, active: bool| {
             div()
+                .debug_selector(move || id.to_owned())
                 .id(id)
                 .h(px(28.))
                 .px(px(12.))
@@ -909,6 +912,7 @@ impl CopilotWindow {
         {
             content = content.child(
                 h_flex()
+                    .debug_selector(|| "copilot-detected-question".to_owned())
                     .id("copilot-detected-question")
                     .w_full()
                     .gap(px(10.))
@@ -1493,6 +1497,7 @@ impl CopilotWindow {
                     .gap(px(6.))
                     .children(actions.into_iter().map(|action| {
                         chip(("copilot-quick", action as usize), false)
+                            .debug_selector(move || format!("copilot-quick-{}", action as usize))
                             .child(action.label())
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
                                 this.act(CopilotAction::Quick(action));
@@ -1501,6 +1506,7 @@ impl CopilotWindow {
             )
             .child(
                 h_flex()
+                    .debug_selector(|| "copilot-ask".to_owned())
                     .id("copilot-ask")
                     .w_full()
                     .h(px(42.))
@@ -1528,6 +1534,7 @@ impl CopilotWindow {
                     .when(!typing, |row| row.child(keycaps(&self.model.shortcuts.ask)))
                     .child(
                         div()
+                            .debug_selector(|| "copilot-send".to_owned())
                             .id("copilot-send")
                             .size(px(30.))
                             .flex()
@@ -1609,6 +1616,7 @@ impl CopilotWindow {
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let settings = self.model.settings.clone();
         let current_model = settings.answer_model();
+        let current_fast_model = settings.fast_model();
         let models = self.model.models.clone();
         let toggle = |id: &'static str,
                       label: &'static str,
@@ -1617,6 +1625,7 @@ impl CopilotWindow {
                       cx: &mut Context<Self>,
                       change: fn(&mut CopilotSettings)| {
             h_flex()
+                .debug_selector(move || id.to_owned())
                 .id(id)
                 .w_full()
                 .gap(px(12.))
@@ -1663,6 +1672,7 @@ impl CopilotWindow {
         };
         let text_area = |id: &'static str, input: &Entity<InputState>, cx: &mut Context<Self>| {
             div()
+                .debug_selector(move || id.to_owned())
                 .id(id)
                 .w_full()
                 .px(px(10.))
@@ -1691,6 +1701,7 @@ impl CopilotWindow {
                     .child(h_flex().flex_wrap().gap(px(6.)).children(
                         CopilotProvider::ALL.into_iter().map(|provider| {
                             chip(("copilot-provider", provider as usize), provider == settings.provider)
+                                .debug_selector(move || format!("copilot-provider-{}", provider as usize))
                                 .child(provider.label())
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.update_settings(|settings| settings.provider = provider);
@@ -1725,15 +1736,32 @@ impl CopilotWindow {
             .child(
                 v_flex()
                     .gap(px(8.))
-                    .child(section_label("Model"))
+                    .child(section_label("Researched answers"))
                     .child(h_flex().flex_wrap().gap(px(6.)).children(
-                        models.into_iter().enumerate().map(|(index, model)| {
+                        models.iter().cloned().enumerate().map(|(index, model)| {
                             let id = model.id.clone();
                             chip(("copilot-model", index), model.id == current_model)
                                 .child(model.label)
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     let id = id.clone();
                                     this.update_settings(|settings| settings.set_answer_model(id));
+                                    cx.notify();
+                                }))
+                        }),
+                    )),
+            )
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(section_label("Instant answers and insights"))
+                    .child(h_flex().flex_wrap().gap(px(6.)).children(
+                        models.into_iter().enumerate().map(|(index, model)| {
+                            let id = model.id.clone();
+                            chip(("copilot-fast-model", index), model.id == current_fast_model)
+                                .child(model.label)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    let id = id.clone();
+                                    this.update_settings(|settings| settings.set_fast_model(id));
                                     cx.notify();
                                 }))
                         }),
@@ -1879,6 +1907,7 @@ impl CopilotWindow {
                     .gap(px(8.))
                     .child(
                         chip("copilot-save-settings", true)
+                            .debug_selector(|| "copilot-save-settings".to_owned())
                             .child("Save")
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.save_text_settings(cx);
@@ -1896,6 +1925,7 @@ impl CopilotWindow {
                     ),
             );
         div()
+            .debug_selector(|| "copilot-settings-body".to_owned())
             .id("copilot-settings-body")
             .size_full()
             .overflow_y_scroll()

@@ -372,6 +372,10 @@ impl CopilotSettings {
         self.answer_models.insert(self.provider, model.into());
     }
 
+    pub fn set_fast_model(&mut self, model: impl Into<String>) {
+        self.fast_models.insert(self.provider, model.into());
+    }
+
     /// A copy safe to log or render: API keys are reduced to presence.
     #[must_use]
     pub fn redacted(&self) -> Self {

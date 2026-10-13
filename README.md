@@ -25,6 +25,15 @@ ChatGPT sign-in, and build instructions](docs/WINDOWS.md) and the
 [verification record](docs/windows-parity.md). Build a portable ZIP and per-user
 installer with `packaging/build-windows.ps1`.
 
+### Meeting Copilot
+
+In a call, press the dictation shortcut to open the
+[meeting copilot](docs/COPILOT.md): a top-of-screen assistant, invisible to
+screen sharing, that transcribes both sides of the conversation, answers
+questions as they are asked with an instant draft and a web-researched answer,
+shows live insights, and saves meeting notes. It works with the ChatGPT
+sign-in, an Anthropic or OpenAI API key, or Claude Code.
+
 ## Install on Linux (upstream)
 
 The original Linux installation instructions are retained below and clone the

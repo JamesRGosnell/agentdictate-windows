@@ -1150,15 +1150,15 @@ mod tests {
         }
     }
 
-    fn harness(
-        settings: CopilotSettings,
-    ) -> (
+    type Harness = (
         Engine,
         Receiver<EngineMsg>,
         Arc<Mutex<Vec<CopilotEvent>>>,
         Arc<Mutex<Vec<AnswerRequest>>>,
         tempfile::TempDir,
-    ) {
+    );
+
+    fn harness(settings: CopilotSettings) -> Harness {
         let directory = tempfile::tempdir().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));

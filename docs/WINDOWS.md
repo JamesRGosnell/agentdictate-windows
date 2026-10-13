@@ -66,6 +66,14 @@ The microphone uses Windows' default input device. Audio ducking temporarily
 reduces other playback sessions and restores their prior volume, respecting
 volume changes the user makes during dictation.
 
+## Meeting Copilot
+
+In a detected call, the dictation shortcut opens the meeting copilot; the tray
+and `agentdictate copilot` open it anywhere. It listens to the microphone and
+system audio, answers questions live, and is hidden from screen sharing. See
+[Meeting Copilot](COPILOT.md) for shortcuts, answer engines, privacy, and
+troubleshooting (`agentdictate copilot --check`).
+
 ## Files and removal
 
 Application files live in `%LOCALAPPDATA%\Programs\AgentDictate`.
@@ -121,5 +129,14 @@ cargo run --locked -p agentdictate-app --example verify_windows -- subscription 
 
 The microphone probe deletes its audio without uploading. The subscription
 probe uploads only the specified file using the ChatGPT route.
+
+The copilot has its own probes. `scripts/test-windows-copilot.ps1 -State live`
+renders the copilot UI with fixture data on an isolated desktop and saves a
+capture under `target`; the gate runs it for every UI state.
+`-State process` launches the real copilot with isolated data and verifies its
+window is a top-center, topmost, non-activating tool window excluded from
+screen capture (add `-Visible` to capture its pixels). The process probe opens
+the real microphone and system audio briefly and does not upload audio unless
+someone speaks.
 See [Windows parity verification](windows-parity.md) for completed and pending
 acceptance checks.
