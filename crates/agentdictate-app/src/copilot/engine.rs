@@ -556,6 +556,17 @@ impl Engine {
                 {
                     span.text = Some(line.text.clone());
                 }
+                // The same call can reach two playback devices (for example a
+                // virtual device chained to speakers); keep one copy.
+                let duplicate = self.transcript.iter().rev().take(8).any(|existing| {
+                    existing.speaker == Speaker::Them
+                        && existing.at_ms.abs_diff(line.at_ms) < 4_000
+                        && utterance_similarity(&existing.text, &line.text) >= 0.8
+                });
+                if duplicate {
+                    tracing::info!("dropped duplicate system-audio line");
+                    return;
+                }
                 let question = looks_like_question(&line.text).then(|| line.text.clone());
                 self.publish(line);
                 self.resolve_pending_mine(false);
@@ -1397,6 +1408,33 @@ mod tests {
             |event| matches!(event, CopilotEvent::Transcript(line) if line.speaker == Speaker::Me),
         );
         assert!(!mine, "echo of the other side must not appear as the user");
+    }
+
+    #[test]
+    fn the_same_call_heard_on_two_devices_appears_once() {
+        let (mut engine, _incoming, events, _requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("Let's review the launch checklist together.".into()),
+        );
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_200,
+            3_100,
+            Ok("Let's review the launch checklist together".into()),
+        );
+        let lines = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, CopilotEvent::Transcript(_)))
+            .count();
+        assert_eq!(lines, 1);
     }
 
     #[test]

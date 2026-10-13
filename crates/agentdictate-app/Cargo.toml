@@ -69,7 +69,7 @@ version = "8"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.61"
-features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Foundation"]
+features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Foundation", "Win32_Devices_FunctionDiscovery", "Win32_UI_Shell_PropertiesSystem"]
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"

@@ -307,6 +307,7 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
         ),
         Err(error) => report.fail("Screen capture", error),
     }
+    report.pass("Audio devices", win::audio::describe_devices());
     let messages = Arc::new(Mutex::new(Vec::new()));
     let sink_messages = Arc::clone(&messages);
     match platform.start_audio(
@@ -364,9 +365,13 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
             report.pass(
                 "Audio capture",
                 format!(
-                    "microphone meter updates {}, system audio meter updates {}",
+                    "microphone meter updates {}, system audio {}",
                     levels(Speaker::Me),
-                    levels(Speaker::Them)
+                    match levels(Speaker::Them) {
+                        // WASAPI loopback delivers no packets during silence.
+                        0 => "connected (nothing is playing)".to_owned(),
+                        updates => format!("meter updates {updates}"),
+                    }
                 ),
             );
             for problem in problems {

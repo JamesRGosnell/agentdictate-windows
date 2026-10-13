@@ -1,5 +1,5 @@
-//! WASAPI capture for the copilot: the default microphone ("Me") and a
-//! loopback of the default playback device ("Them").
+//! WASAPI capture for the copilot: the default microphone ("Me") and
+//! loopbacks of the playback devices where calls are heard ("Them").
 
 use std::{
     sync::{
@@ -22,6 +22,34 @@ use crate::copilot::{
 struct Chunk {
     samples: Vec<f32>,
     rate: u32,
+}
+
+/// Where a capture stream listens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceKind {
+    Microphone,
+    /// The default playback device.
+    Playback,
+    /// The default communications playback device, which call apps such as
+    /// Teams use. Captured only while it differs from the default device.
+    CallPlayback,
+}
+
+impl SourceKind {
+    const fn speaker(self) -> Speaker {
+        match self {
+            Self::Microphone => Speaker::Me,
+            Self::Playback | Self::CallPlayback => Speaker::Them,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Microphone => "microphone",
+            Self::Playback => "playback",
+            Self::CallPlayback => "call playback",
+        }
+    }
 }
 
 pub(crate) struct WasapiCapture {
@@ -87,7 +115,7 @@ impl Drop for WasapiCapture {
 }
 
 struct Source {
-    speaker: Speaker,
+    kind: SourceKind,
     stream: Option<cpal::Stream>,
     device_name: String,
     failed: Arc<AtomicBool>,
@@ -95,28 +123,87 @@ struct Source {
     last_attempt: Instant,
 }
 
-fn device_for(speaker: Speaker) -> Result<cpal::Device, String> {
+/// Friendly name of the default communications playback device.
+fn communications_output_name() -> Option<String> {
+    use windows::Win32::{
+        Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
+        Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eCommunications, eRender},
+        System::Com::{
+            CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STGM_READ,
+        },
+    };
+    unsafe {
+        // Already-initialized apartments report a benign status.
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eCommunications)
+            .ok()?;
+        let store = device.OpenPropertyStore(STGM_READ).ok()?;
+        let name = store.GetValue(&PKEY_Device_FriendlyName).ok()?.to_string();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+/// The call device, when it is not already the default playback device.
+fn separate_call_device() -> Option<String> {
+    let call = communications_output_name()?;
+    let default = cpal::default_host()
+        .default_output_device()
+        .and_then(|device| device.name().ok());
+    (default.as_deref() != Some(call.as_str())).then_some(call)
+}
+
+/// The devices a session would capture, for diagnostics.
+pub(crate) fn describe_devices() -> String {
+    let name = |kind| {
+        device_for(kind)
+            .ok()
+            .and_then(|device| device.name().ok())
+            .unwrap_or_else(|| "unavailable".to_owned())
+    };
+    format!(
+        "microphone \u{201c}{}\u{201d}, playback \u{201c}{}\u{201d}, calls {}",
+        name(SourceKind::Microphone),
+        name(SourceKind::Playback),
+        separate_call_device().map_or_else(
+            || "use the playback device".to_owned(),
+            |call| format!("\u{201c}{call}\u{201d} (also captured)")
+        )
+    )
+}
+
+fn device_for(kind: SourceKind) -> Result<cpal::Device, String> {
     let host = cpal::default_host();
-    match speaker {
-        Speaker::Me => host
+    match kind {
+        SourceKind::Microphone => host
             .default_input_device()
             .ok_or_else(|| "No microphone is available.".to_owned()),
-        Speaker::Them => host
+        SourceKind::Playback => host
             .default_output_device()
             .ok_or_else(|| "No playback device is available for system audio.".to_owned()),
+        SourceKind::CallPlayback => {
+            let name = separate_call_device()
+                .ok_or_else(|| "Calls play through the default device.".to_owned())?;
+            host.output_devices()
+                .map_err(|error| error.to_string())?
+                .find(|device| device.name().ok().as_deref() == Some(name.as_str()))
+                .ok_or_else(|| format!("The call device \u{201c}{name}\u{201d} is unavailable."))
+        }
     }
 }
 
 fn build_stream(
-    speaker: Speaker,
+    kind: SourceKind,
     chunks: SyncSender<Chunk>,
     failed: Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, String), String> {
-    let device = device_for(speaker)?;
+    let device = device_for(kind)?;
     let name = device.name().unwrap_or_default();
-    let supported = match speaker {
-        Speaker::Me => device.default_input_config(),
-        Speaker::Them => device.default_output_config(),
+    let supported = match kind {
+        SourceKind::Microphone => device.default_input_config(),
+        SourceKind::Playback | SourceKind::CallPlayback => device.default_output_config(),
     }
     .map_err(|error| error.to_string())?;
     let format = supported.sample_format();
@@ -181,38 +268,48 @@ fn run_controller(
     let mut sources = Vec::new();
     let mut processors = Vec::new();
     let mut errors = Vec::new();
-    for (enabled, speaker) in [(microphone, Speaker::Me), (system_audio, Speaker::Them)] {
+    for (enabled, kind) in [
+        (microphone, SourceKind::Microphone),
+        (system_audio, SourceKind::Playback),
+        (system_audio, SourceKind::CallPlayback),
+    ] {
         if !enabled {
             continue;
         }
         let (chunks, incoming) = mpsc::sync_channel::<Chunk>(256);
         let failed = Arc::new(AtomicBool::new(false));
-        let (stream, device_name) = match build_stream(speaker, chunks.clone(), Arc::clone(&failed))
-        {
-            Ok((stream, name)) => {
-                tracing::info!(?speaker, device = %name, "copilot audio source started");
-                (Some(stream), name)
+        let wanted = kind != SourceKind::CallPlayback || separate_call_device().is_some();
+        let (stream, device_name) = if wanted {
+            match build_stream(kind, chunks.clone(), Arc::clone(&failed)) {
+                Ok((stream, name)) => {
+                    tracing::info!(source = kind.label(), device = %name, "copilot audio source started");
+                    (Some(stream), name)
+                }
+                Err(error) => {
+                    tracing::warn!(source = kind.label(), %error, "copilot audio source unavailable");
+                    if kind != SourceKind::CallPlayback {
+                        errors.push(format!("{}: {error}", kind.speaker().display()));
+                    }
+                    (None, String::new())
+                }
             }
-            Err(error) => {
-                tracing::warn!(?speaker, %error, "copilot audio source unavailable");
-                errors.push(format!("{}: {error}", speaker.display()));
-                (None, String::new())
-            }
+        } else {
+            (None, String::new())
         };
         let processor = {
             let sink = Arc::clone(&sink);
             let stop = Arc::clone(&stop);
             let paused = Arc::clone(&paused);
             std::thread::Builder::new()
-                .name(format!("copilot-audio-{}", speaker.label().to_lowercase()))
-                .spawn(move || process(speaker, incoming, sink, stop, paused))
+                .name(format!("copilot-audio-{}", kind.label().replace(' ', "-")))
+                .spawn(move || process(kind.speaker(), incoming, sink, stop, paused))
         };
         match processor {
             Ok(handle) => processors.push(handle),
             Err(error) => errors.push(error.to_string()),
         }
         sources.push(Source {
-            speaker,
+            kind,
             stream,
             device_name,
             failed,
@@ -240,38 +337,33 @@ fn run_controller(
     let mut last_device_check = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
-        let check_devices = last_device_check.elapsed() >= Duration::from_secs(3);
-        if check_devices {
-            last_device_check = Instant::now();
-        }
-        for source in &mut sources {
-            let default_changed = check_devices
-                && device_for(source.speaker)
-                    .ok()
-                    .and_then(|device| device.name().ok())
-                    .is_some_and(|name| !name.is_empty() && name != source.device_name);
-            let broken = source.failed.load(Ordering::Relaxed) || source.stream.is_none();
-            if !(default_changed || broken)
-                || source.last_attempt.elapsed() < Duration::from_secs(2)
-            {
-                continue;
+        if last_device_check.elapsed() < Duration::from_secs(3) {
+            // Between device checks, only rebuild streams that failed.
+            for source in &mut sources {
+                if source.failed.load(Ordering::Relaxed) {
+                    restart(source);
+                }
             }
-            source.last_attempt = Instant::now();
-            source.stream = None;
-            source.failed.store(false, Ordering::Relaxed);
-            match build_stream(
-                source.speaker,
-                source.chunks.clone(),
-                Arc::clone(&source.failed),
-            ) {
-                Ok((stream, name)) => {
-                    tracing::info!(speaker = ?source.speaker, device = %name, "copilot audio source restarted");
-                    source.stream = Some(stream);
-                    source.device_name = name;
+            continue;
+        }
+        last_device_check = Instant::now();
+        let call_device = separate_call_device();
+        for source in &mut sources {
+            let current = match source.kind {
+                SourceKind::CallPlayback => call_device.clone(),
+                kind => device_for(kind).ok().and_then(|device| device.name().ok()),
+            };
+            match (current, source.stream.is_some()) {
+                // The call device now matches the default; one loopback is enough.
+                (None, true) if source.kind == SourceKind::CallPlayback => {
+                    tracing::info!("call audio now plays through the default device");
+                    source.stream = None;
+                    source.device_name.clear();
                 }
-                Err(error) => {
-                    tracing::debug!(speaker = ?source.speaker, %error, "copilot audio source still unavailable");
-                }
+                (Some(name), true) if name != source.device_name => restart(source),
+                (Some(_), false) => restart(source),
+                _ if source.failed.load(Ordering::Relaxed) => restart(source),
+                _ => {}
             }
         }
     }
@@ -283,6 +375,29 @@ fn run_controller(
     drop(sources);
     for processor in processors {
         let _ = processor.join();
+    }
+}
+
+fn restart(source: &mut Source) {
+    if source.last_attempt.elapsed() < Duration::from_secs(2) {
+        return;
+    }
+    source.last_attempt = Instant::now();
+    source.stream = None;
+    source.failed.store(false, Ordering::Relaxed);
+    match build_stream(
+        source.kind,
+        source.chunks.clone(),
+        Arc::clone(&source.failed),
+    ) {
+        Ok((stream, name)) => {
+            tracing::info!(source = source.kind.label(), device = %name, "copilot audio source started");
+            source.stream = Some(stream);
+            source.device_name = name;
+        }
+        Err(error) => {
+            tracing::debug!(source = source.kind.label(), %error, "copilot audio source still unavailable");
+        }
     }
 }
 
@@ -324,6 +439,7 @@ fn process(
             }
         }
     };
+    let mut received_audio = false;
     loop {
         let message = incoming.recv_timeout(Duration::from_millis(120));
         if stop.load(Ordering::Relaxed) {
@@ -349,6 +465,7 @@ fn process(
         match message {
             Ok(chunk) => {
                 last_data = Instant::now();
+                received_audio = true;
                 if is_paused {
                     continue;
                 }
@@ -368,7 +485,7 @@ fn process(
                 // Loopback goes quiet when nothing plays; treat the gap as
                 // silence so an utterance in progress still closes.
                 let gap = last_data.elapsed();
-                if !is_paused && gap >= Duration::from_millis(100) {
+                if !is_paused && received_audio && gap >= Duration::from_millis(100) {
                     let samples =
                         (gap.as_millis() as usize).min(1_000) * SAMPLE_RATE as usize / 1000;
                     emit(segmenter.push_silence(samples));
@@ -377,7 +494,9 @@ fn process(
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        if last_level.elapsed() >= Duration::from_millis(60) {
+        // An idle call-device processor stays silent so it never hides the
+        // default device's meter.
+        if received_audio && last_level.elapsed() >= Duration::from_millis(60) {
             last_level = Instant::now();
             sink(AudioMsg::Level {
                 speaker,
