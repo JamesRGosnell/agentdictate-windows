@@ -35,9 +35,10 @@ use thiserror::Error;
 
 use crate::daemon::OVERVIEW_RECENT_HISTORY_LIMIT;
 use agentdictate_ui::{
-    HistoryViewModel, ModelCatalogViewModel, RecoveryItemViewModel, RecoveryStage,
-    ReplacementRuleViewModel, ReplacementsViewModel, TranscriptViewModel, UsageDayViewModel,
-    UsagePeriod, UsageTotals, UsageViewModel, WorkspaceAction, WorkspaceViewModel,
+    HistoryViewModel, MeetingsViewModel, ModelCatalogViewModel, RecoveryItemViewModel,
+    RecoveryStage, ReplacementRuleViewModel, ReplacementsViewModel, TranscriptViewModel,
+    UsageDayViewModel, UsagePeriod, UsageTotals, UsageViewModel, WorkspaceAction,
+    WorkspaceViewModel,
 };
 
 #[derive(Debug, Error)]
@@ -54,6 +55,10 @@ pub enum WorkspaceError {
     Ipc(#[from] agentdictate_runtime::IpcError),
     #[error("{message}")]
     CommandRejected { message: String },
+    #[error("that meeting's notes are no longer in the meetings folder")]
+    MeetingNotFound,
+    #[error("could not open the meeting notes: {0}")]
+    MeetingsUnavailable(std::io::Error),
     #[error(transparent)]
     DeliveryFocus(#[from] agentdictate_runtime::ExternalError),
     #[error("daemon returned unrelated data for a history request")]
@@ -66,6 +71,7 @@ pub enum WorkspaceError {
 
 pub struct WorkspaceClient {
     runtime_directory: PathBuf,
+    meetings_dir: Option<PathBuf>,
     next_request_id: AtomicU64,
     request_gate: Mutex<()>,
     state: Mutex<WorkspaceClientState>,
@@ -76,6 +82,7 @@ struct WorkspaceClientState {
     period: UsagePeriod,
     history_next_cursor: Option<HistoryPageCursor>,
     history_customized: bool,
+    meetings: MeetingsViewModel,
 }
 
 impl WorkspaceClient {
@@ -83,6 +90,7 @@ impl WorkspaceClient {
     pub fn new(runtime_directory: PathBuf, snapshot: WorkspaceSnapshot) -> Self {
         Self {
             runtime_directory,
+            meetings_dir: None,
             next_request_id: AtomicU64::new(10_000),
             request_gate: Mutex::new(()),
             state: Mutex::new(WorkspaceClientState {
@@ -90,8 +98,85 @@ impl WorkspaceClient {
                 snapshot,
                 period: UsagePeriod::Last30Days,
                 history_customized: false,
+                meetings: MeetingsViewModel::default(),
             }),
         }
+    }
+
+    /// Lists the meeting copilot's saved notes from `folder` in the Meetings page.
+    #[must_use]
+    pub fn with_meetings_dir(mut self, folder: PathBuf) -> Self {
+        if let Ok(state) = self.state.get_mut() {
+            state.meetings.notes = crate::meetings::scan(&folder);
+        }
+        self.meetings_dir = Some(folder);
+        self
+    }
+
+    /// The presentation of the cached state. Every response goes through it,
+    /// so the meetings list survives daemon refreshes.
+    fn project(state: &WorkspaceClientState) -> WorkspaceViewModel {
+        workspace_view_model(&state.snapshot, state.period).with_meetings(state.meetings.clone())
+    }
+
+    fn rescan_meetings(&self) -> Result<(), WorkspaceError> {
+        let Some(folder) = &self.meetings_dir else {
+            return Ok(());
+        };
+        let notes = crate::meetings::scan(folder);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| WorkspaceError::StateUnavailable)?;
+        state.meetings.notes = notes;
+        Ok(())
+    }
+
+    /// Meetings actions read the notes folder directly; the daemon is not
+    /// involved.
+    fn perform_meetings(
+        &self,
+        action: WorkspaceAction,
+    ) -> Result<WorkspaceViewModel, WorkspaceError> {
+        let folder = self.meetings_dir.clone();
+        match action {
+            WorkspaceAction::RefreshMeetings | WorkspaceAction::CloseMeeting => {
+                self.rescan_meetings()?;
+                if matches!(action, WorkspaceAction::CloseMeeting) {
+                    self.lock_state()?.meetings.selected = None;
+                }
+            }
+            WorkspaceAction::OpenMeeting { id } => {
+                let detail = folder
+                    .as_deref()
+                    .and_then(|folder| crate::meetings::open(folder, &id))
+                    .ok_or(WorkspaceError::MeetingNotFound)?;
+                self.lock_state()?.meetings.selected = Some(detail);
+            }
+            WorkspaceAction::OpenMeetingsFolder => {
+                let folder = folder.ok_or(WorkspaceError::MeetingNotFound)?;
+                std::fs::create_dir_all(&folder).map_err(WorkspaceError::MeetingsUnavailable)?;
+                crate::meetings::reveal(&folder).map_err(WorkspaceError::MeetingsUnavailable)?;
+            }
+            WorkspaceAction::OpenMeetingFile { id } => {
+                let file = folder
+                    .as_deref()
+                    .and_then(|folder| crate::meetings::note_path(folder, &id))
+                    .filter(|file| file.is_file())
+                    .ok_or(WorkspaceError::MeetingNotFound)?;
+                crate::meetings::reveal(&file).map_err(WorkspaceError::MeetingsUnavailable)?;
+            }
+            _ => unreachable!("only meetings actions are routed here"),
+        }
+        Ok(Self::project(&*self.lock_state()?))
+    }
+
+    fn lock_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, WorkspaceClientState>, WorkspaceError> {
+        self.state
+            .lock()
+            .map_err(|_| WorkspaceError::StateUnavailable)
     }
 
     pub fn view_model(&self) -> Result<WorkspaceViewModel, WorkspaceError> {
@@ -99,10 +184,20 @@ impl WorkspaceClient {
             .state
             .lock()
             .map_err(|_| WorkspaceError::StateUnavailable)?;
-        Ok(workspace_view_model(&state.snapshot, state.period))
+        Ok(Self::project(&state))
     }
 
     pub fn perform(&self, action: WorkspaceAction) -> Result<WorkspaceViewModel, WorkspaceError> {
+        if matches!(
+            action,
+            WorkspaceAction::RefreshMeetings
+                | WorkspaceAction::OpenMeeting { .. }
+                | WorkspaceAction::CloseMeeting
+                | WorkspaceAction::OpenMeetingsFolder
+                | WorkspaceAction::OpenMeetingFile { .. }
+        ) {
+            return self.perform_meetings(action);
+        }
         if let WorkspaceAction::SearchHistory { query } = action {
             {
                 let mut state = self
@@ -134,7 +229,7 @@ impl WorkspaceClient {
                 .state
                 .lock()
                 .map_err(|_| WorkspaceError::StateUnavailable)?;
-            return Ok(workspace_view_model(&state.snapshot, state.period));
+            return Ok(Self::project(&state));
         }
         if let WorkspaceAction::SelectUsagePeriod(period) = action {
             let mut state = self
@@ -142,7 +237,7 @@ impl WorkspaceClient {
                 .lock()
                 .map_err(|_| WorkspaceError::StateUnavailable)?;
             state.period = period;
-            return Ok(workspace_view_model(&state.snapshot, state.period));
+            return Ok(Self::project(&state));
         }
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -218,7 +313,13 @@ impl WorkspaceClient {
             WorkspaceAction::DeleteReplacement { id } => {
                 ClientCommand::delete_replacement(request_id, id)
             }
-            WorkspaceAction::SelectUsagePeriod(_) | WorkspaceAction::OpenCopilot => {
+            WorkspaceAction::SelectUsagePeriod(_)
+            | WorkspaceAction::OpenCopilot
+            | WorkspaceAction::RefreshMeetings
+            | WorkspaceAction::OpenMeeting { .. }
+            | WorkspaceAction::CloseMeeting
+            | WorkspaceAction::OpenMeetingsFolder
+            | WorkspaceAction::OpenMeetingFile { .. } => {
                 unreachable!("handled above")
             }
         };
@@ -230,6 +331,7 @@ impl WorkspaceClient {
     /// Requests from actions and filesystem refreshes are serialized so an
     /// older response cannot overwrite a newer local snapshot.
     pub fn refresh(&self) -> Result<WorkspaceViewModel, WorkspaceError> {
+        self.rescan_meetings()?;
         let needs_history_refresh = {
             let state = self
                 .state
@@ -294,7 +396,7 @@ impl WorkspaceClient {
             .lock()
             .map_err(|_| WorkspaceError::StateUnavailable)?;
         if state.snapshot.history_search != page.search {
-            return Ok(workspace_view_model(&state.snapshot, state.period));
+            return Ok(Self::project(&state));
         }
         if append && !page.cursor_restarted {
             for row in page.rows {
@@ -315,7 +417,7 @@ impl WorkspaceClient {
         state.snapshot.history_next_cursor = page.next_cursor;
         state.snapshot.history_has_more = state.history_next_cursor.is_some();
         state.snapshot.history_search = page.search;
-        Ok(workspace_view_model(&state.snapshot, state.period))
+        Ok(Self::project(&state))
     }
 
     fn send_workspace_command(
@@ -354,7 +456,7 @@ impl WorkspaceClient {
             state.history_next_cursor = workspace.history_next_cursor.clone();
         }
         state.snapshot = workspace;
-        Ok(workspace_view_model(&state.snapshot, state.period))
+        Ok(Self::project(&state))
     }
 
     /// Watches SQLite database, rollback-journal, and WAL writes and emits a

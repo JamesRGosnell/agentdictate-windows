@@ -137,6 +137,15 @@ fn workspace_actions_own_stable_rendering_selectors() {
             WorkspaceAction::SelectUsagePeriod(UsagePeriod::Last7Days),
             "usage-period-7-days",
         ),
+        (WorkspaceAction::RefreshMeetings, "meetings-refresh"),
+        (
+            WorkspaceAction::OpenMeeting {
+                id: "2026-10-13 0900 Pilot.md".to_owned(),
+            },
+            "meetings-item-2026-10-13 0900 Pilot.md",
+        ),
+        (WorkspaceAction::CloseMeeting, "meetings-back"),
+        (WorkspaceAction::OpenMeetingsFolder, "meetings-open-folder"),
     ];
 
     for (action, expected) in actions {
@@ -152,6 +161,7 @@ fn workspace_actions_own_stable_rendering_selectors() {
             usage: UsageViewModel::default(),
             model_catalog: agentdictate_ui::ModelCatalogViewModel::default(),
             overlay_unavailable: false,
+            meetings: agentdictate_ui::MeetingsViewModel::default(),
         }
     );
 }

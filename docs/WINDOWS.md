@@ -60,7 +60,9 @@ retrying delivery or removing the recovery item; switch to your destination and
 paste manually. A slow overlay shutdown is terminated after a grace period, and
 automatic paste proceeds only after the helper's process exit is confirmed.
 
-The tray offers Settings, toggle dictation, literal dictation, and Quit.
+The tray offers Settings, toggle dictation, literal dictation, Meeting Copilot,
+Meeting notes (the Meetings page), and Quit. `agentdictate --route meetings`
+opens the window on a page directly.
 **Launch at login** uses the current user's Windows Run registration.
 The microphone uses Windows' default input device. Audio ducking temporarily
 reduces other playback sessions and restores their prior volume, respecting

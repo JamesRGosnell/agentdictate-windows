@@ -12,6 +12,7 @@ mod daemon;
 pub mod diagnostics;
 mod hotkey_dispatch;
 mod live_transcription;
+mod meetings;
 mod model_catalog;
 mod openai;
 mod overlay_process;
@@ -78,6 +79,24 @@ impl AppPaths {
     #[must_use]
     pub fn model_catalog_cache_file(&self) -> PathBuf {
         self.cache.join("model-catalog.json")
+    }
+
+    /// Where the meeting copilot saves meeting notes.
+    #[must_use]
+    pub fn meetings_dir(&self) -> PathBuf {
+        self.data_root().join("meetings")
+    }
+
+    /// Documents the meeting copilot draws on.
+    #[must_use]
+    pub fn knowledge_dir(&self) -> PathBuf {
+        self.data_root().join("knowledge")
+    }
+
+    fn data_root(&self) -> PathBuf {
+        self.database_file
+            .parent()
+            .map_or_else(|| self.logs.clone(), std::path::Path::to_path_buf)
     }
 
     #[cfg(unix)]

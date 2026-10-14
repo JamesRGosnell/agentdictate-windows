@@ -5,14 +5,14 @@ use gpui_component::{input::InputState, scroll::Scrollbar, v_flex};
 
 use crate::sidebar_motion::SidebarFrame;
 use crate::{
-    HistoryViewModel, NavigationItemViewModel, ReplacementsViewModel, Route,
+    HistoryViewModel, MeetingsViewModel, NavigationItemViewModel, ReplacementsViewModel, Route,
     SIDEBAR_OVERLAY_BREAKPOINT, SettingsDraft, ThemeTokens, TranscriptViewModel, UsageViewModel,
     WorkspaceAction, sidebar_open_for_layout,
 };
 
 use super::{
-    ROUTE_SCROLLBAR_WIDTH, SIDEBAR_WIDTH, SettingsShell, gpui_color, history_page, overview,
-    replacements_page,
+    ROUTE_SCROLLBAR_WIDTH, SIDEBAR_WIDTH, SettingsShell, gpui_color, history_page, meetings_page,
+    overview, replacements_page,
     settings_page::{self, SettingsPageModel},
     settings_shell::{ReplacementEditorState, route_index},
     shell_chrome::{shell_title_bar, sidebar_view},
@@ -25,7 +25,7 @@ struct PreparedLayout {
 
 #[derive(Clone, Copy)]
 struct ShellChromeModel {
-    navigation: [NavigationItemViewModel; 4],
+    navigation: [NavigationItemViewModel; Route::ALL.len()],
     sidebar_open: bool,
     theme: ThemeTokens,
 }
@@ -48,6 +48,10 @@ enum RoutePageModel {
         history: HistoryViewModel,
         search_input: Option<Entity<InputState>>,
         pending_destructive_action: Option<WorkspaceAction>,
+    },
+    Meetings {
+        meetings: MeetingsViewModel,
+        feedback: Option<String>,
     },
     Replacements {
         replacements: ReplacementsViewModel,
@@ -72,6 +76,10 @@ impl RoutePageModel {
                 history: workspace.history.clone(),
                 search_input: shell.routes.history_search_input.clone(),
                 pending_destructive_action: shell.routes.pending_destructive_action.clone(),
+            },
+            Route::Meetings => Self::Meetings {
+                meetings: workspace.meetings.clone(),
+                feedback: shell.routes.entry(Route::Meetings).feedback.clone(),
             },
             Route::Replacements => Self::Replacements {
                 replacements: workspace.replacements.clone(),
@@ -101,6 +109,7 @@ impl RoutePageModel {
         match self {
             Self::Overview { .. } => Route::Overview,
             Self::History { .. } => Route::History,
+            Self::Meetings { .. } => Route::Meetings,
             Self::Replacements { .. } => Route::Replacements,
             Self::Settings(_) => Route::Settings,
         }
@@ -108,13 +117,18 @@ impl RoutePageModel {
 
     fn embeds_feedback(&self) -> bool {
         match self {
-            Self::Settings(_) => true,
+            Self::Settings(_) | Self::Meetings { .. } => true,
             Self::Replacements { editor, .. } => editor.is_some(),
             Self::Overview { .. } | Self::History { .. } => false,
         }
     }
 
-    fn surface(self, theme: ThemeTokens, cx: &mut Context<SettingsShell>) -> gpui::Div {
+    fn surface(
+        self,
+        theme: ThemeTokens,
+        window: &mut Window,
+        cx: &mut Context<SettingsShell>,
+    ) -> gpui::Div {
         match self {
             Self::Overview {
                 usage,
@@ -135,6 +149,9 @@ impl RoutePageModel {
                 pending_destructive_action,
             } => {
                 history_page::surface(history, search_input, pending_destructive_action, theme, cx)
+            }
+            Self::Meetings { meetings, feedback } => {
+                meetings_page::surface(meetings, feedback, theme, window, cx)
             }
             Self::Replacements {
                 replacements,
@@ -243,7 +260,7 @@ fn wide_sidebar_rail(
 fn main_panel(
     viewport: RouteViewportModel,
     chrome: ShellChromeModel,
-    window: &Window,
+    window: &mut Window,
     cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
     let route = viewport.page.route();
@@ -262,13 +279,14 @@ fn main_panel(
             chrome.theme,
             cx,
         ))
-        .child(route_viewport(viewport, chrome.theme, cx))
+        .child(route_viewport(viewport, chrome.theme, window, cx))
         .when_some(footer, |panel, footer| panel.child(footer))
 }
 
 fn route_viewport(
     viewport: RouteViewportModel,
     theme: ThemeTokens,
+    window: &mut Window,
     cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
     let RouteViewportModel {
@@ -281,7 +299,7 @@ fn route_viewport(
     let route_scroll_id = route_index(route);
     let route_scroll_selector = format!("route-scroll-{}", route.slug());
     let embeds_feedback = page.embeds_feedback();
-    let surface = page.surface(theme, cx);
+    let surface = page.surface(theme, window, cx);
     gpui::div()
         .debug_selector(|| "route-content".to_owned())
         .relative()

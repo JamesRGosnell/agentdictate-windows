@@ -75,8 +75,11 @@ does not reach other apps, including chat apps that use it to send.
   tab away; press **Done** when you are finished. Press **✕** again while the
   notes are being written to close as soon as they are saved. Notes, with the
   copilot's answers and the transcript, are saved in
-  `%LOCALAPPDATA%\AgentDictate\meetings`; open the folder from the tray with
-  **Meeting notes**.
+  `%LOCALAPPDATA%\AgentDictate\meetings`.
+- **Meetings.** Every saved meeting is listed, newest first, on the
+  **Meetings** page of the AgentDictate window; the tray's **Meeting notes**
+  opens it. Open a meeting to read its summary and transcript or copy its
+  follow-up email.
 
 The panel opens when there is something to show and collapses to the bar with
 the chevron. While collapsed, new answers reopen it.

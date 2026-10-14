@@ -6,14 +6,16 @@ pub enum Route {
     #[default]
     Overview,
     History,
+    Meetings,
     Replacements,
     Settings,
 }
 
 impl Route {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Overview,
         Self::History,
+        Self::Meetings,
         Self::Replacements,
         Self::Settings,
     ];
@@ -22,6 +24,7 @@ impl Route {
         match self {
             Self::Overview => "Overview",
             Self::History => "History",
+            Self::Meetings => "Meetings",
             Self::Replacements => "Replacements",
             Self::Settings => "Settings",
         }
@@ -31,6 +34,7 @@ impl Route {
         match self {
             Self::Overview => "overview",
             Self::History => "history",
+            Self::Meetings => "meetings",
             Self::Replacements => "replacements",
             Self::Settings => "settings",
         }
@@ -40,6 +44,7 @@ impl Route {
         match self {
             Self::Overview => "nav-overview",
             Self::History => "nav-history",
+            Self::Meetings => "nav-meetings",
             Self::Replacements => "nav-replacements",
             Self::Settings => "nav-settings",
         }
@@ -49,6 +54,7 @@ impl Route {
         match self {
             Self::Overview => "Open Overview",
             Self::History => "Open History",
+            Self::Meetings => "Open Meetings",
             Self::Replacements => "Open Replacements",
             Self::Settings => "Open Settings",
         }

@@ -19,6 +19,7 @@ use crate::{
 mod copilot_view;
 mod history_action_lane;
 mod history_page;
+mod meetings_page;
 mod overlay_view;
 mod overview;
 mod replacements_page;

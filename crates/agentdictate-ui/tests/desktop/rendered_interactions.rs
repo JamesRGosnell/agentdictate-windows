@@ -1114,6 +1114,7 @@ fn flat_sidebar_and_integrated_window_chrome_are_stable(cx: &mut TestAppContext)
     }
     harness.bounds("nav-dot-overview");
     harness.bounds("nav-dot-history");
+    harness.bounds("nav-dot-meetings");
     harness.bounds("nav-dot-replacements");
     harness.bounds("nav-dot-settings");
     harness.bounds("page-context");
@@ -1151,6 +1152,128 @@ fn buttons_receive_clicks_after_every_resize_zone(cx: &mut TestAppContext) {
         harness.click_direct(Route::Overview.navigation_id());
         assert_eq!(harness.active_route(), Route::Overview, "after {edge}");
     }
+}
+
+fn meetings_model(selected: bool) -> ShellViewModel {
+    let note = agentdictate_ui::MeetingNoteViewModel {
+        id: "2026-10-13 0900 Pilot planning.md".to_owned(),
+        title: "Pilot planning".to_owned(),
+        started: "2026-10-13 09:00".to_owned(),
+        duration: "11:33".to_owned(),
+        overview: "Agreed on a 25-seat pilot.".to_owned(),
+    };
+    let detail = selected.then(|| agentdictate_ui::MeetingDetailViewModel {
+        id: note.id.clone(),
+        title: note.title.clone(),
+        started: note.started.clone(),
+        duration: note.duration.clone(),
+        summary: "Agreed on a **25-seat pilot**.\n\n**Action items**\n- Send the agreement"
+            .to_owned(),
+        follow_up: Some("Hi Sam,\n\nThanks for today.".to_owned()),
+        answers: String::new(),
+        transcript: "**[0:02] Them:** Can we start small?".to_owned(),
+    });
+    ShellViewModel::from_snapshot(
+        Route::Meetings,
+        WorkflowSnapshot {
+            phase: WorkflowPhase::Ready,
+        },
+    )
+    .with_workspace(WorkspaceViewModel {
+        meetings: agentdictate_ui::MeetingsViewModel {
+            notes: vec![note],
+            selected: detail,
+        },
+        ..WorkspaceViewModel::default()
+    })
+}
+
+#[gpui::test]
+fn meetings_list_saved_notes_and_open_one(cx: &mut TestAppContext) {
+    let opened = meetings_model(true).workspace;
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&actions);
+    let mut harness = Harness::open_model_with_actions(
+        cx,
+        size(px(1_100.), px(780.)),
+        meetings_model(false),
+        Arc::new(move |action| {
+            captured.lock().unwrap().push(action);
+            Ok(opened.clone())
+        }),
+    );
+    assert!(harness.has("meetings-page"));
+    harness.bounds("meetings-title-2026-10-13 0900 Pilot planning.md");
+    harness.click("meetings-item-2026-10-13 0900 Pilot planning.md");
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [WorkspaceAction::OpenMeeting {
+            id: "2026-10-13 0900 Pilot planning.md".to_owned()
+        }]
+    );
+    assert!(harness.has("meetings-detail"));
+    assert!(harness.has("meetings-summary"));
+    assert!(harness.has("meetings-follow-up"));
+    assert!(harness.has("meetings-transcript"));
+}
+
+#[gpui::test]
+fn an_opened_meeting_copies_its_follow_up_and_returns_to_the_list(cx: &mut TestAppContext) {
+    let list = meetings_model(false).workspace;
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&actions);
+    let mut harness = Harness::open_model_with_actions(
+        cx,
+        size(px(1_100.), px(780.)),
+        meetings_model(true),
+        Arc::new(move |action| {
+            captured.lock().unwrap().push(action);
+            Ok(list.clone())
+        }),
+    );
+    harness.click("meetings-copy-follow-up");
+    assert!(harness.has("meetings-feedback"));
+    assert_eq!(
+        harness
+            .cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("Hi Sam,\n\nThanks for today.")
+    );
+    harness.click("meetings-back");
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [WorkspaceAction::CloseMeeting]
+    );
+}
+
+#[gpui::test]
+fn opening_meetings_refreshes_the_saved_notes(cx: &mut TestAppContext) {
+    let model = ShellViewModel::from_snapshot(
+        Route::Overview,
+        WorkflowSnapshot {
+            phase: WorkflowPhase::Ready,
+        },
+    );
+    let refreshed = meetings_model(false).workspace;
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&actions);
+    let mut harness = Harness::open_model_with_actions(
+        cx,
+        size(px(1_100.), px(780.)),
+        model,
+        Arc::new(move |action| {
+            captured.lock().unwrap().push(action);
+            Ok(refreshed.clone())
+        }),
+    );
+    harness.click(Route::Meetings.navigation_id());
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [WorkspaceAction::RefreshMeetings]
+    );
+    harness.bounds("meetings-item-2026-10-13 0900 Pilot planning.md");
 }
 
 #[gpui::test]

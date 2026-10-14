@@ -178,21 +178,55 @@ fn main() {
             follow_up: Some("Hi Sam,\n\nThanks for the time today. As discussed, we'll start with a **30-day pilot for 25 engineers**, then move to annual billing at $18 per seat per month.\n\nNext steps:\n- I'll send the pilot agreement and pricing by Friday\n- You'll name a pilot lead\n\nBest,\nJames".into()),
         });
     }
-    if state == "overview" {
-        // The Settings window's Overview card that starts the copilot.
+    if state == "overview" || state == "meetings" {
+        // The Settings window's Overview card that starts the copilot, or its
+        // Meetings page with one meeting open.
         use agentdictate_core::{WorkflowPhase, WorkflowSnapshot};
-        use agentdictate_ui::{AgentDictateWindowFrame, Route, SettingsShell, ShellViewModel};
+        use agentdictate_ui::{
+            AgentDictateWindowFrame, MeetingDetailViewModel, MeetingNoteViewModel,
+            MeetingsViewModel, Route, SettingsShell, ShellViewModel, WorkspaceViewModel,
+        };
+        let meetings = state == "meetings";
         Application::new()
             .with_assets(AgentDictateAssets)
-            .run(|cx| {
+            .run(move |cx| {
                 gpui_component::init(cx);
                 gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-                let model = ShellViewModel::from_snapshot(
-                    Route::Overview,
+                let mut model = ShellViewModel::from_snapshot(
+                    if meetings {
+                        Route::Meetings
+                    } else {
+                        Route::Overview
+                    },
                     WorkflowSnapshot {
                         phase: WorkflowPhase::Ready,
                     },
                 );
+                if meetings {
+                    let note = MeetingNoteViewModel {
+                        id: "2026-10-13 0900 Enterprise pricing.md".into(),
+                        title: "Enterprise pricing for 200 engineers".into(),
+                        started: "2026-10-13 09:00".into(),
+                        duration: "32:14".into(),
+                        overview: "Acme is evaluating dictation for about 200 engineers.".into(),
+                    };
+                    model = model.with_workspace(WorkspaceViewModel {
+                        meetings: MeetingsViewModel {
+                            selected: Some(MeetingDetailViewModel {
+                                id: note.id.clone(),
+                                title: note.title.clone(),
+                                started: note.started.clone(),
+                                duration: note.duration.clone(),
+                                summary: "Acme is evaluating dictation for about 200 engineers and asked for annual pricing.\n\n**Key points**\n- Needs strong technical vocabulary and terminal support\n- 200 seats on annual billing: **$18 per seat per month**\n\n**Decisions**\n- Start with a 30-day pilot for 25 engineers\n\n**Action items**\n- Me: send the pilot agreement by Friday\n- Them: name a pilot lead".into(),
+                                follow_up: Some("Hi Sam,\n\nThanks for the time today. As discussed, we'll start with a **30-day pilot for 25 engineers**.\n\nBest,\nJames".into()),
+                                answers: String::new(),
+                                transcript: "**[0:04] Them:** Thanks for making time. We're evaluating dictation tools for about two hundred engineers.\n\n**[0:11] You:** Great, happy to walk you through it.".into(),
+                            }),
+                            notes: vec![note],
+                        },
+                        ..WorkspaceViewModel::default()
+                    });
+                }
                 cx.open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::new(

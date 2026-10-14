@@ -11,10 +11,13 @@ fn routes_have_stable_navigation_order_and_deep_link_slugs() {
         [
             Route::Overview,
             Route::History,
+            Route::Meetings,
             Route::Replacements,
             Route::Settings,
         ]
     );
+    assert_eq!(Route::from_str("meetings"), Ok(Route::Meetings));
+    assert_eq!(Route::Meetings.navigation_id(), "nav-meetings");
     assert_eq!(Route::Overview.title(), "Overview");
     assert_eq!(Route::History.slug(), "history");
     assert_eq!(Route::from_str("replacements"), Ok(Route::Replacements));

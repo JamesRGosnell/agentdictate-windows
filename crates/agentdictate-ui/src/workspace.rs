@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    HistoryViewModel, ModelCatalogViewModel, RecoveryStage, ReplacementDraft,
+    HistoryViewModel, MeetingsViewModel, ModelCatalogViewModel, RecoveryStage, ReplacementDraft,
     ReplacementsViewModel, TranscriptViewModel, UsagePeriod, UsageViewModel,
 };
 
@@ -41,6 +41,19 @@ pub enum WorkspaceAction {
     SelectUsagePeriod(UsagePeriod),
     /// Starts the meeting copilot, or shows the running one.
     OpenCopilot,
+    /// Re-reads the saved meetings.
+    RefreshMeetings,
+    /// Opens a saved meeting's notes in the Meetings page.
+    OpenMeeting {
+        id: String,
+    },
+    /// Returns from a meeting to the list.
+    CloseMeeting,
+    OpenMeetingsFolder,
+    /// Opens a saved meeting's notes file in the default app.
+    OpenMeetingFile {
+        id: String,
+    },
 }
 
 impl WorkspaceAction {
@@ -58,6 +71,11 @@ impl WorkspaceAction {
             Self::DeleteReplacement { id } => format!("replacement-delete-{id}"),
             Self::SelectUsagePeriod(period) => format!("usage-period-{}", period.slug()),
             Self::OpenCopilot => "overview-copilot-start".to_owned(),
+            Self::RefreshMeetings => "meetings-refresh".to_owned(),
+            Self::OpenMeeting { id } => format!("meetings-item-{id}"),
+            Self::CloseMeeting => "meetings-back".to_owned(),
+            Self::OpenMeetingsFolder => "meetings-open-folder".to_owned(),
+            Self::OpenMeetingFile { id } => format!("meetings-open-file-{id}"),
         }
     }
 }
@@ -70,6 +88,7 @@ pub struct WorkspaceViewModel {
     pub replacements: ReplacementsViewModel,
     pub usage: UsageViewModel,
     pub model_catalog: ModelCatalogViewModel,
+    pub meetings: MeetingsViewModel,
 }
 
 /// Executes one workspace action and returns the fresh presentation snapshot
@@ -93,7 +112,14 @@ impl WorkspaceViewModel {
             replacements,
             usage,
             model_catalog: ModelCatalogViewModel::default(),
+            meetings: MeetingsViewModel::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_meetings(mut self, meetings: MeetingsViewModel) -> Self {
+        self.meetings = meetings;
+        self
     }
 
     #[must_use]

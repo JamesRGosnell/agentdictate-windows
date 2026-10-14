@@ -8,6 +8,7 @@ mod copilot;
 #[cfg(feature = "desktop")]
 mod desktop;
 mod history;
+mod meetings;
 mod model_catalog;
 mod overlay;
 mod replacements;
@@ -40,6 +41,7 @@ pub use desktop::{
 pub use history::{
     HistoryViewModel, RecoveryItemViewModel, RecoveryStage, RecoveryViewModel, TranscriptViewModel,
 };
+pub use meetings::{MeetingDetailViewModel, MeetingNoteViewModel, MeetingsViewModel};
 pub use model_catalog::{
     ModelCatalogOptionViewModel, ModelCatalogStatusSource, ModelCatalogStatusViewModel,
     ModelCatalogViewModel, ReasoningOptionViewModel,

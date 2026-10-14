@@ -1143,6 +1143,90 @@ pub fn meeting_notes_markdown(
     notes
 }
 
+/// A saved meeting-notes file read back into its parts, as written by
+/// [`meeting_notes_markdown`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeetingNotes {
+    pub title: String,
+    pub started: String,
+    pub duration: String,
+    /// Overview, key points, decisions, and action items, in Markdown.
+    pub summary: String,
+    pub follow_up: Option<String>,
+    /// The copilot's answers during the meeting, in Markdown.
+    pub answers: String,
+    /// The transcript, in Markdown.
+    pub transcript: String,
+}
+
+impl MeetingNotes {
+    /// The summary's opening sentence, for lists of meetings.
+    #[must_use]
+    pub fn overview(&self) -> String {
+        let plain = |line: &str| line.replace("**", "").trim().to_owned();
+        let lines = self
+            .summary
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        let mut bullets = None;
+        for line in lines {
+            if line.starts_with('#') || (line.starts_with("**") && line.ends_with("**")) {
+                continue;
+            }
+            if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                bullets.get_or_insert_with(|| plain(item));
+                continue;
+            }
+            return plain(line);
+        }
+        bullets.unwrap_or_default()
+    }
+}
+
+/// Reads a meeting-notes file. Sections are found by the headings the
+/// writer uses, so headings inside the model-written summary stay in it.
+#[must_use]
+pub fn parse_meeting_notes(markdown: &str) -> MeetingNotes {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut notes = MeetingNotes::default();
+    for line in &lines {
+        let line = line.trim();
+        if notes.title.is_empty()
+            && let Some(title) = line.strip_prefix("# ")
+        {
+            notes.title = title.trim().to_owned();
+        } else if let Some(started) = line.strip_prefix("- **Started:**") {
+            notes.started = started.trim().to_owned();
+        } else if let Some(duration) = line.strip_prefix("- **Duration:**") {
+            notes.duration = duration.trim().to_owned();
+        }
+    }
+    let heading = |name: &str| lines.iter().position(|line| line.trim() == name);
+    let summary = heading("## Summary");
+    let answers = heading("## Copilot answers");
+    let transcript = heading("## Transcript");
+    let section = |start: Option<usize>, ends: &[Option<usize>]| -> String {
+        let Some(start) = start else {
+            return String::new();
+        };
+        let end = ends
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|&end| end > start)
+            .min()
+            .unwrap_or(lines.len());
+        lines[start + 1..end].join("\n").trim().to_owned()
+    };
+    let (summary, follow_up) = split_follow_up(&section(summary, &[answers, transcript]));
+    notes.summary = summary;
+    notes.follow_up = follow_up;
+    notes.answers = section(answers, &[transcript]);
+    notes.transcript = section(transcript, &[]);
+    notes
+}
+
 /// System prompt for end-of-meeting notes.
 #[must_use]
 pub const fn notes_system_prompt() -> &'static str {
@@ -1433,6 +1517,49 @@ mod tests {
             "Correction: It's $59."
         );
         assert_eq!(combined_answer("", "Full answer."), "Full answer.");
+    }
+
+    #[test]
+    fn saved_notes_read_back_into_their_parts() {
+        let markdown = meeting_notes_markdown(
+            "Pilot planning",
+            "2026-10-13 09:00",
+            693_000,
+            Some(
+                "Agreed on a pilot.\n\n## Key points\n- 25 seats\n\n**Follow-up email**\nHi Sam,\n\nThanks.",
+            ),
+            &[TranscriptLine {
+                id: 1,
+                speaker: Speaker::Them,
+                text: "Can we start small?".into(),
+                at_ms: 2_000,
+            }],
+            &[(
+                "Can we start small?".into(),
+                "Offer a 25-seat pilot.".into(),
+            )],
+        );
+        let notes = parse_meeting_notes(&markdown);
+        assert_eq!(notes.title, "Pilot planning");
+        assert_eq!(notes.started, "2026-10-13 09:00");
+        assert_eq!(notes.duration, "11:33");
+        // A heading inside the summary stays in the summary.
+        assert_eq!(
+            notes.summary,
+            "Agreed on a pilot.\n\n## Key points\n- 25 seats"
+        );
+        assert_eq!(notes.follow_up.as_deref(), Some("Hi Sam,\n\nThanks."));
+        assert!(notes.answers.starts_with("### Can we start small?"));
+        assert!(notes.transcript.contains("Can we start small?"));
+        assert_eq!(notes.overview(), "Agreed on a pilot.");
+        let bare =
+            parse_meeting_notes("# Untitled\n\n## Transcript\n\n_No speech was transcribed._\n");
+        assert_eq!((bare.summary.as_str(), bare.overview().as_str()), ("", ""));
+        let bullets = MeetingNotes {
+            summary: "**Key points**\n- **Budget** approved".into(),
+            ..MeetingNotes::default()
+        };
+        assert_eq!(bullets.overview(), "Budget approved");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::{Color, NavigationItemViewModel, Route, ThemeTokens};
 use super::{SIDEBAR_WIDTH, SettingsShell, gpui_color};
 
 pub(super) fn sidebar_view(
-    navigation: [NavigationItemViewModel; 4],
+    navigation: [NavigationItemViewModel; Route::ALL.len()],
     overlay: bool,
     theme: ThemeTokens,
     cx: &mut Context<SettingsShell>,
@@ -83,6 +83,7 @@ fn route_accent(route: Route, theme: ThemeTokens) -> Color {
     match route {
         Route::Overview => theme.accent,
         Route::History => theme.info,
+        Route::Meetings => Color::rgb(251, 191, 36),
         Route::Replacements => theme.success,
         Route::Settings => Color::rgb(167, 139, 250),
     }

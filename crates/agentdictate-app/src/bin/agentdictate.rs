@@ -29,7 +29,10 @@ fn main() {
             };
             if GetConsoleWindow().is_null()
                 && (std::env::args().len() == 1
-                    || std::env::args().nth(1).as_deref() == Some("login"))
+                    || matches!(
+                        std::env::args().nth(1).as_deref(),
+                        Some("login" | "--route")
+                    ))
             {
                 let message: Vec<u16> =
                     format!("{error:#}").encode_utf16().chain(Some(0)).collect();
@@ -81,6 +84,16 @@ fn run() -> anyhow::Result<()> {
             Some(other) => anyhow::bail!("unknown copilot option: {other}"),
         };
     }
+    // `--route meetings` opens the settings window on a page, as the tray's
+    // Meeting notes item does.
+    let mut route = Route::Overview;
+    let args = match args.as_slice() {
+        [flag, slug] if flag == "--route" => {
+            route = slug.parse().map_err(anyhow::Error::msg)?;
+            Vec::new()
+        }
+        _ => args,
+    };
     if !args.is_empty() {
         let command = match args.as_slice() {
             [command] if command == "quit" => ClientCommand::quit(1),
@@ -92,7 +105,7 @@ fn run() -> anyhow::Result<()> {
                 ClientCommand::start_recording_in_mode(1, mode.parse().map_err(anyhow::Error::msg)?)
             }
             _ => anyhow::bail!(
-                "Usage: agentdictate [start [--mode dictate|literal] | stop | cancel | status | quit | login | copilot]"
+                "Usage: agentdictate [start [--mode dictate|literal] | stop | cancel | status | quit | login | copilot | --route <page>]"
             ),
         };
         let (mut client, _) = IpcClient::connect(&paths.runtime)?;
@@ -123,7 +136,9 @@ fn run() -> anyhow::Result<()> {
         anyhow::bail!("AgentDictate daemon did not provide workspace data")
     };
     let runtime = paths.runtime.clone();
-    let workspace_client = Arc::new(WorkspaceClient::new(runtime.clone(), *workspace));
+    let workspace_client = Arc::new(
+        WorkspaceClient::new(runtime.clone(), *workspace).with_meetings_dir(paths.meetings_dir()),
+    );
     let mut workspace_model = workspace_client.view_model()?;
     let workspace_updates = match workspace_client
         .watch_with_catalog(&paths.database_file, paths.model_catalog_cache_file())
@@ -166,8 +181,7 @@ fn run() -> anyhow::Result<()> {
             | ServerMessageKind::HistoryPage { .. } => Ok(()),
         }
     });
-    let model = ShellViewModel::from_app_snapshot(Route::Overview, snapshot)
-        .with_workspace(workspace_model);
+    let model = ShellViewModel::from_app_snapshot(route, snapshot).with_workspace(workspace_model);
     match workspace_updates {
         Some(updates) => run_settings_shell_with_workspace_actions_and_updates(
             model,

@@ -142,8 +142,9 @@ pub(super) const fn route_index(route: Route) -> usize {
     match route {
         Route::Overview => 0,
         Route::History => 1,
-        Route::Replacements => 2,
-        Route::Settings => 3,
+        Route::Meetings => 2,
+        Route::Replacements => 3,
+        Route::Settings => 4,
     }
 }
 
@@ -307,6 +308,14 @@ impl SettingsShell {
         self.model.select_route(route);
         if route == Route::Settings && previous_route != Route::Settings {
             self.request_model_catalog_refresh();
+        }
+        // Meetings saved since the window opened appear when the page opens.
+        if route == Route::Meetings
+            && previous_route != Route::Meetings
+            && !self.workspace_actions.in_flight
+            && self.workspace_actions.sink.is_some()
+        {
+            self.emit_workspace_action(WorkspaceAction::RefreshMeetings, cx);
         }
         self.routes.pending_destructive_action = None;
         self.clear_route_feedback_for(previous_route);

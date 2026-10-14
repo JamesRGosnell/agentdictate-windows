@@ -270,14 +270,9 @@ fn execute_tray_action(
             Ok(())
         }
         TrayAction::OpenMeetingNotes => {
-            let notes = runtime_directory.parent().map_or_else(
-                || runtime_directory.join("meetings"),
-                |root| root.join("meetings"),
-            );
-            std::fs::create_dir_all(&notes)?;
             drop(
-                Command::new("explorer.exe")
-                    .arg(&notes)
+                Command::new(settings_executable)
+                    .args(["--route", "meetings"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())

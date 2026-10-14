@@ -15,7 +15,7 @@ fn shell_view_model_derives_navigation_and_recording_status_from_domain_state() 
     );
 
     assert_eq!(model.active_route, Route::History);
-    assert_eq!(model.navigation.len(), 4);
+    assert_eq!(model.navigation.len(), 5);
     assert_eq!(
         model
             .navigation
