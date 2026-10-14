@@ -10,9 +10,9 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode, CopilotProvider,
-    CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction, RewriteStyle, Situation,
-    Speaker, SpeakerLabels, TranscriptLine, VoiceNames, combined_answer, format_offset, given_name,
-    has_several_voices, model_pace, researched_follow_up,
+    CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction, RewriteEngine, RewriteStyle,
+    Situation, Speaker, SpeakerLabels, TranscriptLine, VoiceNames, combined_answer, format_offset,
+    given_name, has_several_voices, model_pace, researched_follow_up,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
@@ -2660,6 +2660,22 @@ impl CopilotWindow {
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     let id = id.clone();
                                     this.update_settings(|settings| settings.set_fast_model(id));
+                                    cx.notify();
+                                }))
+                        }),
+                    )),
+            )
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(section_label("Rewrites"))
+                    .child(h_flex().flex_wrap().gap(px(6.)).children(
+                        RewriteEngine::ALL.into_iter().enumerate().map(|(index, engine)| {
+                            chip(("copilot-rewrite-engine", index), engine == settings.rewrite_engine)
+                                .debug_selector(move || format!("copilot-rewrite-engine-{index}"))
+                                .child(engine.label())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.update_settings(|settings| settings.rewrite_engine = engine);
                                     cx.notify();
                                 }))
                         }),

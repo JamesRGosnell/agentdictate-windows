@@ -19,7 +19,7 @@ use std::{
 use agentdictate_core::{
     AnswerStatus, CallView, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights,
     CopilotProvider, CopilotSettings, EmailDraft, INSTANT_GUIDANCE, ListenState, ModelChoice,
-    QuickAction, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, TurnContext,
+    QuickAction, RewriteEngine, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, TurnContext,
     answer_system_prompt, answer_user_prompt, call_view_system_prompt, call_view_user_prompt,
     combined_answer, detected_question_instruction, insights_system_prompt, insights_user_prompt,
     is_echo_of, looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_call_view,
@@ -92,6 +92,8 @@ const LOOK_PAUSE: Duration = Duration::from_secs(180);
 const SHOT_TTL: Duration = Duration::from_secs(30);
 /// Slack when matching a capture to the speech it was taken during.
 const SHOT_SLACK_MS: u64 = 300;
+/// The Claude model that rewrites through the claude CLI.
+const CLAUDE_REWRITE_MODEL: &str = "sonnet";
 /// Names seen in the meeting window kept for the user to pick from.
 const MAX_SEEN_NAMES: usize = 16;
 /// How often the desktop is checked for the meeting still going on.
@@ -1552,9 +1554,23 @@ impl Engine {
             .find(|(answer, _, _)| *answer == id)
             .map(|(_, _, text)| text.as_str())
             .unwrap_or_default();
-        let mut settings = self.settings.clone();
-        settings.set_answer_model(self.settings.provider.default_fast_model());
-        let request = AnswerRequest {
+        let mut fallback = self.settings.clone();
+        fallback.set_answer_model(self.settings.provider.default_fast_model());
+        // Claude rewrites through the claude CLI; the quickest model steps in
+        // when Claude is unavailable.
+        let (settings, fallback) = match self.settings.rewrite_engine {
+            RewriteEngine::ClaudeSonnet => {
+                let mut claude = self.settings.clone();
+                claude.provider = CopilotProvider::ClaudeCode;
+                claude.set_answer_model(CLAUDE_REWRITE_MODEL);
+                // A fallback through the same CLI would fail the same way.
+                let fallback =
+                    (self.settings.provider != CopilotProvider::ClaudeCode).then_some(fallback);
+                (claude, fallback)
+            }
+            RewriteEngine::Quickest => (fallback, None),
+        };
+        let mut request = AnswerRequest {
             system: answer_system_prompt(&self.settings),
             user: answer_user_prompt(
                 &transcript,
@@ -1576,17 +1592,40 @@ impl Engine {
             .name("copilot-rewrite".into())
             .spawn(move || {
                 let mut text = String::new();
-                let result = providers(&settings).and_then(|provider| {
-                    provider.stream(&request, &cancel, &mut |event| {
-                        if cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        if let StreamEvent::Text(delta) = event {
-                            text.push_str(&delta);
-                            ui(CopilotEvent::RewriteDelta { id, text: delta });
-                        }
-                    })
-                });
+                let attempt =
+                    |settings: &CopilotSettings, request: &AnswerRequest, text: &mut String| {
+                        let started = Instant::now();
+                        let result = providers(settings).and_then(|provider| {
+                            provider.stream(request, &cancel, &mut |event| {
+                                if cancel.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                if let StreamEvent::Text(delta) = event {
+                                    text.push_str(&delta);
+                                    ui(CopilotEvent::RewriteDelta { id, text: delta });
+                                }
+                            })
+                        });
+                        tracing::info!(
+                            model = %request.model,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            ok = result.is_ok(),
+                            "copilot rewrite finished"
+                        );
+                        result
+                    };
+                let mut result = attempt(&settings, &request, &mut text);
+                if let (Err(error), Some(fallback)) = (&result, &fallback)
+                    && text.is_empty()
+                    && !cancel.load(Ordering::Relaxed)
+                {
+                    tracing::warn!(%error, "Claude could not rewrite; using the quickest model");
+                    ui(CopilotEvent::Notice(format!(
+                        "Claude is unavailable, so the fastest model rewrote it. {error}"
+                    )));
+                    request.model = fallback.answer_model();
+                    result = attempt(fallback, &request, &mut text);
+                }
                 if cancel.load(Ordering::Relaxed) {
                     ui(CopilotEvent::RewriteFinished {
                         id,
@@ -3354,6 +3393,59 @@ mod tests {
         assert!(!engine.tick());
         engine.paused = false;
         assert!(engine.tick());
+    }
+
+    #[test]
+    fn claude_rewrites_through_the_claude_cli_and_falls_back_to_the_quickest_model() {
+        let (mut engine, incoming, events, requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            rewrite_engine: RewriteEngine::ClaudeSonnet,
+            ..CopilotSettings::default()
+        });
+        // Only the ChatGPT route answers here, so Claude fails like a
+        // signed-out CLI would.
+        let scripted = Arc::clone(&engine.services.providers);
+        engine.services.providers = Arc::new(move |settings: &CopilotSettings| {
+            if settings.provider == CopilotProvider::ClaudeCode {
+                Err("Claude Code is signed out.".to_owned())
+            } else {
+                scripted(settings)
+            }
+        });
+        engine
+            .answers
+            .push((2, "Price?".into(), "It's $20 per seat.".into()));
+        engine.handle_action(CopilotAction::Rewrite {
+            id: 2,
+            style: RewriteStyle::Casual,
+            text: "It's $20 per seat.".into(),
+        });
+        loop {
+            let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+            let rewritten = matches!(message, EngineMsg::Rewritten { id: 2, .. });
+            engine.handle(message);
+            if rewritten {
+                break;
+            }
+        }
+        let request = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.user.contains("<line>"))
+            .cloned()
+            .unwrap();
+        assert_eq!(request.model, "gpt-6-luna");
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CopilotEvent::Notice(notice) if notice.starts_with("Claude is unavailable")
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CopilotEvent::RewriteFinished { id: 2, error: None }))
+        );
     }
 
     #[test]

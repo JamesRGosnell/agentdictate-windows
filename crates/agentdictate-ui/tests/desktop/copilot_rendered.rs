@@ -621,6 +621,19 @@ fn settings_toggles_and_provider_choices_are_saved(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn rewrites_can_go_through_claude(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.click("copilot-settings");
+    harness.reveal_setting("copilot-rewrite-engine-1");
+    harness.click("copilot-rewrite-engine-1");
+    assert!(matches!(
+        harness.actions().last(),
+        Some(CopilotAction::UpdateSettings(settings))
+            if settings.rewrite_engine == agentdictate_core::RewriteEngine::ClaudeSonnet
+    ));
+}
+
+#[gpui::test]
 fn ending_the_session_is_one_click(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);
     harness.click("copilot-end");

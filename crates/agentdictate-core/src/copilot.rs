@@ -378,6 +378,30 @@ taken from my knowledge excerpts or the conversation. Never invent one; if none 
     }
 }
 
+/// Which model rewrites the line to say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteEngine {
+    /// The answer engine's quickest model.
+    #[default]
+    Quickest,
+    /// Claude Sonnet through the claude CLI and the user's Claude
+    /// subscription, falling back to the quickest model when it fails.
+    ClaudeSonnet,
+}
+
+impl RewriteEngine {
+    pub const ALL: [Self; 2] = [Self::Quickest, Self::ClaudeSonnet];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Quickest => "Fastest model",
+            Self::ClaudeSonnet => "Claude Sonnet (Claude CLI)",
+        }
+    }
+}
+
 /// Instruction for rewriting a line the user is about to say. `details` is
 /// the full answer the line came from, including what research added.
 #[must_use]
@@ -434,6 +458,8 @@ pub struct CopilotSettings {
     pub use_past_meetings: bool,
     /// The user has dismissed the first-run welcome.
     pub onboarded: bool,
+    /// Which model rewrites the line to say.
+    pub rewrite_engine: RewriteEngine,
     /// Optional ISO-639-1 transcription language; empty means automatic.
     pub language: String,
 }
@@ -462,6 +488,7 @@ impl Default for CopilotSettings {
             save_notes: true,
             use_past_meetings: true,
             onboarded: false,
+            rewrite_engine: RewriteEngine::default(),
             language: String::new(),
         }
     }

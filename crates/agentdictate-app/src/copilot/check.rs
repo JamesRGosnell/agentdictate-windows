@@ -831,6 +831,14 @@ pub(crate) fn rewrites(model: Option<&str>) -> anyhow::Result<usize> {
     let mut report = Report { failures: 0 };
     let paths = crate::AppPaths::from_environment()?;
     let mut settings = store::load(&store::settings_path(&paths.config_file));
+    // "claude:sonnet" rewrites through the Claude Code CLI.
+    let model = match model.and_then(|model| model.strip_prefix("claude:")) {
+        Some(model) => {
+            settings.provider = agentdictate_core::CopilotProvider::ClaudeCode;
+            Some(model)
+        }
+        None => model,
+    };
     let model = model.map_or_else(
         || settings.provider.default_fast_model().to_owned(),
         str::to_owned,
@@ -839,7 +847,7 @@ pub(crate) fn rewrites(model: Option<&str>) -> anyhow::Result<usize> {
     let chatgpt = Arc::new(ChatGptCredentials::discover());
     let provider =
         providers::provider_for(&settings, &chatgpt, "", &[]).map_err(anyhow::Error::msg)?;
-    println!("Rewrite check with {model}");
+    println!("Rewrite check with {} {model}", settings.provider.label());
     let lines: Vec<TranscriptLine> = [
         (
             Speaker::Them,
