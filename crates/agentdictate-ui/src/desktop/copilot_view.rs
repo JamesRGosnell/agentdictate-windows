@@ -10,8 +10,8 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode, CopilotProvider,
-    CopilotSettings, ListenState, ModelChoice, QuickAction, Situation, Speaker, format_offset,
-    model_pace,
+    CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction, Situation, Speaker,
+    combined_answer, format_offset, model_pace, researched_follow_up,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
@@ -1329,11 +1329,17 @@ impl CopilotWindow {
         let failed = matches!(answer.status, AnswerStatus::Failed(_));
         let status = answer.status_label();
         let body = answer.body.clone();
-        let copy_text = if answer.body.trim().is_empty() {
-            answer.instant.clone()
+        let instant = answer.instant.clone();
+        let has_instant = !instant.trim().is_empty();
+        // One answer that grows: the instant draft is the line to say, and the
+        // researched answer adds to it, corrects it, or confirms it.
+        let (hero, follow_up) = if has_instant {
+            (instant.clone(), researched_follow_up(&body))
         } else {
-            answer.body.clone()
+            (body.clone(), FollowUp::Pending)
         };
+        let corrected = matches!(&follow_up, FollowUp::Correction(line) if !line.is_empty());
+        let copy_text = combined_answer(&instant, &body);
         let style = TextViewStyle {
             is_dark: true,
             highlight_theme: HighlightTheme::default_dark(),
@@ -1443,31 +1449,23 @@ impl CopilotWindow {
                         })),
                 )
             });
-        let instant = answer.instant.clone();
-        let has_instant = !instant.trim().is_empty();
-        let researched_label = if answer.sources.is_empty() {
-            "RESEARCHED".to_owned()
-        } else {
-            format!(
-                "RESEARCHED \u{00b7} {} SOURCE{}",
-                answer.sources.len(),
-                if answer.sources.len() == 1 { "" } else { "S" }
-            )
-        };
-        // With an instant draft on screen, the researched lane's progress is
-        // phrased as follow-up work rather than a wait.
+        // With a draft on screen, the researched lane's progress reads as
+        // checking the draft rather than a wait.
         let status = match (&answer.status, has_instant) {
-            (AnswerStatus::Thinking, true) => Some("Researching a verified answer".to_owned()),
+            (AnswerStatus::Thinking | AnswerStatus::Streaming, true) => {
+                Some("Checking the facts".to_owned())
+            }
             _ => status,
         };
-        let status_row = status.map(|label| {
+        let show_status = active && matches!(follow_up, FollowUp::Pending);
+        let status_row = status.filter(|_| show_status || failed).map(|label| {
             let dots: Vec<f32> = (0..3)
                 .map(|index| 0.3 + 0.7 * pulse(1_100. + f64::from(index) * 180.))
                 .collect();
             h_flex()
                 .gap(px(8.))
-                .text_size(px(12.5))
-                .text_color(color(if failed { DANGER } else { MUTED }))
+                .text_size(px(12.))
+                .text_color(color(if failed { DANGER } else { DIM }))
                 .when(active, |row| {
                     row.child(h_flex().gap(px(3.)).children(dots.into_iter().map(|alpha| {
                         div()
@@ -1477,10 +1475,108 @@ impl CopilotWindow {
                     })))
                 })
                 .when(matches!(answer.status, AnswerStatus::Searching(_)), |row| {
-                    row.child(icon("globe", 12., MUTED))
+                    row.child(icon("globe", 12., DIM))
                 })
                 .child(div().flex_1().min_w_0().child(label))
         });
+        let markdown = |id: String, text: String, window: &mut Window, cx: &mut Context<Self>| {
+            TextView::markdown(SharedString::from(id), text, window, cx)
+                .style(style.clone())
+                .selectable(true)
+        };
+        let hero_view = (!hero.trim().is_empty()).then(|| {
+            let id = if has_instant {
+                format!("copilot-instant-text-{id}")
+            } else {
+                format!("copilot-answer-text-{id}")
+            };
+            markdown(id, hero.clone(), window, cx)
+        });
+        let follow_up_view = match &follow_up {
+            FollowUp::Adds(more) if !more.is_empty() => Some(
+                v_flex()
+                    .debug_selector(|| "copilot-answer-more".to_owned())
+                    .w_full()
+                    .gap(px(6.))
+                    .pt(px(10.))
+                    .border_t_1()
+                    .border_color(color(HAIRLINE))
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(DIM))
+                            .child(icon("globe", 10., ACCENT))
+                            .child(if answer.sources.is_empty() {
+                                "MORE".to_owned()
+                            } else {
+                                format!(
+                                    "MORE \u{00b7} {} SOURCE{}",
+                                    answer.sources.len(),
+                                    if answer.sources.len() == 1 { "" } else { "S" }
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(13.5))
+                            .line_height(rems(1.45))
+                            .text_color(color(TEXT))
+                            .child(markdown(
+                                format!("copilot-answer-text-{id}"),
+                                more.clone(),
+                                window,
+                                cx,
+                            )),
+                    )
+                    .into_any_element(),
+            ),
+            FollowUp::Correction(line) if !line.is_empty() => Some(
+                v_flex()
+                    .debug_selector(|| "copilot-answer-correction".to_owned())
+                    .w_full()
+                    .gap(px(6.))
+                    .p(px(12.))
+                    .rounded(px(10.))
+                    .bg(color(0xf871711a))
+                    .border_1()
+                    .border_color(color(0xf8717140))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(DANGER))
+                            .child("CORRECTION \u{00b7} SAY THIS INSTEAD"),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(15.))
+                            .line_height(rems(1.45))
+                            .text_color(color(TEXT))
+                            .child(markdown(
+                                format!("copilot-answer-text-{id}"),
+                                line.clone(),
+                                window,
+                                cx,
+                            )),
+                    )
+                    .into_any_element(),
+            ),
+            FollowUp::Confirmed => Some(
+                h_flex()
+                    .debug_selector(|| "copilot-answer-confirmed".to_owned())
+                    .gap(px(6.))
+                    .text_size(px(11.5))
+                    .text_color(color(DIM))
+                    .child(icon("check", 12., ACCENT))
+                    .child("Checked \u{00b7} nothing to add")
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
         let sources = answer.sources.clone();
         v_flex()
             .id(("copilot-answer", id))
@@ -1492,66 +1588,35 @@ impl CopilotWindow {
             .border_1()
             .border_color(color(if latest { 0xffffff17 } else { HAIRLINE }))
             .child(header)
-            .when(has_instant, |card| {
+            .when_some(hero_view, |card, hero_view| {
                 card.child(
                     h_flex()
-                        .gap(px(6.))
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(color(DIM))
-                        .child(icon("sparkles", 10., ACCENT))
-                        .child("INSTANT"),
-                )
-                .child(
-                    div()
+                        .debug_selector(|| "copilot-answer-hero".to_owned())
                         .w_full()
-                        .text_size(px(14.))
-                        .line_height(rems(1.45))
-                        .text_color(color(TEXT))
+                        .items_start()
+                        .gap(px(12.))
                         .child(
-                            TextView::markdown(
-                                SharedString::from(format!("copilot-instant-text-{id}")),
-                                instant.clone(),
-                                window,
-                                cx,
-                            )
-                            .style(style.clone())
-                            .selectable(true),
+                            div()
+                                .w(px(3.))
+                                .h_full()
+                                .min_h(px(20.))
+                                .flex_none()
+                                .rounded(px(2.))
+                                .bg(color(if corrected { DIM } else { ACCENT })),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(if has_instant { 15.5 } else { 14. }))
+                                .line_height(rems(1.45))
+                                .text_color(color(if corrected { MUTED } else { TEXT }))
+                                .child(hero_view),
                         ),
                 )
-                .child(div().w_full().h(px(1.)).bg(color(HAIRLINE)))
             })
             .when_some(status_row, |card, row| card.child(row))
-            .when(has_instant && !body.is_empty(), |card| {
-                card.child(
-                    h_flex()
-                        .gap(px(6.))
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(color(DIM))
-                        .child(icon("globe", 10., ACCENT))
-                        .child(researched_label.clone()),
-                )
-            })
-            .when(!body.is_empty(), |card| {
-                card.child(
-                    div()
-                        .w_full()
-                        .text_size(px(14.))
-                        .line_height(rems(1.45))
-                        .text_color(color(TEXT))
-                        .child(
-                            TextView::markdown(
-                                SharedString::from(format!("copilot-answer-text-{id}")),
-                                body.clone(),
-                                window,
-                                cx,
-                            )
-                            .style(style)
-                            .selectable(true),
-                        ),
-                )
-            })
+            .when_some(follow_up_view, |card, view| card.child(view))
             .when(!sources.is_empty(), |card| {
                 card.child(
                     h_flex().flex_wrap().gap(px(6.)).children(

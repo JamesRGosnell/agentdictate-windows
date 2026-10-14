@@ -143,7 +143,7 @@ fn main() {
         } else {
             feed(CopilotEvent::AnswerDelta {
                 id: 2,
-                text: "**Say:** \u{201c}For 200 seats on annual billing you'd be at **$18 per seat per month**, about **$43,200 a year**, and that includes SSO and priority support.\u{201d}\n\n- Annual billing saves **20%** versus monthly ($22.50)\n- Volume tier starts at 150 seats, so they already qualify\n- Offer a **30-day pilot** with 25 seats to de-risk the rollout".into(),
+                text: "\u{201c}For 200 seats on annual billing it's **$18 per seat per month**, about **$43,200 a year**, with SSO and priority support included.\u{201d}\n\n- Annual billing saves **20%** versus monthly ($22.50)\n- Volume tier starts at 150 seats, so they already qualify\n- Offer a **30-day pilot** with 25 seats to de-risk the rollout".into(),
             });
             feed(CopilotEvent::AnswerSource {
                 id: 2,

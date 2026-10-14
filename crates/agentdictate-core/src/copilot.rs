@@ -800,9 +800,80 @@ briefly when you rely on it. Never invent facts about me or my business that are
 /// must not guess facts the researched answer will verify.
 pub const INSTANT_GUIDANCE: &str = "Reply in at most two sentences the user can say right now, then at most two short bullets. You have no web access: answer from what you reliably know and from my knowledge excerpts. For anything that changes or that you are unsure of, such as current prices, recent events, the latest versions, or exact figures, never guess: give a natural line that buys a moment while the details are confirmed.";
 
-/// Added to the researched answer's request when an instant draft is shown
-/// above it.
-pub const RESEARCHED_GUIDANCE: &str = "A quick draft is already shown to the user. Focus on accurate, specific, verified details: confirm or correct facts, give exact figures, and cite sources when you searched.";
+/// What the researched answer says when the instant draft needs nothing more.
+pub const NOTHING_TO_ADD: &str = "Nothing to add.";
+
+/// Added to the researched answer's request once the instant draft is on
+/// screen: the researched answer continues the draft instead of repeating it,
+/// so the user reads one answer that grows, and corrects it only when wrong.
+#[must_use]
+pub fn researched_guidance(draft: &str) -> String {
+    format!(
+        "I'm already saying this quick draft to them:\n<draft>\n{}\n</draft>\n\
+Continue from it without repeating it. Add only what makes it stronger and that I can say next: verified specifics \
+such as exact figures, names, and dates, as one or two sentences or a few short bullets, citing sources briefly when you \
+searched. If the draft is wrong or misleading, begin with \"Correction:\" and give the line I should say instead. \
+If the draft is already complete and accurate, reply with exactly \"{NOTHING_TO_ADD}\"",
+        draft.trim()
+    )
+}
+
+/// How the researched answer relates to the instant draft above it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowUp {
+    /// Nothing usable yet, possibly the start of a marker still streaming.
+    Pending,
+    /// Details that continue the draft.
+    Adds(String),
+    /// The draft was wrong; this is what to say instead.
+    Correction(String),
+    /// The draft was checked and needs nothing more.
+    Confirmed,
+}
+
+/// Reads a researched answer written with [`researched_guidance`], holding
+/// back text that may still become a marker while it streams.
+#[must_use]
+pub fn researched_follow_up(text: &str) -> FollowUp {
+    let unmarked = text.trim_start().trim_start_matches(['*', '_']);
+    let lower = unmarked.to_lowercase();
+    if lower.is_empty() {
+        return FollowUp::Pending;
+    }
+    let nothing = "nothing to add";
+    if lower.starts_with(nothing) {
+        return FollowUp::Confirmed;
+    }
+    let correction = "correction:";
+    if let Some(rest) = lower.strip_prefix(correction) {
+        let offset = unmarked.len() - rest.len();
+        let rest = unmarked
+            .get(offset..)
+            .unwrap_or_default()
+            .trim_start_matches(['*', '_', ' ']);
+        return FollowUp::Correction(rest.to_owned());
+    }
+    if nothing.starts_with(lower.trim_end()) || correction.starts_with(lower.trim_end()) {
+        return FollowUp::Pending;
+    }
+    FollowUp::Adds(text.trim().to_owned())
+}
+
+/// The answer as one text, for notes and copying: the draft with what the
+/// researched answer added, or the correction that replaced it.
+#[must_use]
+pub fn combined_answer(instant: &str, researched: &str) -> String {
+    let instant = instant.trim();
+    if instant.is_empty() {
+        return researched.trim().to_owned();
+    }
+    match researched_follow_up(researched) {
+        FollowUp::Pending | FollowUp::Confirmed => instant.to_owned(),
+        FollowUp::Adds(more) => format!("{instant}\n\n{more}"),
+        FollowUp::Correction(line) if line.is_empty() => instant.to_owned(),
+        FollowUp::Correction(line) => format!("Correction: {line}"),
+    }
+}
 
 /// Instruction for answering a question the other side asked.
 #[must_use]
@@ -1324,6 +1395,41 @@ mod tests {
         assert!(with.starts_with("<my_knowledge>\n[pricing.md] Growth plan: $49 per seat."));
         assert!(with.contains("override web results"));
         assert!(with.find("<my_knowledge>") < with.find("<transcript>"));
+    }
+
+    #[test]
+    fn researched_answers_continue_correct_or_confirm_the_draft() {
+        assert!(
+            researched_guidance(" Our plan is $49. ")
+                .contains("<draft>\nOur plan is $49.\n</draft>")
+        );
+        assert_eq!(researched_follow_up(""), FollowUp::Pending);
+        // Streaming text that may still become a marker is held back.
+        assert_eq!(researched_follow_up("Noth"), FollowUp::Pending);
+        assert_eq!(researched_follow_up("**Correc"), FollowUp::Pending);
+        assert_eq!(researched_follow_up("Nothing to add."), FollowUp::Confirmed);
+        assert_eq!(
+            researched_follow_up("**Correction:** It's $59 per seat."),
+            FollowUp::Correction("It's $59 per seat.".into())
+        );
+        assert_eq!(
+            researched_follow_up("- Annual billing saves 20%"),
+            FollowUp::Adds("- Annual billing saves 20%".into())
+        );
+        assert_eq!(
+            researched_follow_up("No, wait"),
+            FollowUp::Adds("No, wait".into())
+        );
+        assert_eq!(
+            combined_answer("Say: $49.", "- Saves 20% yearly"),
+            "Say: $49.\n\n- Saves 20% yearly"
+        );
+        assert_eq!(combined_answer("Say: $49.", "Nothing to add."), "Say: $49.");
+        assert_eq!(
+            combined_answer("Say: $49.", "Correction: It's $59."),
+            "Correction: It's $59."
+        );
+        assert_eq!(combined_answer("", "Full answer."), "Full answer.");
     }
 
     #[test]

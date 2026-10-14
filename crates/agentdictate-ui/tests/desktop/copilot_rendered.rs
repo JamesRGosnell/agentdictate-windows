@@ -325,6 +325,59 @@ fn a_copilot_that_knows_the_user_does_not_ask_to_be_taught(cx: &mut TestAppConte
     assert!(!harness.has("copilot-teach"));
 }
 
+/// Streams an answer with an instant draft and a researched follow-up.
+fn stream_answer(harness: &mut Harness, researched: &str) {
+    harness.send(CopilotEvent::AnswerStarted {
+        id: 7,
+        title: "What does it cost?".into(),
+        used_screen: false,
+        model: "gpt-6-sol".into(),
+        automatic: true,
+    });
+    harness.send(CopilotEvent::InstantDelta {
+        id: 7,
+        text: "\u{201c}It's $49 per seat on the growth plan.\u{201d}".into(),
+    });
+    harness.send(CopilotEvent::InstantFinished { id: 7 });
+    harness.send(CopilotEvent::AnswerDelta {
+        id: 7,
+        text: researched.into(),
+    });
+    harness.send(CopilotEvent::AnswerStatus {
+        id: 7,
+        status: AnswerStatus::Done,
+    });
+}
+
+#[gpui::test]
+fn the_researched_answer_adds_to_the_line_to_say(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    stream_answer(&mut harness, "- Annual billing saves 20%");
+    assert!(harness.has("copilot-answer-hero"));
+    assert!(harness.has("copilot-answer-more"));
+    assert!(!harness.has("copilot-answer-correction"));
+}
+
+#[gpui::test]
+fn a_wrong_draft_is_corrected_in_place(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    stream_answer(
+        &mut harness,
+        "**Correction:** It's $59 per seat since October.",
+    );
+    assert!(harness.has("copilot-answer-hero"));
+    assert!(harness.has("copilot-answer-correction"));
+    assert!(!harness.has("copilot-answer-more"));
+}
+
+#[gpui::test]
+fn a_complete_draft_is_marked_as_checked(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    stream_answer(&mut harness, "Nothing to add.");
+    assert!(harness.has("copilot-answer-confirmed"));
+    assert!(!harness.has("copilot-answer-more"));
+}
+
 #[gpui::test]
 fn typing_a_question_activates_the_window_and_returns_focus(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);

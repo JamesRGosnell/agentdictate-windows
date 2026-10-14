@@ -18,12 +18,13 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights, CopilotProvider,
-    CopilotSettings, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction, RESEARCHED_GUIDANCE,
-    Speaker, TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt,
+    CopilotSettings, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction, Speaker,
+    TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt, combined_answer,
     detected_question_instruction, insights_system_prompt, insights_user_prompt, is_echo_of,
     looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_insights,
-    parse_turn_verdict, render_transcript, split_follow_up, turn_judge_system_prompt,
-    turn_judge_user_prompt, typed_question_instruction, utterance_similarity, worth_judging,
+    parse_turn_verdict, render_transcript, researched_guidance, split_follow_up,
+    turn_judge_system_prompt, turn_judge_user_prompt, typed_question_instruction,
+    utterance_similarity, worth_judging,
 };
 
 use super::{
@@ -43,6 +44,8 @@ const INSIGHTS_MIN_NEW_LINES: usize = 2;
 const AUTO_ANSWER_COOLDOWN: Duration = Duration::from_secs(6);
 /// How often the knowledge folders are checked for added or edited files.
 const KNOWLEDGE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+/// Longest the researched answer waits for the instant draft it continues.
+const INSTANT_WAIT: Duration = Duration::from_secs(8);
 /// How long the wrap-up stays open when the user leaves it alone.
 const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(180);
 const ECHO_WAIT: Duration = Duration::from_secs(4);
@@ -1152,6 +1155,7 @@ impl Engine {
                 let user =
                     answer_user_prompt(&transcript, &instruction, image.is_some(), &knowledge);
                 let instant_text = Arc::new(Mutex::new(String::new()));
+                let (instant_done, instant_finished) = mpsc::channel::<()>();
                 if instant {
                     let mut fast_settings = settings.clone();
                     fast_settings.set_answer_model(fast_model.clone());
@@ -1198,12 +1202,27 @@ impl Engine {
                                 tracing::warn!(%error, "copilot instant draft failed");
                             }
                             gate.send(CopilotEvent::InstantFinished { id });
+                            let _ = instant_done.send(());
                         });
+                } else {
+                    drop(instant_done);
                 }
+                // The researched answer continues the draft the user is
+                // already reading, so it starts once the draft is written.
+                let draft = if instant {
+                    let _ = instant_finished.recv_timeout(INSTANT_WAIT);
+                    instant_text
+                        .lock()
+                        .map(|text| text.clone())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let has_draft = !draft.trim().is_empty();
                 let request = AnswerRequest {
                     system,
-                    user: if instant {
-                        format!("{user}\n\n{RESEARCHED_GUIDANCE}")
+                    user: if has_draft {
+                        format!("{user}\n\n{}", researched_guidance(&draft))
                     } else {
                         user
                     },
@@ -1252,10 +1271,15 @@ impl Engine {
                 });
                 if !cancel.load(Ordering::Relaxed) {
                     let status = match result {
-                        Ok(()) if text.trim().is_empty() => {
+                        // The draft stands on its own if the follow-up fails.
+                        Ok(()) if text.trim().is_empty() && !has_draft => {
                             AnswerStatus::Failed("The model returned no answer.".into())
                         }
                         Ok(()) => AnswerStatus::Done,
+                        Err(error) if has_draft => {
+                            tracing::warn!(%error, "copilot researched follow-up failed");
+                            AnswerStatus::Done
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "copilot answer failed");
                             AnswerStatus::Failed(error)
@@ -1268,10 +1292,8 @@ impl Engine {
                     chars = text.len(),
                     "copilot answer finished"
                 );
-                if text.trim().is_empty()
-                    && let Ok(instant) = instant_text.lock()
-                {
-                    text = instant.clone();
+                if let Ok(instant) = instant_text.lock() {
+                    text = combined_answer(&instant, &text);
                 }
                 if gate.is_discarded() {
                     text.clear();
@@ -1792,7 +1814,12 @@ mod tests {
                 .user
                 .contains("[0:01] Them: What does pricing look like")
         );
-        assert!(researched[0].user.contains(RESEARCHED_GUIDANCE));
+        // The researched answer continues the instant draft.
+        assert!(
+            researched[0]
+                .user
+                .contains("<draft>\nSay: **$20** per seat.\n</draft>")
+        );
         assert!(researched[0].web_search);
         let instant = requests
             .iter()
@@ -2160,7 +2187,7 @@ mod tests {
         drain(&mut engine, &incoming);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(!requests[0].user.contains(RESEARCHED_GUIDANCE));
+        assert!(!requests[0].user.contains("<draft>"));
         assert!(
             !events
                 .lock()
