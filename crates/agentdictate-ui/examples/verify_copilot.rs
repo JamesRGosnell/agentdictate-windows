@@ -91,11 +91,14 @@ fn main() {
             ),
         ];
         for (index, (speaker, text, at_ms)) in lines.into_iter().enumerate() {
+            // Two people on the other side: the buyer and their engineer.
+            let voice = (speaker == Speaker::Them).then_some(u8::from(index == 2));
             feed(CopilotEvent::Transcript(TranscriptLine {
                 id: index as u64 + 1,
                 speaker,
                 text: text.to_owned(),
                 at_ms,
+                voice,
             }));
         }
         feed(CopilotEvent::Insights(CopilotInsights {

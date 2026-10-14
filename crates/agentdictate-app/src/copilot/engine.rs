@@ -33,6 +33,7 @@ use super::{
     reveal::RevealGate,
     stream::StreamEvent,
     vad::{SegmentEvent, Utterance, wav_bytes},
+    voices::{VoiceTracker, voice_print},
 };
 
 const TRANSCRIPTION_WORKERS: usize = 3;
@@ -204,6 +205,8 @@ struct ThemSpan {
     start_ms: u64,
     end_ms: u64,
     text: Option<String>,
+    /// The other side's voice that spoke, when told apart.
+    voice: Option<u8>,
 }
 
 /// A line from the other side that may call for the user to respond.
@@ -254,6 +257,7 @@ pub(crate) struct Engine {
     transcript: Vec<TranscriptLine>,
     next_line: u64,
     them_spans: VecDeque<ThemSpan>,
+    voices: VoiceTracker,
     pending_mine: Vec<PendingMine>,
     them_speaking: bool,
     pending_turn: Option<PendingTurn>,
@@ -298,6 +302,7 @@ impl Engine {
             transcript: Vec::new(),
             next_line: 1,
             them_spans: VecDeque::new(),
+            voices: VoiceTracker::default(),
             pending_mine: Vec::new(),
             them_speaking: false,
             pending_turn: None,
@@ -731,10 +736,13 @@ impl Engine {
         let start_ms = released.saturating_sub(utterance.duration_ms()) + utterance.lead_ms;
         let end_ms = released.saturating_sub(utterance.tail_ms).max(start_ms);
         if speaker == Speaker::Them {
+            // Voices are assigned in the order people spoke.
+            let voice = self.voices.assign(voice_print(&utterance.samples));
             self.them_spans.push_back(ThemSpan {
                 start_ms,
                 end_ms,
                 text: None,
+                voice,
             });
             while self
                 .them_spans
@@ -784,11 +792,12 @@ impl Engine {
             }
             return;
         }
-        let line = TranscriptLine {
+        let mut line = TranscriptLine {
             id: self.next_line,
             speaker,
             text,
             at_ms: start_ms,
+            voice: None,
         };
         self.next_line += 1;
         match speaker {
@@ -799,6 +808,7 @@ impl Engine {
                     .find(|span| span.start_ms == start_ms && span.end_ms == end_ms)
                 {
                     span.text = Some(line.text.clone());
+                    line.voice = span.voice;
                 }
                 // The same call can reach two playback devices (for example a
                 // virtual device chained to speakers); keep one copy.
@@ -1893,6 +1903,7 @@ mod tests {
             start_ms: 3_700,
             end_ms: 6_000,
             text: None,
+            voice: None,
         });
         drain(&mut engine, &incoming);
         assert_eq!(answers_started(&events), 0);
@@ -2161,6 +2172,7 @@ mod tests {
                 speaker,
                 text: text.into(),
                 at_ms: index as u64 * 2_000,
+                voice: None,
             });
         }
         // Ending twice skips the wrap-up's wait.
@@ -2254,6 +2266,7 @@ mod tests {
             start_ms: 1_000,
             end_ms: 4_000,
             text: None,
+            voice: None,
         });
         engine.handle_transcribed(
             Speaker::Me,
@@ -2306,6 +2319,7 @@ mod tests {
             start_ms: 500,
             end_ms: 6_000,
             text: None,
+            voice: None,
         });
         engine.handle_transcribed(
             Speaker::Them,
@@ -2338,6 +2352,7 @@ mod tests {
                 start_ms,
                 end_ms,
                 text: None,
+                voice: None,
             });
             engine.handle_transcribed(Speaker::Them, start_ms, end_ms, Ok(text.into()));
         }
@@ -2409,6 +2424,7 @@ mod tests {
             start_ms: 1_000,
             end_ms: 3_000,
             text: None,
+            voice: None,
         });
         engine.handle_transcribed(
             Speaker::Them,
@@ -2463,6 +2479,7 @@ mod tests {
             start_ms: 0,
             end_ms: 3_000,
             text: Some("The budget is tight this quarter.".into()),
+            voice: None,
         });
         engine.handle_transcribed(
             Speaker::Me,
@@ -2527,6 +2544,7 @@ mod tests {
             speaker: Speaker::Them,
             text: "Hello there".into(),
             at_ms: 0,
+            voice: None,
         });
         engine.answers.push(("Q".into(), "A".into()));
         let path = engine.write_notes(Some("Summary text")).unwrap();

@@ -18,6 +18,7 @@ mod reveal;
 mod store;
 mod stream;
 mod vad;
+mod voices;
 #[cfg(windows)]
 mod win;
 
@@ -101,6 +102,13 @@ pub fn launch_copilot() -> std::io::Result<()> {
 #[cfg(windows)]
 pub fn run_copilot_check(speech: Option<&std::path::Path>, latency: bool) -> anyhow::Result<usize> {
     check::run(speech, latency)
+}
+
+/// Prints how recordings' voices are told apart, for tuning speaker
+/// separation.
+#[cfg(windows)]
+pub fn run_copilot_voices(paths: &[std::path::PathBuf]) -> anyhow::Result<usize> {
+    check::voices(paths)
 }
 
 /// Plays a recording through the speakers and reports any echo that reached

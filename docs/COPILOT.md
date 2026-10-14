@@ -67,7 +67,11 @@ does not reach other apps, including chat apps that use it to send.
 - **Quick actions.** What should I say?, Follow-up questions, Recap so far,
   Fact-check, and Explain my screen.
 - **Transcript.** Everything said, labeled **You** (your microphone) and
-  **Them** (system audio).
+  **Them** (system audio). When more than one person speaks on the other side,
+  the copilot tells their voices apart and labels them **Them A**, **Them B**,
+  and so on, in the transcript, the notes, and what answers see. Voices are
+  matched by timbre and pitch, on this PC; people who talk over each other or
+  trade lines without a pause share one label.
 - **Wrap-up.** When you end the session with **✕**, the copilot writes notes
   with a summary, key points, decisions, action items, and, when you took part
   in a conversation, a ready-to-send follow-up email. The wrap-up shows them
@@ -126,7 +130,8 @@ words are not written as **You**:
   kept, even when they repeat their words.
 
 `agentdictate copilot --check` reports whether Windows echo cancellation is
-active. `agentdictate copilot --echo-test path\to\speech.wav` plays a recording
+active. `agentdictate copilot --voices a.wav b.wav` shows how recordings'
+voices are told apart. `agentdictate copilot --echo-test path\to\speech.wav` plays a recording
 through your speakers while the copilot listens and reports anything that
 reached **You**; run it in a quiet room without speaking.
 

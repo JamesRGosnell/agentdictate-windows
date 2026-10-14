@@ -414,6 +414,7 @@ mod tests {
                     speaker: Speaker::Them,
                     text: format!("line {id}"),
                     at_ms,
+                    voice: None,
                 })),
                 CopilotEffect::ScrollTranscript
             );

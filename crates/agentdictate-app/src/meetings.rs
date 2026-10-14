@@ -86,6 +86,7 @@ mod tests {
                 speaker: Speaker::Them,
                 text: "Hello".into(),
                 at_ms: 0,
+                voice: None,
             }],
             &[],
         );

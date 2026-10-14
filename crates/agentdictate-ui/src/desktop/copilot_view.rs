@@ -11,7 +11,7 @@ use std::{
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode, CopilotProvider,
     CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction, Situation, Speaker,
-    combined_answer, format_offset, model_pace, researched_follow_up,
+    combined_answer, format_offset, has_several_voices, model_pace, researched_follow_up,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
@@ -48,6 +48,11 @@ const DIM: u32 = 0x71717aff;
 const ACCENT: u32 = 0xe6a48aff;
 const ACCENT_SOFT: u32 = 0xe6a48a29;
 const ME: u32 = 0x8ab4f8ff;
+/// Colors for the other side's voices, Them A first.
+/// None is close to the blue used for "You".
+const VOICES: [u32; 6] = [
+    ACCENT, 0xc4b5fdff, 0x86efacff, 0xfcd34dff, 0xf9a8d4ff, 0x67e8f9ff,
+];
 const DANGER: u32 = 0xf87171ff;
 const SHADOW_MARGIN: f32 = 14.0;
 const PILL_HEIGHT: f32 = 38.0;
@@ -1773,10 +1778,14 @@ impl CopilotWindow {
                     .child("The transcript appears here as people speak."),
             );
         }
+        let several_voices = has_several_voices(&lines);
         for line in lines {
-            let tint = match line.speaker {
-                Speaker::Me => ME,
-                Speaker::Them => ACCENT,
+            let tint = match (line.speaker, line.voice) {
+                (Speaker::Me, _) => ME,
+                (Speaker::Them, Some(voice)) if several_voices => {
+                    VOICES[usize::from(voice) % VOICES.len()]
+                }
+                (Speaker::Them, _) => ACCENT,
             };
             content = content.child(
                 h_flex()
@@ -1785,7 +1794,7 @@ impl CopilotWindow {
                     .gap(px(10.))
                     .child(
                         v_flex()
-                            .w(px(44.))
+                            .w(px(52.))
                             .flex_none()
                             .gap(px(1.))
                             .child(
@@ -1793,7 +1802,7 @@ impl CopilotWindow {
                                     .text_size(px(11.5))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(color(tint))
-                                    .child(line.speaker.display()),
+                                    .child(line.speaker_display(several_voices)),
                             )
                             .child(
                                 div()

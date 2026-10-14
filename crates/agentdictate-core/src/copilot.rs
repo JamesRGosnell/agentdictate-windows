@@ -483,6 +483,51 @@ pub struct TranscriptLine {
     pub text: String,
     /// Milliseconds since the session started, at speech onset.
     pub at_ms: u64,
+    /// Which of the other side's voices spoke, when they are told apart.
+    #[serde(default)]
+    pub voice: Option<u8>,
+}
+
+impl TranscriptLine {
+    /// The speaker for prompts: "Me", "Them", or "Them A" when the other
+    /// side's voices are told apart.
+    #[must_use]
+    pub fn speaker_label(&self, several_voices: bool) -> String {
+        self.name(self.speaker.label(), several_voices)
+    }
+
+    /// The speaker for people: "You", "Them", or "Them A".
+    #[must_use]
+    pub fn speaker_display(&self, several_voices: bool) -> String {
+        self.name(self.speaker.display(), several_voices)
+    }
+
+    fn name(&self, base: &str, several_voices: bool) -> String {
+        match self.voice {
+            Some(voice) if several_voices && self.speaker == Speaker::Them => {
+                format!("{base} {}", voice_letter(voice))
+            }
+            _ => base.to_owned(),
+        }
+    }
+}
+
+/// The letter naming one of the other side's voices: A, B, C...
+#[must_use]
+pub fn voice_letter(voice: u8) -> char {
+    char::from(b'A' + voice.min(25))
+}
+
+/// Whether more than one of the other side's voices spoke, so lines name
+/// them; with a single voice, "Them" stays plain.
+#[must_use]
+pub fn has_several_voices(lines: &[TranscriptLine]) -> bool {
+    let mut first = None;
+    lines
+        .iter()
+        .filter(|line| line.speaker == Speaker::Them)
+        .filter_map(|line| line.voice)
+        .any(|voice| *first.get_or_insert(voice) != voice)
 }
 
 /// Listening state shown in the bar.
@@ -708,13 +753,14 @@ pub fn format_offset(at_ms: u64) -> String {
 /// Renders the most recent transcript within `max_chars`, oldest first.
 #[must_use]
 pub fn render_transcript(lines: &[TranscriptLine], max_chars: usize) -> String {
+    let several_voices = has_several_voices(lines);
     let mut rendered = Vec::new();
     let mut used = 0;
     for line in lines.iter().rev() {
         let entry = format!(
             "[{}] {}: {}",
             format_offset(line.at_ms),
-            line.speaker.label(),
+            line.speaker_label(several_voices),
             line.text.trim()
         );
         if used + entry.len() + 1 > max_chars && !rendered.is_empty() {
@@ -734,6 +780,7 @@ pub fn answer_system_prompt(settings: &CopilotSettings) -> String {
     let mut prompt = String::from(
         "You are AgentDictate Copilot, a real-time assistant that quietly helps the user during live meetings and calls. \
 You receive a live transcript where \"Me\" is the user and \"Them\" is everyone else, and sometimes a screenshot of the user's screen. \
+When the other side has several people, their lines are labeled Them A, Them B, and so on, told apart by voice; the labels can be imperfect. \
 The transcript comes from speech recognition, so expect small recognition errors and infer the intended words.\n\n\
 How to respond:\n\
 - The user is mid-conversation and will glance at your answer. Be immediately useful and skimmable.\n\
@@ -1132,11 +1179,12 @@ pub fn meeting_notes_markdown(
     if transcript.is_empty() {
         notes.push_str("_No speech was transcribed._\n");
     }
+    let several_voices = has_several_voices(transcript);
     for line in transcript {
         notes.push_str(&format!(
             "**[{}] {}:** {}\n\n",
             format_offset(line.at_ms),
-            line.speaker.display(),
+            line.speaker_display(several_voices),
             line.text.trim()
         ));
     }
@@ -1269,6 +1317,7 @@ mod tests {
             speaker,
             text: text.into(),
             at_ms,
+            voice: None,
         }
     }
 
@@ -1533,6 +1582,7 @@ mod tests {
                 speaker: Speaker::Them,
                 text: "Can we start small?".into(),
                 at_ms: 2_000,
+                voice: None,
             }],
             &[(
                 "Can we start small?".into(),
@@ -1560,6 +1610,31 @@ mod tests {
             ..MeetingNotes::default()
         };
         assert_eq!(bullets.overview(), "Budget approved");
+    }
+
+    #[test]
+    fn the_other_sides_voices_are_named_only_when_there_are_several() {
+        let mut lines = vec![
+            line(1, Speaker::Them, "Welcome to the show.", 0),
+            line(2, Speaker::Me, "Thanks for having me.", 2_000),
+        ];
+        lines[0].voice = Some(0);
+        assert!(!has_several_voices(&lines));
+        assert_eq!(
+            render_transcript(&lines, 1_000),
+            "[0:00] Them: Welcome to the show.\n[0:02] Me: Thanks for having me."
+        );
+        let mut guest = line(3, Speaker::Them, "Happy to be here.", 4_000);
+        guest.voice = Some(1);
+        lines.push(guest);
+        assert!(has_several_voices(&lines));
+        let rendered = render_transcript(&lines, 1_000);
+        assert!(rendered.contains("[0:00] Them A: Welcome"));
+        assert!(rendered.contains("[0:04] Them B: Happy"));
+        assert!(rendered.contains("[0:02] Me: Thanks"));
+        let notes = meeting_notes_markdown("Show", "2026-10-13 09:00", 5_000, None, &lines, &[]);
+        assert!(notes.contains("**[0:04] Them B:** Happy to be here."));
+        assert!(notes.contains("**[0:02] You:** Thanks"));
     }
 
     #[test]

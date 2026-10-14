@@ -81,6 +81,16 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(failures == 0, "{failures} echo check(s) failed");
                 Ok(())
             }
+            Some("--voices") => {
+                let paths: Vec<std::path::PathBuf> =
+                    args.iter().skip(2).map(std::path::PathBuf::from).collect();
+                anyhow::ensure!(
+                    !paths.is_empty(),
+                    "usage: agentdictate copilot --voices recording.wav..."
+                );
+                agentdictate_app::run_copilot_voices(&paths)?;
+                Ok(())
+            }
             Some(other) => anyhow::bail!("unknown copilot option: {other}"),
         };
     }

@@ -124,6 +124,7 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
                                 speaker: Speaker::Them,
                                 text,
                                 at_ms: utterance.start_ms(),
+                                voice: None,
                             });
                         }
                         Err(error) => report.fail("Transcription", error),
@@ -248,6 +249,7 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
             speaker: Speaker::Them,
             text: "Quick one: what's the difference between SOC 2 Type I and Type II, and how long does a Type II audit usually take?".into(),
             at_ms: 1_000,
+            voice: None,
         }];
         let probe_user = answer_user_prompt(
             &render_transcript(&probe, 24_000),
@@ -539,4 +541,68 @@ pub(crate) fn echo_test(speech: &Path) -> anyhow::Result<usize> {
         );
     }
     Ok(failures)
+}
+
+/// Prints how the copilot tells voices apart in recordings: each file's
+/// voice print, the distances between files, and the voice each utterance
+/// is assigned as it would be live. Used to tune speaker separation.
+pub(crate) fn voices(paths: &[std::path::PathBuf]) -> anyhow::Result<usize> {
+    use super::voices::{VoiceTracker, distance, voice_print};
+    let mut prints = Vec::new();
+    let mut tracker = VoiceTracker::default();
+    for path in paths {
+        let speech = read_speech(path).map_err(anyhow::Error::msg)?;
+        let samples: Vec<i16> = speech
+            .iter()
+            .map(|sample| (sample.clamp(-1.0, 1.0) * 32_767.0) as i16)
+            .collect();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let print = voice_print(&samples);
+        match &print {
+            Some(print) => println!(
+                "{name}: pitch {} Hz, voiced {:.1} s, timbre {:?}",
+                print
+                    .log_pitch
+                    .map_or_else(|| "?".to_owned(), |pitch| format!("{:.0}", pitch.exp())),
+                print.voiced_seconds,
+                print
+                    .timbre
+                    .iter()
+                    .map(|value| (value * 10.0).round() / 10.0)
+                    .collect::<Vec<_>>()
+            ),
+            None => println!("{name}: too little voiced audio"),
+        }
+        // Live, the segmenter cuts the stream into utterances first.
+        let mut segmenter = Segmenter::new(SegmenterConfig::system_audio());
+        let mut events = segmenter.push(&speech);
+        events.extend(segmenter.push_silence(16_000));
+        for event in events {
+            if let SegmentEvent::Utterance(utterance) = event {
+                let voice = tracker.assign(voice_print(&utterance.samples));
+                println!(
+                    "      utterance at {:.1} s, {:.1} s long: voice {}",
+                    utterance.start_ms() as f32 / 1000.0,
+                    utterance.duration_ms() as f32 / 1000.0,
+                    voice.map_or_else(
+                        || "-".to_owned(),
+                        |voice| char::from(b'A' + voice).to_string()
+                    )
+                );
+            }
+        }
+        prints.push((name, print));
+    }
+    println!();
+    for (index, (left_name, left)) in prints.iter().enumerate() {
+        for (right_name, right) in prints.iter().skip(index + 1) {
+            if let (Some(left), Some(right)) = (left, right) {
+                println!("{left_name} ~ {right_name}: {:.2}", distance(left, right));
+            }
+        }
+    }
+    Ok(0)
 }
