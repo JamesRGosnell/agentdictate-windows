@@ -1,10 +1,12 @@
 //! What the copilot knows about the user beyond the conversation: documents
 //! kept in the knowledge folder and notes from earlier meetings.
 //!
-//! Every answer searches this material, so replies about the user's own
-//! business, prices, and history come from the user's own words. A small
-//! document set is given whole to every answer; larger sets and meeting notes
-//! are ranked against the question with BM25 and trimmed to a budget.
+//! The copilot knows this material from the start: documents, smallest
+//! first, and what earlier meetings concluded are given whole to every answer
+//! as a primer, up to a budget, so replies about the user's own business,
+//! prices, and history come from the user's own words without a search.
+//! Whatever does not fit, and the meetings' transcripts, is ranked against
+//! each question with BM25 and trimmed to a budget.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -12,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use agentdictate_core::KnowledgeSummary;
+use agentdictate_core::{KnowledgeSummary, parse_meeting_notes};
 
 /// Formats read as plain text.
 const TEXT_EXTENSIONS: [&str; 6] = ["md", "markdown", "txt", "text", "csv", "tsv"];
@@ -22,7 +24,7 @@ const UNREADABLE_EXTENSIONS: [&str; 11] = [
 ];
 const CHUNK_CHARS: usize = 1_200;
 /// Documents this small in total are given whole to every answer.
-const WHOLE_DOCUMENTS_CHARS: usize = 16_000;
+const PRIMER_CHARS: usize = 100_000;
 /// Document excerpts added to one answer when the set is larger.
 const DOCUMENT_BUDGET_CHARS: usize = 8_000;
 /// Excerpts from earlier meetings added to one answer.
@@ -53,6 +55,8 @@ enum Origin {
 struct Chunk {
     source: String,
     origin: Origin,
+    /// Part of the primer, so every answer already has it.
+    primed: bool,
     text: String,
     terms: HashMap<String, u32>,
     length: usize,
@@ -62,7 +66,7 @@ struct Chunk {
 #[derive(Default)]
 pub(crate) struct Knowledge {
     chunks: Vec<Chunk>,
-    document_chars: usize,
+    primer: String,
     document_frequency: HashMap<String, usize>,
     average_length: f32,
     summary: KnowledgeSummary,
@@ -74,13 +78,13 @@ impl Knowledge {
     pub(crate) fn load(documents: &Path, meetings: Option<&Path>) -> Self {
         let mut knowledge = Self::default();
         let mut unreadable = Vec::new();
+        let mut texts: Vec<(String, String)> = Vec::new();
+        let mut notes: Vec<(String, String)> = Vec::new();
         for path in files(documents) {
             match read_document(&path) {
                 Some(text) if !text.trim().is_empty() => {
-                    let source = relative_name(documents, &path);
                     knowledge.summary.documents += 1;
-                    knowledge.document_chars += text.len();
-                    knowledge.add(&source, Origin::Document, &text);
+                    texts.push((relative_name(documents, &path), text));
                 }
                 Some(_) => {}
                 None if is_unreadable_document(&path) => {
@@ -100,22 +104,64 @@ impl Knowledge {
                         .map(|stem| stem.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     knowledge.summary.meetings += 1;
-                    knowledge.add(&format!("Meeting {title}"), Origin::Meeting, &text);
+                    notes.push((format!("Meeting {title}"), text));
                 }
             }
         }
         unreadable.sort();
         unreadable.truncate(MAX_UNREADABLE_NAMES);
         knowledge.summary.unreadable = unreadable;
-        knowledge.index();
+        knowledge.build(texts, notes);
         knowledge
+    }
+
+    /// Writes the primer and indexes everything for search. Small documents
+    /// come first so as many as possible are known whole; then what earlier
+    /// meetings concluded, newest first.
+    fn build(&mut self, mut documents: Vec<(String, String)>, mut meetings: Vec<(String, String)>) {
+        documents.sort_by(|left, right| (left.1.len(), &left.0).cmp(&(right.1.len(), &right.0)));
+        let mut primer = String::new();
+        for (source, text) in &documents {
+            let entry = format!("[{source}]\n{}\n\n", text.trim());
+            let primed = primer.len() + entry.len() <= PRIMER_CHARS;
+            if primed {
+                primer.push_str(&entry);
+            }
+            self.add(source, Origin::Document, text, primed);
+        }
+        // Meeting files are named by when they started.
+        meetings.sort_by(|left, right| right.0.cmp(&left.0));
+        for (source, text) in &meetings {
+            let notes = parse_meeting_notes(text);
+            let summary = notes.summary.trim();
+            if !summary.is_empty() {
+                let mut entry = format!("[{source}]\n");
+                if !notes.with.is_empty() {
+                    entry.push_str(&format!("With: {}\n", notes.with));
+                }
+                entry.push_str(summary);
+                entry.push_str("\n\n");
+                if primer.len() + entry.len() <= PRIMER_CHARS {
+                    primer.push_str(&entry);
+                }
+            }
+            // Transcripts stay searchable for details the summary left out.
+            self.add(source, Origin::Meeting, text, false);
+        }
+        self.primer = primer.trim_end().to_owned();
+        self.index();
+    }
+
+    /// What every answer is given about the user from the start.
+    pub(crate) fn primer(&self) -> &str {
+        &self.primer
     }
 
     pub(crate) fn summary(&self) -> KnowledgeSummary {
         self.summary.clone()
     }
 
-    fn add(&mut self, source: &str, origin: Origin, text: &str) {
+    fn add(&mut self, source: &str, origin: Origin, text: &str, primed: bool) {
         self.summary.words += text.split_whitespace().count();
         for piece in chunk_text(text) {
             let tokens = tokens(&piece);
@@ -126,6 +172,7 @@ impl Knowledge {
             self.chunks.push(Chunk {
                 source: source.to_owned(),
                 origin,
+                primed,
                 text: piece,
                 terms,
                 length: tokens.len().max(1),
@@ -145,8 +192,9 @@ impl Knowledge {
     }
 
     /// Excerpts for answering `focus`, the question at hand, with `context`
-    /// (the surrounding conversation) weighing in less. Each excerpt is
-    /// labeled with its source; empty when nothing applies.
+    /// (the surrounding conversation) weighing in less, from what the primer
+    /// left out. Each excerpt is labeled with its source; empty when nothing
+    /// applies.
     pub(crate) fn excerpts(&self, focus: &str, context: &str) -> String {
         let mut query: HashMap<String, f32> = HashMap::new();
         for token in tokens(context) {
@@ -155,16 +203,7 @@ impl Knowledge {
         for token in tokens(focus) {
             *query.entry(token).or_insert(0.0) += 1.0;
         }
-        let mut picked: Vec<&Chunk> = Vec::new();
-        if self.document_chars <= WHOLE_DOCUMENTS_CHARS {
-            picked.extend(
-                self.chunks
-                    .iter()
-                    .filter(|chunk| chunk.origin == Origin::Document),
-            );
-        } else {
-            picked.extend(self.best(&query, Origin::Document, DOCUMENT_BUDGET_CHARS, 1));
-        }
+        let mut picked: Vec<&Chunk> = self.best(&query, Origin::Document, DOCUMENT_BUDGET_CHARS, 1);
         picked.extend(self.best(
             &query,
             Origin::Meeting,
@@ -204,7 +243,7 @@ impl Knowledge {
             .chunks
             .iter()
             .enumerate()
-            .filter(|(_, chunk)| chunk.origin == origin)
+            .filter(|(_, chunk)| chunk.origin == origin && !chunk.primed)
             .filter_map(|(index, chunk)| {
                 let mut shared = 0;
                 let mut score = 0.0;
@@ -581,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn small_document_sets_are_given_whole_with_their_sources() {
+    fn documents_are_known_whole_from_the_start() {
         let folder = tempfile::tempdir().unwrap();
         write(
             folder.path(),
@@ -599,29 +638,38 @@ mod tests {
         let summary = knowledge.summary();
         assert_eq!((summary.documents, summary.meetings), (2, 0));
         assert_eq!(summary.unreadable, vec!["deck.pdf"]);
-        let excerpts = knowledge.excerpts("What's the weather?", "");
-        assert!(excerpts.contains("[pricing.md]\n# Pricing\n\nGrowth plan: $49 per seat"));
-        assert!(excerpts.contains("[team/bio.txt]\nJames founded LeadLord"));
+        let primer = knowledge.primer();
+        assert!(primer.contains("[pricing.md]\n# Pricing\n\nGrowth plan: $49 per seat"));
+        assert!(primer.contains("[team/bio.txt]\nJames founded LeadLord"));
+        // The smaller document comes first.
+        assert!(primer.find("bio.txt") < primer.find("pricing.md"));
+        // What the primer holds is never searched again.
+        assert_eq!(knowledge.excerpts("Growth plan pricing?", ""), "");
     }
 
     #[test]
-    fn large_document_sets_and_meetings_are_searched() {
+    fn what_the_primer_cannot_hold_and_meeting_transcripts_are_searched() {
         let folder = tempfile::tempdir().unwrap();
         let meetings = tempfile::tempdir().unwrap();
-        for index in 0..30 {
-            write(
-                folder.path(),
-                &format!("notes-{index:02}.md"),
-                &format!(
-                    "Unrelated filler about topic {index}. {}",
-                    "Lorem ipsum dolor. ".repeat(40)
-                ),
-            );
-        }
         write(
             folder.path(),
             "security.md",
             "# Security\n\nWe are SOC 2 Type II certified and encrypt data at rest.",
+        );
+        // Larger than the whole primer, so only searched.
+        let mut handbook = "# Handbook\n\n".to_owned();
+        for index in 0..PRIMER_CHARS / 400 {
+            handbook.push_str(&format!(
+                "Section {index}. Unrelated filler about office logistics and supplies. {}\n\n",
+                "Lorem ipsum dolor sit amet. ".repeat(12)
+            ));
+        }
+        handbook.push_str("## Benefits\n\nParental leave is sixteen weeks, fully paid.\n");
+        write(folder.path(), "handbook.md", &handbook);
+        write(
+            meetings.path(),
+            "2026-10-02 1000 Pilot planning.md",
+            "# Pilot planning\n\n- **Started:** 2026-10-02 10:00\n- **With:** Sam Lee\n\n## Summary\n\nAgreed on a 25-seat pilot.\n\n## Transcript\n\n**[0:02] Sam Lee:** Can we start small?\n",
         );
         write(
             meetings.path(),
@@ -634,13 +682,25 @@ mod tests {
             "Discussed hiring a designer.",
         );
         let knowledge = Knowledge::load(folder.path(), Some(meetings.path()));
-        assert_eq!(knowledge.summary().meetings, 2);
-        let excerpts = knowledge.excerpts("Are you SOC 2 certified?", "We care about security.");
-        assert!(excerpts.contains("[security.md]"));
-        assert!(excerpts.contains("[Meeting 2026-10-01 0900 Acme renewal]"));
-        assert!(!excerpts.contains("Hiring sync"));
-        assert!(!excerpts.contains("notes-00.md"));
-        assert!(excerpts.len() < DOCUMENT_BUDGET_CHARS + MEETING_BUDGET_CHARS + 200);
+        assert_eq!(knowledge.summary().meetings, 3);
+        let primer = knowledge.primer();
+        assert!(primer.contains("[security.md]"));
+        assert!(!primer.contains("Handbook"));
+        assert!(primer.contains(
+            "[Meeting 2026-10-02 1000 Pilot planning]\nWith: Sam Lee\nAgreed on a 25-seat pilot."
+        ));
+        assert!(!primer.contains("Can we start small?"));
+        assert!(primer.len() <= PRIMER_CHARS);
+        let leave = knowledge.excerpts("How long is parental leave?", "");
+        assert!(leave.contains("[handbook.md]"));
+        assert!(leave.contains("sixteen weeks"));
+        assert!(!leave.contains("[security.md]"));
+        assert!(leave.len() < DOCUMENT_BUDGET_CHARS + MEETING_BUDGET_CHARS + 200);
+        let soc = knowledge.excerpts("Are you SOC 2 certified?", "We care about security.");
+        assert!(soc.contains("[Meeting 2026-10-01 0900 Acme renewal]"));
+        assert!(!soc.contains("Hiring sync"));
+        let start = knowledge.excerpts("Can we start small?", "");
+        assert!(start.contains("[Meeting 2026-10-02 1000 Pilot planning]"));
     }
 
     #[test]
@@ -652,7 +712,7 @@ mod tests {
         assert_eq!(knowledge.summary().documents, 1);
         assert!(
             knowledge
-                .excerpts("", "")
+                .primer()
                 .contains("[case.docx]\nCase study: Acme & Co\nSaved 40%")
         );
     }

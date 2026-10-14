@@ -126,6 +126,13 @@ pub fn run_copilot_rewrites(model: Option<&str>) -> anyhow::Result<usize> {
     check::rewrites(model)
 }
 
+/// Measures what priming answers with the user's knowledge buys. Returns the
+/// number of failed checks.
+#[cfg(windows)]
+pub fn run_copilot_primer(instant: Option<&str>) -> anyhow::Result<usize> {
+    check::primer(instant)
+}
+
 /// Reads the meeting window once, as live naming does. Returns the number of
 /// failed checks.
 #[cfg(windows)]

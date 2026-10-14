@@ -125,18 +125,26 @@ copilot quotes your real prices, offer, and results instead of guessing.
 - **Knowledge folder.** In the copilot settings, choose **Open knowledge
   folder** and add pricing sheets, product docs, case studies, FAQs, or your
   resume as Word (`.docx`), Markdown, text, or CSV files. Subfolders are read
-  too. The folder is `%LOCALAPPDATA%\AgentDictate\knowledge`. A small set of
-  documents is given whole to every answer; a larger one is searched for the
-  parts that match the question. Changes are picked up within seconds, even
-  mid-call. PDFs and slides cannot be read yet; settings lists any it skipped
+  too. The folder is `%LOCALAPPDATA%\AgentDictate\knowledge`. The copilot
+  knows your documents from the start: every answer is given them whole,
+  smallest first, up to about 100,000 characters (some 25,000 words), and only
+  what does not fit is searched for the parts that match the question. The
+  session sends this to the answer models once when it starts, so the first
+  question does not wait for them to read it. Changes are picked up within
+  seconds, even mid-call. PDFs and slides cannot be read yet; settings lists any it skipped
   so you can save them as Word or text.
-- **Past meetings.** With **Remember past meetings** on, answers can also draw
-  on notes from your earlier meetings, such as what a client asked last time.
+- **Past meetings.** With **Remember past meetings** on, answers also know what
+  your earlier meetings concluded, newest first, and search their transcripts
+  for details, such as what a client asked last time.
 - **About you** and **Standing instructions** describe your role and how you
   like answers written; they apply to every answer.
 
 When nothing in your material covers a question, the copilot answers from
-general knowledge and web search, and never invents facts about your business.
+general knowledge, and never invents facts about your business. It searches the
+web only when it is not sure of an answer or the answer depends on facts that
+change, such as current prices, news, or recent releases; `agentdictate copilot
+--primer [instant-model]` checks this and the priming speed with the live
+models.
 
 ## Speakers and echo
 

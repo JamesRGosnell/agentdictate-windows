@@ -101,6 +101,9 @@ const LOOK_PAUSE: Duration = Duration::from_secs(180);
 const SHOT_TTL: Duration = Duration::from_secs(30);
 /// Slack when matching a capture to the speech it was taken during.
 const SHOT_SLACK_MS: u64 = 300;
+/// Primers shorter than this are cheap to read cold; longer ones are sent
+/// once at the start so the first answer reuses them.
+const PRIME_MIN_CHARS: usize = 4_000;
 /// The Claude model that rewrites through the claude CLI.
 const CLAUDE_REWRITE_MODEL: &str = "sonnet";
 /// Names seen in the meeting window kept for the user to pick from.
@@ -390,6 +393,8 @@ pub(crate) struct Engine {
     knowledge_fingerprint: Option<u64>,
     knowledge_loading: bool,
     knowledge_checked_at: Instant,
+    /// The answer lanes have read the primer.
+    primed: bool,
     notes_path: Option<PathBuf>,
     /// The follow-up email written with the notes.
     follow_up_email: Option<EmailDraft>,
@@ -450,6 +455,7 @@ impl Engine {
             knowledge_fingerprint: None,
             knowledge_loading: false,
             knowledge_checked_at: Instant::now(),
+            primed: false,
             notes_path: None,
             follow_up_email: None,
             next_answer: 1,
@@ -599,6 +605,64 @@ impl Engine {
         }
     }
 
+    /// Sends the answer lanes their standing instructions, with everything
+    /// the copilot knows about the user, once at the start: the provider
+    /// keeps them read, so the first question is as quick as later ones.
+    fn prime_answer_lanes(&mut self) {
+        if self.primed
+            || self.knowledge.primer().len() < PRIME_MIN_CHARS
+            || self.settings.provider == CopilotProvider::ClaudeCode
+        {
+            return;
+        }
+        self.primed = true;
+        let system = answer_system_prompt(&self.settings, self.knowledge.primer());
+        let lanes = [
+            (
+                self.settings.fast_model(),
+                false,
+                format!("{}-instant", self.session_key),
+            ),
+            (
+                self.settings.answer_model(),
+                self.settings.web_search,
+                self.session_key.clone(),
+            ),
+        ];
+        for (model, web_search, cache_key) in lanes {
+            let mut settings = self.settings.clone();
+            settings.set_answer_model(model.clone());
+            let request = AnswerRequest {
+                system: system.clone(),
+                user: "Reply with OK.".to_owned(),
+                image_jpeg: None,
+                model,
+                effort: CopilotEffort::Low,
+                web_search,
+                max_output_tokens: 16,
+                cache_key,
+            };
+            let providers = Arc::clone(&self.services.providers);
+            let _ = std::thread::Builder::new()
+                .name("copilot-prime".into())
+                .spawn(move || {
+                    let started = Instant::now();
+                    let cancel = AtomicBool::new(false);
+                    let result = providers(&settings)
+                        .and_then(|provider| complete(provider.as_ref(), &request, &cancel));
+                    match result {
+                        Ok(_) => tracing::info!(
+                            model = %request.model,
+                            chars = request.system.len(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "copilot answer lane primed with the user's knowledge"
+                        ),
+                        Err(error) => tracing::warn!(%error, "copilot priming failed"),
+                    }
+                });
+        }
+    }
+
     /// The folders answers draw on: the knowledge folder, plus meeting notes
     /// when the user allows it.
     fn knowledge_folders(&self) -> (PathBuf, Option<PathBuf>) {
@@ -735,6 +799,7 @@ impl Engine {
                 self.knowledge_fingerprint = Some(fingerprint);
                 self.knowledge_loading = false;
                 (self.ui)(CopilotEvent::Knowledge(summary));
+                self.prime_answer_lanes();
             }
             EngineMsg::WindowCaptured { at_ms, shot } => {
                 self.looks.busy = false;
@@ -1481,6 +1546,7 @@ impl Engine {
             ANSWER_TRANSCRIPT_CHARS,
         );
         let knowledge = self.knowledge_for(&kind);
+        let known = Arc::clone(&self.knowledge);
         let settings = self.settings.clone();
         let fast_model = settings.fast_model();
         // The instant draft also helps when it uses the answer model: without
@@ -1507,7 +1573,7 @@ impl Engine {
                 } else {
                     None
                 };
-                let system = answer_system_prompt(&settings);
+                let system = answer_system_prompt(&settings, known.primer());
                 let user =
                     answer_user_prompt(&transcript, &instruction, image.is_some(), &knowledge);
                 let instant_text = Arc::new(Mutex::new(String::new()));
@@ -1708,7 +1774,7 @@ impl Engine {
             RewriteEngine::Quickest => (fallback, None),
         };
         let mut request = AnswerRequest {
-            system: answer_system_prompt(&self.settings),
+            system: answer_system_prompt(&self.settings, self.knowledge.primer()),
             user: answer_user_prompt(
                 &transcript,
                 &rewrite_instruction(style, line, details),
@@ -1777,13 +1843,15 @@ impl Engine {
                 };
                 if let Some(error) = &error {
                     tracing::warn!(%error, "copilot rewrite failed");
-                } else {
+                }
+                let rewritten = error.is_none();
+                ui(CopilotEvent::RewriteFinished { id, error });
+                if rewritten {
                     let _ = messages.send(EngineMsg::Rewritten {
                         id,
                         text: text.trim().to_owned(),
                     });
                 }
-                ui(CopilotEvent::RewriteFinished { id, error });
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a copilot rewrite");
@@ -2903,7 +2971,7 @@ mod tests {
         assert!(!requests.is_empty());
         assert!(requests.iter().all(|request| {
             request
-                .user
+                .system
                 .contains("<my_knowledge>\n[pricing.md]\nGrowth plan: $49 per seat.")
         }));
     }
@@ -3689,6 +3757,58 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, CopilotEvent::RewriteFinished { id: 2, error: None }))
         );
+    }
+
+    #[test]
+    fn answers_know_the_user_from_the_start_and_the_lanes_are_primed() {
+        let (mut engine, incoming, _events, requests, directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        let documents = directory.path().join("knowledge");
+        std::fs::create_dir_all(&documents).unwrap();
+        let policy = format!(
+            "# Refunds\n\nRefunds within 30 days. {}",
+            "Details. ".repeat(600)
+        );
+        std::fs::write(documents.join("refunds.md"), &policy).unwrap();
+        engine.handle(EngineMsg::KnowledgeLoaded {
+            knowledge: Arc::new(Knowledge::load(&documents, None)),
+            fingerprint: 1,
+        });
+        wait_for_requests(&requests, 2);
+        {
+            let requests = requests.lock().unwrap();
+            let keys: Vec<&str> = requests
+                .iter()
+                .map(|request| request.cache_key.as_str())
+                .collect();
+            assert!(keys.contains(&format!("{}-instant", engine.session_key).as_str()));
+            assert!(keys.contains(&engine.session_key.as_str()));
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.system.contains("Refunds within 30 days."))
+            );
+        }
+        // A reload does not prime again.
+        engine.handle(EngineMsg::KnowledgeLoaded {
+            knowledge: Arc::new(Knowledge::load(&documents, None)),
+            fingerprint: 2,
+        });
+        engine.handle_action(CopilotAction::Assist);
+        drain(&mut engine, &incoming);
+        let requests = requests.lock().unwrap();
+        let answers: Vec<&AnswerRequest> = requests
+            .iter()
+            .filter(|request| request.user != "Reply with OK.")
+            .collect();
+        assert!(!answers.is_empty());
+        assert!(answers.iter().all(|request| {
+            request.system.contains("Refunds within 30 days.")
+                && !request.user.contains("Refunds within 30 days.")
+        }));
+        assert_eq!(requests.len() - answers.len(), 2);
     }
 
     #[test]

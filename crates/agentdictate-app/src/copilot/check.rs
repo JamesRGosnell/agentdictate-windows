@@ -206,7 +206,7 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
         };
     let transcript_text = render_transcript(&transcript, &VoiceNames::new(), 24_000);
     let request = AnswerRequest {
-        system: answer_system_prompt(&settings),
+        system: answer_system_prompt(&settings, ""),
         user: answer_user_prompt(&transcript_text, &instruction, false, ""),
         image_jpeg: None,
         model: settings.answer_model(),
@@ -274,7 +274,7 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
                 let mut model_settings = settings.clone();
                 model_settings.set_answer_model(*model);
                 let timed = AnswerRequest {
-                    system: answer_system_prompt(&settings),
+                    system: answer_system_prompt(&settings, ""),
                     user: format!("{probe_user}\n\n{}", agentdictate_core::INSTANT_GUIDANCE),
                     image_jpeg: None,
                     model: (*model).to_owned(),
@@ -929,7 +929,7 @@ and annual billing saves you a fair bit compared with paying monthly.";
             ""
         };
         let request = AnswerRequest {
-            system: answer_system_prompt(&settings),
+            system: answer_system_prompt(&settings, ""),
             user: answer_user_prompt(
                 &transcript,
                 &rewrite_instruction(style, line, ""),
@@ -978,13 +978,13 @@ and annual billing saves you a fair bit compared with paying monthly.";
         }
     }
     // A draft that bought time becomes specific from what research found.
-    let draft = "Great question. For a team your size you'd be on our annual volume tier. \
+    let draft = "Great question. For forty seats you'd be on our growth plan. \
 Let me give you the exact number.";
     let researched = format!(
-        "{draft}\n\nFor 200 seats on annual billing it's $18 per seat per month, about $43,200 a year."
+        "{draft}\n\nFor 40 seats on annual billing it's $18 per seat per month, about $8,640 a year."
     );
     let request = AnswerRequest {
-        system: answer_system_prompt(&settings),
+        system: answer_system_prompt(&settings, ""),
         user: answer_user_prompt(
             &transcript,
             &rewrite_instruction(RewriteStyle::Specific, draft, &researched),
@@ -1001,7 +1001,7 @@ Let me give you the exact number.";
     let started = Instant::now();
     let cancel = AtomicBool::new(false);
     match providers::complete(provider.as_ref(), &request, &cancel) {
-        Ok(text) if text.contains("18") || text.contains("43,200") => report.pass(
+        Ok(text) if text.contains("18") || text.contains("8,640") => report.pass(
             "More specific from research",
             format!("{} ms: {}", started.elapsed().as_millis(), text.trim()),
         ),
@@ -1012,4 +1012,137 @@ Let me give you the exact number.";
         Err(error) => report.fail("More specific from research", error),
     }
     Ok(report.failures)
+}
+
+/// Measures what priming buys with the live models: a large synthetic
+/// handbook goes into the standing instructions, then questions check that
+/// answers come from it without a web search, that current facts still get
+/// searched, and how quickly a primed lane starts compared with a cold one.
+pub(crate) fn primer(instant: Option<&str>) -> anyhow::Result<usize> {
+    use agentdictate_core::answer_user_prompt;
+
+    let mut report = Report { failures: 0 };
+    let paths = crate::AppPaths::from_environment()?;
+    let settings = store::load(&store::settings_path(&paths.config_file));
+    let chatgpt = Arc::new(ChatGptCredentials::discover());
+    // About 60,000 characters of company facts, one of which is asked about.
+    let mut handbook = String::from("[handbook.md]\n# Northwind Sales Handbook\n\n");
+    for index in 0..120 {
+        handbook.push_str(&format!(
+            "## Product note {index}\nThe Northwind module {index} syncs inventory every {} minutes, supports {} warehouses, \
+and is included in the Growth and Enterprise plans. Customers in retail and logistics use it to cut stockouts.\n\n",
+            5 + index % 10,
+            2 + index % 7
+        ));
+    }
+    handbook.push_str("## Enterprise SLA\nThe Enterprise plan guarantees 99.95% monthly uptime, with service credits of 10% per 0.1% below it.\n");
+    let system = answer_system_prompt(&settings, &handbook);
+    println!(
+        "Primer check: {} characters of knowledge; instant {}, researched {}",
+        handbook.len(),
+        settings.fast_model(),
+        settings.answer_model()
+    );
+    let transcript = "[0:03] Them: Before we sign, I need to know about reliability.";
+    let ask = |model: &str,
+               web_search: bool,
+               cache_key: &str,
+               question: &str|
+     -> Result<(u128, u128, Vec<String>, String), String> {
+        let mut lane = settings.clone();
+        lane.set_answer_model(model.to_owned());
+        let provider = providers::provider_for(&lane, &chatgpt, "", &[])?;
+        let request = AnswerRequest {
+            system: system.clone(),
+            user: answer_user_prompt(
+                transcript,
+                &detected_question_instruction(question),
+                false,
+                "",
+            ),
+            image_jpeg: None,
+            model: model.to_owned(),
+            effort: CopilotEffort::Low,
+            web_search,
+            max_output_tokens: 1024,
+            cache_key: cache_key.to_owned(),
+        };
+        let started = Instant::now();
+        let cancel = AtomicBool::new(false);
+        let mut first = None;
+        let mut searches = Vec::new();
+        let mut text = String::new();
+        provider.stream(&request, &cancel, &mut |event| match event {
+            StreamEvent::Text(delta) => {
+                first.get_or_insert_with(|| started.elapsed().as_millis());
+                text.push_str(&delta);
+            }
+            StreamEvent::Searching(query) => searches.push(query),
+            _ => {}
+        })?;
+        Ok((
+            first.unwrap_or_default(),
+            started.elapsed().as_millis(),
+            searches,
+            text,
+        ))
+    };
+    let session = uuid::Uuid::new_v4().to_string();
+    // The instant lane, cold and then primed under the same cache key.
+    let instant = instant.map_or_else(|| settings.fast_model(), str::to_owned);
+    let key = format!("{session}-instant");
+    for (label, question) in [
+        ("Instant lane, cold", "What uptime do you guarantee?"),
+        ("Instant lane, primed", "And what if you miss it?"),
+    ] {
+        match ask(&instant, false, &key, question) {
+            Ok((first, total, _, text)) => report.pass(
+                label,
+                format!(
+                    "first text {first} ms, done {total} ms: {}",
+                    one_line(&text)
+                ),
+            ),
+            Err(error) => report.fail(label, error),
+        }
+    }
+    // The researched lane answers from the handbook without searching, and
+    // still searches for facts that change.
+    let researched = settings.answer_model();
+    for (label, question, wants_search, expected) in [
+        (
+            "Known fact, no search",
+            "What uptime does your Enterprise plan guarantee?",
+            false,
+            "99.95",
+        ),
+        (
+            "Current fact, searched",
+            "What is the latest stable version of the Rust compiler?",
+            true,
+            "",
+        ),
+    ] {
+        match ask(&researched, settings.web_search, &session, question) {
+            Ok((first, total, searches, text)) => {
+                let searched = !searches.is_empty();
+                let detail = format!(
+                    "first text {first} ms, done {total} ms, searches {searches:?}: {}",
+                    one_line(&text)
+                );
+                if searched == wants_search && text.contains(expected) {
+                    report.pass(label, detail);
+                } else {
+                    report.fail(label, detail);
+                }
+            }
+            Err(error) => report.fail(label, error),
+        }
+    }
+    Ok(report.failures)
+}
+
+fn one_line(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    line.chars().take(140).collect()
 }

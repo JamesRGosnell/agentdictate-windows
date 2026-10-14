@@ -406,6 +406,9 @@ impl AnswerProvider for AnthropicProvider {
     }
 }
 
+/// Longest system prompt passed on Claude Code's command line.
+const SYSTEM_PROMPT_ARGUMENT_CHARS: usize = 8_000;
+
 /// Claude Code in headless mode, which answers with the user's Claude
 /// subscription and its built-in web tools.
 struct ClaudeCodeProvider {
@@ -480,13 +483,26 @@ impl AnswerProvider for ClaudeCodeProvider {
                 tools,
                 "--allowedTools",
                 tools,
-                "--system-prompt",
-                &request.system,
             ])
             .current_dir(claude_code_workspace())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Instructions primed with the user's knowledge outgrow a command
+        // line (32,767 characters on Windows), so they go in a file.
+        if request.system.len() > SYSTEM_PROMPT_ARGUMENT_CHARS {
+            let mut hasher = std::hash::DefaultHasher::new();
+            std::hash::Hash::hash(&request.system, &mut hasher);
+            let file = claude_code_workspace().join(format!(
+                "system-{:016x}.md",
+                std::hash::Hasher::finish(&hasher)
+            ));
+            std::fs::write(&file, &request.system)
+                .map_err(|error| format!("Could not prepare Claude Code: {error}"))?;
+            command.arg("--system-prompt-file").arg(file);
+        } else {
+            command.args(["--system-prompt", &request.system]);
+        }
         for (name, _) in std::env::vars_os() {
             let name = name.to_string_lossy().to_string();
             if name.starts_with("CLAUDE_CODE_")
@@ -633,6 +649,33 @@ pub(crate) fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the signed-in claude CLI: `cargo test -p agentdictate-app --lib
+    /// long_system_prompts_reach_claude_code -- --ignored`.
+    #[test]
+    #[ignore = "needs a signed-in claude CLI"]
+    fn long_system_prompts_reach_claude_code() {
+        let provider = ClaudeCodeProvider {
+            binary: claude_code_binary().expect("claude CLI"),
+        };
+        let mut system = "Answer with the codeword from the notes below.\n".to_owned();
+        system.push_str(&"Filler note about nothing in particular. ".repeat(400));
+        system.push_str("\nThe codeword is PERIWINKLE.");
+        assert!(system.len() > SYSTEM_PROMPT_ARGUMENT_CHARS);
+        let request = AnswerRequest {
+            system,
+            user: "What is the codeword?".into(),
+            image_jpeg: None,
+            model: "haiku".into(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 64,
+            cache_key: "test".into(),
+        };
+        let cancel = AtomicBool::new(false);
+        let text = complete(&provider, &request, &cancel).unwrap();
+        assert!(text.to_uppercase().contains("PERIWINKLE"), "{text}");
+    }
 
     fn request() -> AnswerRequest {
         AnswerRequest {

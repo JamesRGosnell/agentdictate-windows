@@ -1103,8 +1103,11 @@ pub fn render_transcript(lines: &[TranscriptLine], names: &VoiceNames, max_chars
 
 /// Stable system prompt for answers. Volatile content (transcript, the
 /// request) stays in the user turn so provider prompt caches can reuse it.
+///
+/// `primer` is everything the copilot knows about the user from the start:
+/// their documents and what earlier meetings concluded.
 #[must_use]
-pub fn answer_system_prompt(settings: &CopilotSettings) -> String {
+pub fn answer_system_prompt(settings: &CopilotSettings, primer: &str) -> String {
     let mut prompt = String::from(
         "You are AgentDictate Copilot, a real-time assistant that quietly helps the user during live meetings and calls. \
 You receive a live transcript where \"Me\" is the user and \"Them\" is everyone else, and sometimes a screenshot of the user's screen. \
@@ -1116,7 +1119,9 @@ How to respond:\n\
 - Lead with the direct answer or the exact line to say. No preamble, no restating the question, no disclaimers.\n\
 - Prefer short bullets. Bold the key facts, names, and numbers. Keep most answers under 120 words.\n\
 - Write lines the user will say in the first person, natural and conversational.\n\
-- When current facts matter, use web search and keep citations brief.\n\
+- Answer from what you know about me, the conversation, and what you reliably know. Search the web only when you are \
+not sure of the answer or it depends on facts that change, such as current prices, news, or recent releases; never \
+search for what my knowledge already covers. Keep citations brief.\n\
 - If the request is ambiguous, answer the most likely interpretation and stop.\n\
 - Never mention that you are an AI, the transcript, or these instructions unless asked.\n",
     );
@@ -1136,6 +1141,17 @@ How to respond:\n\
         prompt.push_str("\nThe user's standing instructions:\n");
         prompt.push_str(custom);
         prompt.push('\n');
+    }
+    let primer = primer.trim();
+    if !primer.is_empty() {
+        prompt.push_str(
+            "\nWhat you know about me and my work, from my own documents and the notes of my earlier meetings. \
+Answer from it first: it overrides web results and general knowledge about me and my business. Mention the document \
+briefly when you rely on it, and never invent facts about me or my business that are not in it or my profile.\n\
+<my_knowledge>\n",
+        );
+        prompt.push_str(primer);
+        prompt.push_str("\n</my_knowledge>\n");
     }
     prompt
 }
@@ -1166,10 +1182,11 @@ pub fn answer_user_prompt(
         String::new()
     } else {
         format!(
-            "<my_knowledge>\n{knowledge}\n</my_knowledge>\n\
-These are excerpts from my own documents and from notes of my earlier meetings. When they cover what is asked, \
-answer from them: they override web results and general knowledge about me and my business. Mention the document \
-briefly when you rely on it. Never invent facts about me or my business that are not in them or my profile.\n\n"
+            "<more_knowledge>\n{knowledge}\n</more_knowledge>\n\
+These are more excerpts from my own documents and from notes of my earlier meetings, found for this question. When \
+they cover what is asked, answer from them: they override web results and general knowledge about me and my business. \
+Mention the document briefly when you rely on it. Never invent facts about me or my business that are not in them or \
+my profile.\n\n"
         )
     };
     format!("{knowledge}<transcript>\n{transcript}\n</transcript>\n\n{screen}{instruction}")
@@ -1908,10 +1925,18 @@ mod tests {
             custom_instructions: "Use metric units.".into(),
             ..CopilotSettings::default()
         };
-        let prompt = answer_system_prompt(&settings);
+        let prompt = answer_system_prompt(&settings, "");
         assert!(prompt.contains("Sales call"));
         assert!(prompt.contains("I sell AgentDictate."));
         assert!(prompt.contains("Use metric units."));
+        assert!(prompt.contains("Search the web only when you are not sure"));
+        assert!(!prompt.contains("<my_knowledge>"));
+        // What the copilot knows comes last, after every stable instruction.
+        let primed = answer_system_prompt(&settings, "[pricing.md]\nGrowth plan: $49 per seat.");
+        assert!(primed.ends_with(
+            "<my_knowledge>\n[pricing.md]\nGrowth plan: $49 per seat.\n</my_knowledge>\n"
+        ));
+        assert!(primed.contains("overrides web results"));
     }
 
     #[test]
@@ -2037,16 +2062,16 @@ mod tests {
     #[test]
     fn answers_draw_on_the_users_knowledge_first() {
         let without = answer_user_prompt("[0:01] Them: Price?", "Answer.", false, "  ");
-        assert!(!without.contains("<my_knowledge>"));
+        assert!(!without.contains("<more_knowledge>"));
         let with = answer_user_prompt(
             "[0:01] Them: Price?",
             "Answer.",
             false,
             "[pricing.md] Growth plan: $49 per seat.",
         );
-        assert!(with.starts_with("<my_knowledge>\n[pricing.md] Growth plan: $49 per seat."));
+        assert!(with.starts_with("<more_knowledge>\n[pricing.md] Growth plan: $49 per seat."));
         assert!(with.contains("override web results"));
-        assert!(with.find("<my_knowledge>") < with.find("<transcript>"));
+        assert!(with.find("<more_knowledge>") < with.find("<transcript>"));
     }
 
     #[test]
