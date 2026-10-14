@@ -12,7 +12,7 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings,
-    KnowledgeSummary, ListenState, QuickAction, Situation,
+    KnowledgeSummary, ListenState, QuickAction, Situation, Speaker, TranscriptLine,
 };
 use agentdictate_ui::{
     CopilotShape, CopilotViewModel, CopilotWindow, CopilotWindowHost, test_support,
@@ -240,6 +240,7 @@ fn quick_actions_and_detected_questions_reach_the_engine(cx: &mut TestAppContext
         question: Some("What is the annual price?".into()),
         suggestions: Vec::new(),
         situation: Situation::Unclear,
+        ..CopilotInsights::default()
     }));
     assert!(!harness.has("copilot-situation"));
     // Insights open the panel once, unless the user collapsed it.
@@ -402,6 +403,86 @@ fn the_first_run_welcome_explains_the_copilot_and_is_dismissed_once(cx: &mut Tes
         &actions[1],
         CopilotAction::UpdateSettings(settings) if settings.onboarded
     ));
+}
+
+fn them(id: u64, voice: u8, text: &str, at_ms: u64) -> TranscriptLine {
+    TranscriptLine {
+        id,
+        speaker: Speaker::Them,
+        text: text.into(),
+        at_ms,
+        voice: Some(voice),
+    }
+}
+
+#[gpui::test]
+fn the_other_sides_people_are_named_by_click_or_from_the_screen(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Transcript(them(
+        1,
+        0,
+        "Thanks for joining.",
+        0,
+    )));
+    harness.send(CopilotEvent::Transcript(them(
+        2,
+        1,
+        "Glad to be here.",
+        2_000,
+    )));
+    harness.send(CopilotEvent::Speakers {
+        names: [(0, "Sam Lee".to_owned())].into(),
+        seen: vec!["Sam Lee".into(), "Joey Tran".into()],
+    });
+    harness
+        .view
+        .update(harness.cx, |view, cx| view.show_transcript(cx));
+    harness.cx.run_until_parked();
+    assert!(harness.has("copilot-person-0") && harness.has("copilot-person-1"));
+
+    // Clicking Them B's line offers the names on screen nobody has yet.
+    harness.click("copilot-speaker-2");
+    assert!(
+        harness
+            .host_calls()
+            .iter()
+            .any(|call| call == "begin typing")
+    );
+    harness.click("copilot-name-suggestion-0");
+    assert_eq!(
+        harness.actions(),
+        vec![CopilotAction::NameSpeaker {
+            voice: 1,
+            name: "Joey Tran".into(),
+        }]
+    );
+
+    // A name can be forgotten and typed instead.
+    harness.click("copilot-person-0");
+    harness.click("copilot-name-clear");
+    harness.click("copilot-person-0");
+    harness.cx.simulate_input("Samuel");
+    harness.cx.simulate_keystrokes("enter");
+    harness.cx.run_until_parked();
+    assert_eq!(
+        harness.actions()[1..],
+        [
+            CopilotAction::NameSpeaker {
+                voice: 0,
+                name: String::new(),
+            },
+            CopilotAction::NameSpeaker {
+                voice: 0,
+                name: "Samuel".into(),
+            },
+        ]
+    );
+    assert!(
+        harness
+            .host_calls()
+            .iter()
+            .any(|call| call == "end typing true")
+    );
 }
 
 #[gpui::test]

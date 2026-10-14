@@ -17,11 +17,12 @@ use std::{
 };
 
 use agentdictate_core::{
-    AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights, CopilotProvider,
-    CopilotSettings, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction, Speaker,
-    TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt, combined_answer,
-    detected_question_instruction, insights_system_prompt, insights_user_prompt, is_echo_of,
-    looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_insights,
+    AnswerStatus, CallView, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights,
+    CopilotProvider, CopilotSettings, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction,
+    Speaker, SpeakerLabels, TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt,
+    call_view_system_prompt, call_view_user_prompt, combined_answer, detected_question_instruction,
+    insights_system_prompt, insights_user_prompt, is_echo_of, looks_like_question,
+    meeting_notes_markdown, notes_system_prompt, parse_call_view, parse_insights,
     parse_turn_verdict, render_transcript, researched_guidance, split_follow_up,
     turn_judge_system_prompt, turn_judge_user_prompt, typed_question_instruction,
     utterance_similarity, worth_judging,
@@ -29,6 +30,7 @@ use agentdictate_core::{
 
 use super::{
     knowledge::{Knowledge, fingerprint},
+    names::{Clue, Roster},
     providers::{AnswerProvider, AnswerRequest, complete},
     reveal::RevealGate,
     stream::StreamEvent,
@@ -73,6 +75,25 @@ const TURN_VERDICT_WAIT: Duration = Duration::from_secs(3);
 /// speech. The segmenter needs over half a second of silence to end an
 /// utterance, while another device's copy of the question starts with it.
 const RESUMED_SPEECH_MS: u64 = 300;
+/// How long the other side must have been speaking before the meeting
+/// window is read for who it shows speaking: apps highlight the speaker
+/// after a moment.
+const LOOK_AFTER: Duration = Duration::from_millis(1_200);
+/// Least time between two captures of the meeting window.
+const LOOK_INTERVAL: Duration = Duration::from_secs(4);
+/// Meeting-window readings per session, so a call nobody can be named in
+/// costs little.
+const MAX_WINDOW_READINGS: usize = 40;
+/// Readings in a row without a call in view before the window is left alone
+/// for [`LOOK_PAUSE`].
+const MISSES_BEFORE_PAUSE: u8 = 3;
+const LOOK_PAUSE: Duration = Duration::from_secs(180);
+/// Captures not matched to a voice within this time are dropped.
+const SHOT_TTL: Duration = Duration::from_secs(30);
+/// Slack when matching a capture to the speech it was taken during.
+const SHOT_SLACK_MS: u64 = 300;
+/// Names seen in the meeting window kept for the user to pick from.
+const MAX_SEEN_NAMES: usize = 16;
 
 /// Audio pipeline output, independent of the capture backend.
 #[derive(Clone, Debug)]
@@ -136,8 +157,18 @@ pub(crate) trait Platform: Send + Sync {
         sink: AudioSink,
     ) -> Result<Box<dyn AudioControl>, String>;
     fn capture_screen(&self) -> Result<Vec<u8>, String>;
+    /// The meeting app's window, or the screen when none is found.
+    fn capture_call_window(&self) -> Result<CallShot, String>;
     fn copy_text(&self, text: &str);
     fn open(&self, target: &str);
+}
+
+/// A capture of the meeting app's window.
+#[derive(Clone, Debug)]
+pub(crate) struct CallShot {
+    /// The window's title, when a meeting window was found.
+    pub title: Option<String>,
+    pub jpeg: Arc<Vec<u8>>,
 }
 
 pub(crate) type ProviderFactory =
@@ -192,6 +223,16 @@ pub(crate) enum EngineMsg {
         knowledge: Arc<Knowledge>,
         fingerprint: u64,
     },
+    /// The meeting window, captured while the other side spoke.
+    WindowCaptured {
+        at_ms: u64,
+        shot: Result<CallShot, String>,
+    },
+    /// Who the meeting window showed speaking while `voice` spoke.
+    WindowRead {
+        voice: u8,
+        view: Result<Option<CallView>, String>,
+    },
 }
 
 struct TranscriptionJob {
@@ -229,6 +270,23 @@ struct Draft {
     finished: Option<(String, String)>,
 }
 
+/// Reading names from the meeting app's window while the other side speaks.
+#[derive(Default)]
+struct WindowLooks {
+    /// When the other side's current speech began.
+    speech_started: Option<Instant>,
+    /// The current speech was captured already.
+    captured: bool,
+    /// A capture or reading is under way.
+    busy: bool,
+    last_capture: Option<Instant>,
+    /// Captures waiting for the voice that was speaking.
+    shots: Vec<(u64, Instant, CallShot)>,
+    readings: usize,
+    misses: u8,
+    resume_at: Option<Instant>,
+}
+
 struct PendingMine {
     line: TranscriptLine,
     end_ms: u64,
@@ -258,6 +316,10 @@ pub(crate) struct Engine {
     next_line: u64,
     them_spans: VecDeque<ThemSpan>,
     voices: VoiceTracker,
+    roster: Roster,
+    /// Names the meeting window showed, offered when the user names a voice.
+    seen_names: Vec<String>,
+    looks: WindowLooks,
     pending_mine: Vec<PendingMine>,
     them_speaking: bool,
     pending_turn: Option<PendingTurn>,
@@ -303,6 +365,9 @@ impl Engine {
             next_line: 1,
             them_spans: VecDeque::new(),
             voices: VoiceTracker::default(),
+            roster: Roster::default(),
+            seen_names: Vec::new(),
+            looks: WindowLooks::default(),
             pending_mine: Vec::new(),
             them_speaking: false,
             pending_turn: None,
@@ -590,6 +655,17 @@ impl Engine {
                 self.knowledge_loading = false;
                 (self.ui)(CopilotEvent::Knowledge(summary));
             }
+            EngineMsg::WindowCaptured { at_ms, shot } => {
+                self.looks.busy = false;
+                match shot {
+                    Ok(shot) => {
+                        self.looks.shots.push((at_ms, Instant::now(), shot));
+                        self.match_shots();
+                    }
+                    Err(error) => tracing::debug!(%error, "meeting window capture failed"),
+                }
+            }
+            EngineMsg::WindowRead { voice, view } => self.handle_window_read(voice, view),
             EngineMsg::ModelsLoaded(provider, models) => {
                 if provider == CopilotProvider::ChatgptSubscription {
                     self.chatgpt_models = models.iter().map(|model| model.id.clone()).collect();
@@ -665,6 +741,11 @@ impl Engine {
                 self.services.platform.copy_text(&text);
                 (self.ui)(CopilotEvent::Notice("Copied".into()));
             }
+            CopilotAction::NameSpeaker { voice, name } => {
+                self.roster.note(voice, &name, Clue::User);
+                tracing::info!(voice, named = !name.trim().is_empty(), "speaker named");
+                self.publish_speakers();
+            }
             CopilotAction::End => return true,
         }
         false
@@ -711,6 +792,8 @@ impl Engine {
             AudioMsg::Speaking { speaker, active } => {
                 if speaker == Speaker::Them {
                     self.them_speaking = active;
+                    self.looks.speech_started = active.then(Instant::now);
+                    self.looks.captured = false;
                     if !active {
                         self.evaluate_turn();
                     }
@@ -751,6 +834,7 @@ impl Engine {
             {
                 self.them_spans.pop_front();
             }
+            self.match_shots();
         }
         let Some(jobs) = &self.jobs else { return };
         self.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -993,7 +1077,11 @@ impl Engine {
         let request = AnswerRequest {
             system: turn_judge_system_prompt().to_owned(),
             user: turn_judge_user_prompt(
-                &render_transcript(&self.transcript, INSIGHTS_TRANSCRIPT_CHARS),
+                &render_transcript(
+                    &self.transcript,
+                    &self.roster.names(),
+                    INSIGHTS_TRANSCRIPT_CHARS,
+                ),
                 latest,
                 context,
             ),
@@ -1180,7 +1268,11 @@ impl Engine {
             model: model.clone(),
             automatic,
         });
-        let transcript = render_transcript(&self.transcript, ANSWER_TRANSCRIPT_CHARS);
+        let transcript = render_transcript(
+            &self.transcript,
+            &self.roster.names(),
+            ANSWER_TRANSCRIPT_CHARS,
+        );
         let knowledge = self.knowledge_for(&kind);
         let settings = self.settings.clone();
         let fast_model = settings.fast_model();
@@ -1391,6 +1483,196 @@ impl Engine {
         }
         self.evaluate_turn();
         self.maybe_request_insights();
+        self.maybe_look_at_window();
+    }
+
+    fn publish_speakers(&self) {
+        (self.ui)(CopilotEvent::Speakers {
+            names: self.roster.names(),
+            seen: self.seen_names.clone(),
+        });
+    }
+
+    /// Captures the meeting window while the other side speaks, when someone
+    /// may still need a name: apps highlight whoever is talking.
+    fn maybe_look_at_window(&mut self) {
+        let looks = &self.looks;
+        let allowed = self.settings.screen_context
+            && self.settings.provider.supports_screen()
+            && !self.ending
+            && !self.paused;
+        let due = looks
+            .speech_started
+            .is_some_and(|started| started.elapsed() >= LOOK_AFTER)
+            && !looks.captured
+            && !looks.busy
+            && looks.readings < MAX_WINDOW_READINGS
+            && looks
+                .last_capture
+                .is_none_or(|at| at.elapsed() >= LOOK_INTERVAL)
+            && looks.resume_at.is_none_or(|at| Instant::now() >= at);
+        if !allowed || !due {
+            return;
+        }
+        // Until someone has spoken, the speaker may be anyone.
+        let heard = self.voices.count();
+        if heard > 0 && !(0..heard).any(|voice| self.roster.needs_look(voice as u8)) {
+            return;
+        }
+        self.looks.captured = true;
+        self.looks.busy = true;
+        self.looks.last_capture = Some(Instant::now());
+        let at_ms = self.elapsed_ms();
+        let platform = Arc::clone(&self.services.platform);
+        let messages = self.messages.clone();
+        let spawned = std::thread::Builder::new()
+            .name("copilot-window".into())
+            .spawn(move || {
+                let shot = platform.capture_call_window();
+                let _ = messages.send(EngineMsg::WindowCaptured { at_ms, shot });
+            });
+        if spawned.is_err() {
+            self.looks.busy = false;
+        }
+    }
+
+    /// Pairs captures with the voice that was speaking when they were
+    /// taken, and reads the window for voices that still need a name.
+    fn match_shots(&mut self) {
+        self.looks
+            .shots
+            .retain(|(_, taken, _)| taken.elapsed() < SHOT_TTL);
+        let mut index = 0;
+        while index < self.looks.shots.len() {
+            let at_ms = self.looks.shots[index].0;
+            let Some(voice) = self
+                .them_spans
+                .iter()
+                .find(|span| {
+                    span.start_ms <= at_ms + SHOT_SLACK_MS && at_ms <= span.end_ms + SHOT_SLACK_MS
+                })
+                .map(|span| span.voice)
+            else {
+                // The speech is still going on.
+                index += 1;
+                continue;
+            };
+            let (_, _, shot) = self.looks.shots.remove(index);
+            if let Some(voice) = voice
+                && self.roster.needs_look(voice)
+                && !self.looks.busy
+                && self.looks.readings < MAX_WINDOW_READINGS
+            {
+                self.read_window(voice, shot);
+            }
+        }
+    }
+
+    fn read_window(&mut self, voice: u8, shot: CallShot) {
+        self.looks.busy = true;
+        self.looks.readings += 1;
+        self.roster.looked(voice);
+        let mut settings = self.settings.clone();
+        settings.set_answer_model(self.settings.provider.default_fast_model());
+        let request = AnswerRequest {
+            system: call_view_system_prompt().to_owned(),
+            user: call_view_user_prompt(shot.title.as_deref(), &self.settings.profile),
+            image_jpeg: Some(shot.jpeg),
+            model: settings.answer_model(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 300,
+            cache_key: format!("{}-window", self.session_key),
+        };
+        let providers = Arc::clone(&self.services.providers);
+        let messages = self.messages.clone();
+        let spawned = std::thread::Builder::new()
+            .name("copilot-window-read".into())
+            .spawn(move || {
+                let cancel = AtomicBool::new(false);
+                let view = providers(&settings)
+                    .and_then(|provider| complete(provider.as_ref(), &request, &cancel))
+                    .map(|text| parse_call_view(&text));
+                let _ = messages.send(EngineMsg::WindowRead { voice, view });
+            });
+        if spawned.is_err() {
+            self.looks.busy = false;
+        }
+    }
+
+    fn handle_window_read(&mut self, voice: u8, view: Result<Option<CallView>, String>) {
+        self.looks.busy = false;
+        let view = match view {
+            Ok(Some(view)) if view.call => view,
+            Ok(_) => {
+                self.looks.misses += 1;
+                if self.looks.misses >= MISSES_BEFORE_PAUSE {
+                    tracing::info!("no meeting window in view; looking again later");
+                    self.looks.misses = 0;
+                    self.looks.resume_at = Some(Instant::now() + LOOK_PAUSE);
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "meeting window reading failed");
+                return;
+            }
+        };
+        self.looks.misses = 0;
+        let mut changed = false;
+        for name in &view.participants {
+            if self.seen_names.len() < MAX_SEEN_NAMES
+                && !self
+                    .seen_names
+                    .iter()
+                    .any(|seen| seen.eq_ignore_ascii_case(name))
+            {
+                self.seen_names.push(name.clone());
+                changed = true;
+            }
+        }
+        if let Some(name) = &view.speaking {
+            changed |= self.roster.note(voice, name, Clue::Seen);
+        }
+        if let [only] = view.participants.as_slice()
+            && self.voices.count() <= 1
+        {
+            changed |= self.roster.note(voice, only, Clue::OnlyOther);
+        }
+        tracing::info!(
+            voice,
+            speaking = view.speaking.is_some(),
+            participants = view.participants.len(),
+            "meeting window read"
+        );
+        if changed {
+            self.publish_speakers();
+        }
+    }
+
+    /// Names voices the conversation identified, by their transcript labels.
+    fn name_from_conversation(&mut self, speakers: &std::collections::BTreeMap<String, String>) {
+        if speakers.is_empty() {
+            return;
+        }
+        let labels = SpeakerLabels::new(&self.transcript, &self.roster.names());
+        let heard = labels.voices(&self.transcript);
+        let mut changed = false;
+        for (label, name) in speakers {
+            if let Some(voice) = labels
+                .voice_for_label(label)
+                .filter(|voice| heard.contains(voice))
+            {
+                changed |= self.roster.note(voice, name, Clue::Heard);
+            }
+        }
+        if changed {
+            tracing::info!(
+                names = self.roster.names().len(),
+                "speakers named from the conversation"
+            );
+            self.publish_speakers();
+        }
     }
 
     fn maybe_request_insights(&mut self) {
@@ -1419,6 +1701,7 @@ impl Engine {
             system: insights_system_prompt().to_owned(),
             user: insights_user_prompt(&render_transcript(
                 &self.transcript,
+                &self.roster.names(),
                 INSIGHTS_TRANSCRIPT_CHARS,
             )),
             image_jpeg: None,
@@ -1454,6 +1737,7 @@ impl Engine {
         // A detected question is offered as a click-to-answer card; only the
         // other side's own pause-confirmed questions are answered unprompted.
         let before = self.insights.situation;
+        self.name_from_conversation(&insights.speakers);
         self.insights = insights.clone();
         (self.ui)(CopilotEvent::Insights(insights));
         let after = self.insights.situation;
@@ -1562,7 +1846,7 @@ impl Engine {
             system: notes_system_prompt().to_owned(),
             user: format!(
                 "<transcript>\n{}\n</transcript>",
-                render_transcript(&self.transcript, 60_000)
+                render_transcript(&self.transcript, &self.roster.names(), 60_000)
             ),
             image_jpeg: None,
             model: settings.answer_model(),
@@ -1626,6 +1910,7 @@ impl Engine {
             self.elapsed_ms(),
             summary,
             &self.transcript,
+            &self.roster.names(),
             &self.answers,
         );
         std::fs::write(&path, markdown)?;
@@ -1688,6 +1973,12 @@ mod tests {
         fn capture_screen(&self) -> Result<Vec<u8>, String> {
             Ok(vec![0xff, 0xd8])
         }
+        fn capture_call_window(&self) -> Result<CallShot, String> {
+            Ok(CallShot {
+                title: Some("Weekly sync | Microsoft Teams".into()),
+                jpeg: Arc::new(vec![0xff, 0xd8]),
+            })
+        }
         fn copy_text(&self, _text: &str) {}
         fn open(&self, _target: &str) {}
     }
@@ -1711,6 +2002,10 @@ mod tests {
                 sink(StreamEvent::Text(
                     "Agreed on a pilot.\n\n**Follow-up email**\nHi Sam,\n\nThanks for today."
                         .into(),
+                ));
+            } else if request.system == call_view_system_prompt() {
+                sink(StreamEvent::Text(
+                    r#"{"call":true,"speaking":"Sam Lee","participants":["Sam Lee","Joey Tran"],"me":null}"#.into(),
                 ));
             } else if request.system == turn_judge_system_prompt() {
                 // Tag questions in these fixtures are rhetorical.
@@ -2071,6 +2366,7 @@ mod tests {
             question: Some("Instead of weekly, meet with them every single day".into()),
             suggestions: Vec::new(),
             situation: Situation::Unclear,
+            ..CopilotInsights::default()
         })));
         drain(&mut engine, &incoming);
         assert_eq!(answers_started(&events), 0);
@@ -2552,6 +2848,157 @@ mod tests {
         let notes = std::fs::read_to_string(path).unwrap();
         assert!(notes.contains("Summary text"));
         assert!(notes.contains("Hello there"));
+    }
+
+    fn speakers(events: &Arc<Mutex<Vec<CopilotEvent>>>) -> Option<agentdictate_core::VoiceNames> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                CopilotEvent::Speakers { names, .. } => Some(names.clone()),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn people_named_in_the_conversation_are_named_in_answers_and_notes() {
+        let (mut engine, incoming, events, requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.handle_transcribed(Speaker::Them, 0, 1_000, Ok("Hi, I'm Sam from Acme.".into()));
+        engine.handle_insights(Ok(Some(CopilotInsights {
+            speakers: [("Them".to_owned(), "Sam".to_owned())].into(),
+            ..CopilotInsights::default()
+        })));
+        // Labels for voices nobody heard are ignored.
+        engine.handle_insights(Ok(Some(CopilotInsights {
+            speakers: [("Them C".to_owned(), "Joey".to_owned())].into(),
+            ..CopilotInsights::default()
+        })));
+        assert_eq!(speakers(&events).unwrap()[&0], "Sam");
+        engine.handle_action(CopilotAction::Assist);
+        drain(&mut engine, &incoming);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.user.contains("Them (Sam): Hi, I'm Sam"))
+        );
+
+        // The user's name for a voice wins and reaches the notes.
+        engine.handle_action(CopilotAction::NameSpeaker {
+            voice: 0,
+            name: "Samuel Lee".into(),
+        });
+        engine.handle_insights(Ok(Some(CopilotInsights {
+            speakers: [("Them (Samuel Lee)".to_owned(), "Pam".to_owned())].into(),
+            ..CopilotInsights::default()
+        })));
+        engine.handle_insights(Ok(Some(CopilotInsights {
+            speakers: [("Them (Samuel Lee)".to_owned(), "Pam".to_owned())].into(),
+            ..CopilotInsights::default()
+        })));
+        assert_eq!(speakers(&events).unwrap()[&0], "Samuel Lee");
+        let notes = std::fs::read_to_string(engine.write_notes(None).unwrap()).unwrap();
+        assert!(notes.contains("- **With:** Samuel Lee"));
+        assert!(notes.contains("Samuel Lee:** Hi, I'm Sam"));
+    }
+
+    /// Lets the other side speak long enough for a window capture, then ends
+    /// the utterance as `voice` and waits for the window to be read.
+    fn look_while_they_speak(engine: &mut Engine, incoming: &Receiver<EngineMsg>, voice: u8) {
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: true,
+        });
+        engine.looks.speech_started = Some(Instant::now() - LOOK_AFTER);
+        engine.looks.last_capture = None;
+        engine.tick();
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        let EngineMsg::WindowCaptured { at_ms, .. } = &message else {
+            panic!("expected a window capture");
+        };
+        let at_ms = *at_ms;
+        engine.handle(message);
+        engine.them_spans.push_back(ThemSpan {
+            start_ms: at_ms.saturating_sub(1_000),
+            end_ms: at_ms + 500,
+            text: None,
+            voice: Some(voice),
+        });
+        engine.match_shots();
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(message, EngineMsg::WindowRead { .. }));
+        engine.handle(message);
+    }
+
+    #[test]
+    fn the_meeting_window_names_whoever_it_shows_speaking() {
+        let (mut engine, incoming, events, requests, _directory) =
+            harness(CopilotSettings::default());
+        for print in [0.0, 9.0] {
+            engine.voices.assign(Some(super::super::voices::VoicePrint {
+                timbre: [print; 12],
+                log_pitch: None,
+                voiced_seconds: 3.0,
+            }));
+        }
+        look_while_they_speak(&mut engine, &incoming, 0);
+        // One reading is not enough.
+        assert_eq!(speakers(&events).unwrap_or_default().get(&0), None);
+        look_while_they_speak(&mut engine, &incoming, 0);
+        let names = speakers(&events).unwrap();
+        assert_eq!(names[&0], "Sam Lee");
+        let seen = events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                CopilotEvent::Speakers { seen, .. } => Some(seen.clone()),
+                _ => None,
+            });
+        assert_eq!(seen.unwrap(), vec!["Sam Lee", "Joey Tran"]);
+        let reading = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.system == call_view_system_prompt())
+            .cloned()
+            .unwrap();
+        assert!(reading.image_jpeg.is_some());
+        assert_eq!(reading.model, "gpt-6-luna");
+        assert!(reading.user.contains("Weekly sync | Microsoft Teams"));
+        // A named voice is not looked at again.
+        assert!(!engine.roster.needs_look(0));
+    }
+
+    #[test]
+    fn the_window_is_left_alone_when_no_call_is_in_view_or_screens_are_off() {
+        let (mut engine, _incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        for _ in 0..MISSES_BEFORE_PAUSE {
+            engine.handle(EngineMsg::WindowRead {
+                voice: 0,
+                view: Ok(Some(CallView::default())),
+            });
+        }
+        assert!(engine.looks.resume_at.is_some());
+        let (mut engine, _incoming, _events, _requests, _directory) = harness(CopilotSettings {
+            screen_context: false,
+            ..CopilotSettings::default()
+        });
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: true,
+        });
+        engine.looks.speech_started = Some(Instant::now() - LOOK_AFTER);
+        engine.tick();
+        assert!(!engine.looks.busy && !engine.looks.captured);
     }
 
     #[test]

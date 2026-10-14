@@ -488,28 +488,215 @@ pub struct TranscriptLine {
     pub voice: Option<u8>,
 }
 
-impl TranscriptLine {
-    /// The speaker for prompts: "Me", "Them", or "Them A" when the other
-    /// side's voices are told apart.
-    #[must_use]
-    pub fn speaker_label(&self, several_voices: bool) -> String {
-        self.name(self.speaker.label(), several_voices)
-    }
+/// Names of the other side's people, by voice.
+pub type VoiceNames = BTreeMap<u8, String>;
 
-    /// The speaker for people: "You", "Them", or "Them A".
-    #[must_use]
-    pub fn speaker_display(&self, several_voices: bool) -> String {
-        self.name(self.speaker.display(), several_voices)
-    }
+/// How transcript lines name who spoke: "You" and "Them", "Them A" and
+/// "Them B" once the other side's voices are told apart, and people's names
+/// once they are known.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpeakerLabels {
+    several_voices: bool,
+    /// The other side's voice, when exactly one was told apart.
+    only_voice: Option<u8>,
+    names: VoiceNames,
+}
 
-    fn name(&self, base: &str, several_voices: bool) -> String {
-        match self.voice {
-            Some(voice) if several_voices && self.speaker == Speaker::Them => {
-                format!("{base} {}", voice_letter(voice))
-            }
-            _ => base.to_owned(),
+impl SpeakerLabels {
+    #[must_use]
+    pub fn new(lines: &[TranscriptLine], names: &VoiceNames) -> Self {
+        let mut voices = lines
+            .iter()
+            .filter(|line| line.speaker == Speaker::Them)
+            .filter_map(|line| line.voice);
+        let only_voice = voices.next();
+        let several_voices = only_voice.is_some_and(|first| voices.any(|voice| voice != first));
+        Self {
+            several_voices,
+            only_voice: only_voice.filter(|_| !several_voices),
+            names: names.clone(),
         }
     }
+
+    /// Whether lines tell the other side's voices apart.
+    #[must_use]
+    pub const fn several_voices(&self) -> bool {
+        self.several_voices
+    }
+
+    /// The voice a line is named by: its own, or the only voice when the
+    /// other side is one person. `None` for the user's lines and for
+    /// unassigned lines among several voices.
+    #[must_use]
+    pub fn voice_of(&self, line: &TranscriptLine) -> Option<u8> {
+        match (line.speaker, line.voice) {
+            (Speaker::Me, _) => None,
+            (Speaker::Them, _) if !self.several_voices => Some(self.only_voice.unwrap_or(0)),
+            (Speaker::Them, voice) => voice,
+        }
+    }
+
+    /// The other side's voices, in the order they first spoke.
+    #[must_use]
+    pub fn voices(&self, lines: &[TranscriptLine]) -> Vec<u8> {
+        let mut voices = Vec::new();
+        for voice in lines.iter().filter_map(|line| self.voice_of(line)) {
+            if !voices.contains(&voice) {
+                voices.push(voice);
+            }
+        }
+        voices
+    }
+
+    /// The person who spoke a line, when known.
+    #[must_use]
+    pub fn name(&self, line: &TranscriptLine) -> Option<&str> {
+        self.voice_of(line).and_then(|voice| self.voice_name(voice))
+    }
+
+    /// A voice's person, when known.
+    #[must_use]
+    pub fn voice_name(&self, voice: u8) -> Option<&str> {
+        self.names.get(&voice).map(String::as_str)
+    }
+
+    /// The speaker for prompts: "Me", "Them", "Them A", or with the
+    /// person's name, "Them (Sam)" and "Them A (Sam)".
+    #[must_use]
+    pub fn label(&self, line: &TranscriptLine) -> String {
+        match line.speaker {
+            Speaker::Me => Speaker::Me.label().to_owned(),
+            Speaker::Them => {
+                let base = self.base(line);
+                match self.name(line) {
+                    Some(name) => format!("{base} ({name})"),
+                    None => base,
+                }
+            }
+        }
+    }
+
+    /// The speaker for people: "You", "Them", "Them A", or the person's name.
+    #[must_use]
+    pub fn display(&self, line: &TranscriptLine) -> String {
+        match (line.speaker, self.name(line)) {
+            (Speaker::Me, _) => Speaker::Me.display().to_owned(),
+            (Speaker::Them, Some(name)) => name.to_owned(),
+            (Speaker::Them, None) => self.base(line),
+        }
+    }
+
+    /// How a voice is labeled before it has a name: "Them", or "Them A"
+    /// among several voices.
+    #[must_use]
+    pub fn voice_label(&self, voice: u8) -> String {
+        if self.several_voices {
+            format!("Them {}", voice_letter(voice))
+        } else {
+            Speaker::Them.label().to_owned()
+        }
+    }
+
+    /// The voice a model-written label refers to, such as "Them B" or
+    /// "Them B (Sam)".
+    #[must_use]
+    pub fn voice_for_label(&self, label: &str) -> Option<u8> {
+        let label = label.split('(').next()?.trim();
+        let rest = label
+            .get(..4)
+            .filter(|head| head.eq_ignore_ascii_case("them"))
+            .and_then(|_| label.get(4..))?
+            .trim();
+        let mut letters = rest.chars();
+        match (letters.next(), letters.next()) {
+            (None, _) if !self.several_voices => Some(self.only_voice.unwrap_or(0)),
+            (Some(letter), None) if letter.is_ascii_alphabetic() => {
+                let voice = letter.to_ascii_uppercase() as u8 - b'A';
+                if self.several_voices {
+                    Some(voice)
+                } else {
+                    // A lone voice is plain "Them"; "Them A" can only mean it.
+                    (voice == 0).then(|| self.only_voice.unwrap_or(0))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn base(&self, line: &TranscriptLine) -> String {
+        match line.voice {
+            Some(voice) if self.several_voices => self.voice_label(voice),
+            _ => Speaker::Them.label().to_owned(),
+        }
+    }
+}
+
+/// A person's given name, for tight labels.
+#[must_use]
+pub fn given_name(name: &str) -> &str {
+    name.split_whitespace().next().unwrap_or(name)
+}
+
+/// Words a model may write where it does not know a name.
+const NOT_NAMES: [&str; 26] = [
+    "me",
+    "you",
+    "them",
+    "us",
+    "unknown",
+    "null",
+    "none",
+    "n/a",
+    "user",
+    "host",
+    "co-host",
+    "guest",
+    "speaker",
+    "interviewer",
+    "interviewee",
+    "candidate",
+    "presenter",
+    "narrator",
+    "moderator",
+    "everyone",
+    "participant",
+    "customer",
+    "client",
+    "caller",
+    "other",
+    "someone",
+];
+
+/// A person's name written by a model, trimmed of decoration, or `None`
+/// when it is not plausibly a name: placeholders, roles, or long phrases.
+#[must_use]
+pub fn clean_person_name(raw: &str) -> Option<String> {
+    // Meeting apps decorate names: "Sam Lee (Guest)", "Sam Lee | Acme".
+    let raw = raw.split(['(', '|', '[']).next().unwrap_or_default();
+    let name = raw
+        .trim_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '"' | '\'' | '*' | '.' | ',' | ':')
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let first = name.chars().next()?;
+    let plausible = first.is_alphabetic()
+        && !first.is_lowercase()
+        && name.chars().count() <= 40
+        && name.split(' ').count() <= 4
+        && !name.chars().any(|character| {
+            character.is_ascii_digit()
+                || matches!(
+                    character,
+                    '@' | '/' | '\\' | '<' | '>' | '{' | '}' | ']' | ')'
+                )
+        });
+    let lower = name.to_lowercase();
+    let placeholder = NOT_NAMES.contains(&lower.as_str())
+        || lower.starts_with("them ")
+        || lower.starts_with("speaker ");
+    (plausible && !placeholder).then_some(name)
 }
 
 /// The letter naming one of the other side's voices: A, B, C...
@@ -584,6 +771,10 @@ pub struct CopilotInsights {
     pub suggestions: Vec<String>,
     #[serde(deserialize_with = "lenient_situation")]
     pub situation: Situation,
+    /// People's names the conversation makes certain, by transcript label
+    /// such as "Them B".
+    #[serde(deserialize_with = "lenient_speakers")]
+    pub speakers: BTreeMap<String, String>,
 }
 
 /// What the copilot is listening to, judged from the transcript.
@@ -637,6 +828,20 @@ fn lenient_situation<'de, D: serde::Deserializer<'de>>(
         "media" => Situation::Media,
         _ => Situation::Unclear,
     })
+}
+
+/// Reads model-written speaker names, skipping entries that are not text.
+fn lenient_speakers<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Object(entries)) = value else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|(label, name)| Some((label.trim().to_owned(), name.as_str()?.to_owned())))
+        .collect())
 }
 
 /// Shortcut labels as actually registered (fallbacks differ from defaults).
@@ -708,6 +913,12 @@ pub enum CopilotEvent {
     /// Focus the ask box (global shortcut).
     FocusAsk,
     Knowledge(KnowledgeSummary),
+    /// People's names by voice, and the names seen in the meeting window,
+    /// offered when the user names a voice.
+    Speakers {
+        names: VoiceNames,
+        seen: Vec<String>,
+    },
     Ending,
     NotesSaved {
         path: String,
@@ -735,6 +946,11 @@ pub enum CopilotAction {
     OpenKnowledgeFolder,
     OpenUrl(String),
     CopyText(String),
+    /// Names one of the other side's voices; an empty name forgets it.
+    NameSpeaker {
+        voice: u8,
+        name: String,
+    },
     End,
 }
 
@@ -752,15 +968,15 @@ pub fn format_offset(at_ms: u64) -> String {
 
 /// Renders the most recent transcript within `max_chars`, oldest first.
 #[must_use]
-pub fn render_transcript(lines: &[TranscriptLine], max_chars: usize) -> String {
-    let several_voices = has_several_voices(lines);
+pub fn render_transcript(lines: &[TranscriptLine], names: &VoiceNames, max_chars: usize) -> String {
+    let labels = SpeakerLabels::new(lines, names);
     let mut rendered = Vec::new();
     let mut used = 0;
     for line in lines.iter().rev() {
         let entry = format!(
             "[{}] {}: {}",
             format_offset(line.at_ms),
-            line.speaker_label(several_voices),
+            labels.label(line),
             line.text.trim()
         );
         if used + entry.len() + 1 > max_chars && !rendered.is_empty() {
@@ -781,6 +997,7 @@ pub fn answer_system_prompt(settings: &CopilotSettings) -> String {
         "You are AgentDictate Copilot, a real-time assistant that quietly helps the user during live meetings and calls. \
 You receive a live transcript where \"Me\" is the user and \"Them\" is everyone else, and sometimes a screenshot of the user's screen. \
 When the other side has several people, their lines are labeled Them A, Them B, and so on, told apart by voice; the labels can be imperfect. \
+A person's name follows the label once known, as in \"Them A (Sam)\"; use names where it is natural. \
 The transcript comes from speech recognition, so expect small recognition errors and infer the intended words.\n\n\
 How to respond:\n\
 - The user is mid-conversation and will glance at your answer. Be immediately useful and skimmable.\n\
@@ -955,7 +1172,10 @@ null for advice, opinions, instructions, statements, rhetorical questions, quest
  \"suggestions\": array of at most 3 short clickable prompts (under 6 words) the user may want next, like \"Define <term>\" or \"Suggest a reply\",\n\
  \"situation\": \"conversation\" if Me takes part in a live conversation, \"presentation\" if someone presents or lectures to an audience that includes Me, \
 \"media\" if Me is watching or listening to a recording such as a video or podcast (Them talk to each other or to a camera while Me stays silent), \
-or \"unclear\"}"
+or \"unclear\",\n\
+ \"speakers\": object mapping the other side's transcript labels, such as \"Them\" or \"Them B\", to that person's name, only when the transcript makes it certain: \
+they introduce themselves (\"Hi, I'm Sam\"), they answer right after being addressed by name (\"Sam, what do you think?\"), or Me thanks or addresses them by name right after they spoke. \
+Use {} when unsure, and never guess a name from a role or company. Labels with a name in parentheses are already named; include one only to correct a name the transcript clearly contradicts.}"
 }
 
 /// User turn for rolling insights.
@@ -993,7 +1213,96 @@ pub fn parse_insights(response: &str) -> Option<CopilotInsights> {
         .question
         .map(|question| question.trim().to_owned())
         .filter(|question| !question.is_empty() && !question.eq_ignore_ascii_case("null"));
+    insights.speakers = insights
+        .speakers
+        .into_iter()
+        .filter_map(|(label, name)| Some((label, clean_person_name(&name)?)))
+        .take(6)
+        .collect();
     Some(insights)
+}
+
+/// What a screenshot of the meeting app shows about who is on the call.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct CallView {
+    /// A call or meeting window with participants is visible.
+    pub call: bool,
+    /// The participant the app shows as speaking.
+    pub speaking: Option<String>,
+    /// The other participants' names shown, without the user.
+    pub participants: Vec<String>,
+    /// The user's own name, when shown.
+    pub me: Option<String>,
+}
+
+/// System prompt for reading who is speaking from a meeting app's window.
+#[must_use]
+pub const fn call_view_system_prompt() -> &'static str {
+    "You read screenshots of video calls (Teams, Zoom, Google Meet, Webex, Slack, and others) for the user, who is in the call. \
+Respond with ONLY one JSON object and no other text, using exactly these keys:\n\
+{\"call\": true if a call or meeting window with participants is visible, otherwise false,\n\
+ \"speaking\": the name of the participant the app shows as speaking right now (a highlighted tile border, a speaking indicator or sound bars by the name, \
+or the active speaker shown large), exactly as written on screen; null when no one or several people are shown speaking, or when unsure,\n\
+ \"participants\": array of the other participants' names shown on screen, exactly as written, without the user,\n\
+ \"me\": the user's own name when the screen shows it (their self view, or a name marked \"(You)\" or \"Me\"), otherwise null}\n\
+Report only names written on screen; never guess one from a face. Ignore names in chat messages, documents, and shared slides."
+}
+
+/// User turn for reading a meeting app's window.
+#[must_use]
+pub fn call_view_user_prompt(window_title: Option<&str>, profile: &str) -> String {
+    let mut prompt = String::new();
+    if let Some(title) = window_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        prompt.push_str(&format!("Window title: {title}\n"));
+    }
+    let profile: String = profile.trim().chars().take(400).collect();
+    if !profile.is_empty() {
+        prompt.push_str(&format!("About the user: {profile}\n"));
+    }
+    prompt.push_str("Someone on the other side is talking right now. Who is shown speaking?");
+    prompt
+}
+
+/// Reads a meeting-window description, keeping only plausible names and
+/// leaving the user out of the other participants.
+#[must_use]
+pub fn parse_call_view(response: &str) -> Option<CallView> {
+    let start = response.find('{')?;
+    let end = response.rfind('}')?;
+    let mut view: CallView = serde_json::from_str(response.get(start..=end)?).ok()?;
+    view.me = view.me.as_deref().and_then(clean_person_name);
+    let is_me = |name: &str| {
+        view.me
+            .as_deref()
+            .is_some_and(|me| me.eq_ignore_ascii_case(name))
+            || name.eq_ignore_ascii_case("you")
+    };
+    view.speaking = view
+        .speaking
+        .as_deref()
+        .and_then(clean_person_name)
+        .filter(|name| !is_me(name));
+    let mut participants: Vec<String> = Vec::new();
+    for name in view
+        .participants
+        .iter()
+        .filter_map(|name| clean_person_name(name))
+    {
+        if !is_me(&name)
+            && !participants
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&name))
+        {
+            participants.push(name);
+        }
+    }
+    participants.truncate(16);
+    view.participants = participants;
+    Some(view)
 }
 
 const QUESTION_OPENERS: [&str; 24] = [
@@ -1154,12 +1463,27 @@ pub fn meeting_notes_markdown(
     duration_ms: u64,
     summary: Option<&str>,
     transcript: &[TranscriptLine],
+    names: &VoiceNames,
     answers: &[(String, String)],
 ) -> String {
+    let labels = SpeakerLabels::new(transcript, names);
     let mut notes = format!(
-        "# {title}\n\n- **Started:** {started}\n- **Duration:** {}\n\n",
+        "# {title}\n\n- **Started:** {started}\n- **Duration:** {}\n",
         format_offset(duration_ms)
     );
+    let mut people: Vec<&str> = Vec::new();
+    for voice in labels.voices(transcript) {
+        if let Some(name) = labels
+            .voice_name(voice)
+            .filter(|name| !people.contains(name))
+        {
+            people.push(name);
+        }
+    }
+    if !people.is_empty() {
+        notes.push_str(&format!("- **With:** {}\n", people.join(", ")));
+    }
+    notes.push('\n');
     if let Some(summary) = summary.map(str::trim).filter(|summary| !summary.is_empty()) {
         notes.push_str("## Summary\n\n");
         notes.push_str(summary);
@@ -1179,12 +1503,11 @@ pub fn meeting_notes_markdown(
     if transcript.is_empty() {
         notes.push_str("_No speech was transcribed._\n");
     }
-    let several_voices = has_several_voices(transcript);
     for line in transcript {
         notes.push_str(&format!(
             "**[{}] {}:** {}\n\n",
             format_offset(line.at_ms),
-            line.speaker_display(several_voices),
+            labels.display(line),
             line.text.trim()
         ));
     }
@@ -1198,6 +1521,8 @@ pub struct MeetingNotes {
     pub title: String,
     pub started: String,
     pub duration: String,
+    /// The other side's people, when they were named.
+    pub with: String,
     /// Overview, key points, decisions, and action items, in Markdown.
     pub summary: String,
     pub follow_up: Option<String>,
@@ -1248,6 +1573,8 @@ pub fn parse_meeting_notes(markdown: &str) -> MeetingNotes {
             notes.started = started.trim().to_owned();
         } else if let Some(duration) = line.strip_prefix("- **Duration:**") {
             notes.duration = duration.trim().to_owned();
+        } else if let Some(with) = line.strip_prefix("- **With:**") {
+            notes.with = with.trim().to_owned();
         }
     }
     let heading = |name: &str| lines.iter().position(|line| line.trim() == name);
@@ -1375,12 +1702,12 @@ mod tests {
             line(2, Speaker::Me, "second", 65_000),
             line(3, Speaker::Them, "third?", 3_725_000),
         ];
-        let all = render_transcript(&lines, 10_000);
+        let all = render_transcript(&lines, &VoiceNames::new(), 10_000);
         assert_eq!(
             all,
             "[0:01] Them: first line that is fairly long\n[1:05] Me: second\n[1:02:05] Them: third?"
         );
-        let recent = render_transcript(&lines, 45);
+        let recent = render_transcript(&lines, &VoiceNames::new(), 45);
         assert_eq!(recent, "[1:05] Me: second\n[1:02:05] Them: third?");
     }
 
@@ -1584,6 +1911,7 @@ mod tests {
                 at_ms: 2_000,
                 voice: None,
             }],
+            &VoiceNames::new(),
             &[(
                 "Can we start small?".into(),
                 "Offer a 25-seat pilot.".into(),
@@ -1621,20 +1949,142 @@ mod tests {
         lines[0].voice = Some(0);
         assert!(!has_several_voices(&lines));
         assert_eq!(
-            render_transcript(&lines, 1_000),
+            render_transcript(&lines, &VoiceNames::new(), 1_000),
             "[0:00] Them: Welcome to the show.\n[0:02] Me: Thanks for having me."
         );
         let mut guest = line(3, Speaker::Them, "Happy to be here.", 4_000);
         guest.voice = Some(1);
         lines.push(guest);
         assert!(has_several_voices(&lines));
-        let rendered = render_transcript(&lines, 1_000);
+        let rendered = render_transcript(&lines, &VoiceNames::new(), 1_000);
         assert!(rendered.contains("[0:00] Them A: Welcome"));
         assert!(rendered.contains("[0:04] Them B: Happy"));
         assert!(rendered.contains("[0:02] Me: Thanks"));
-        let notes = meeting_notes_markdown("Show", "2026-10-13 09:00", 5_000, None, &lines, &[]);
+        let notes = meeting_notes_markdown(
+            "Show",
+            "2026-10-13 09:00",
+            5_000,
+            None,
+            &lines,
+            &VoiceNames::new(),
+            &[],
+        );
         assert!(notes.contains("**[0:04] Them B:** Happy to be here."));
         assert!(notes.contains("**[0:02] You:** Thanks"));
+        assert!(!notes.contains("**With:**"));
+    }
+
+    #[test]
+    fn named_voices_are_labeled_by_name_everywhere() {
+        let mut lines = vec![
+            line(1, Speaker::Them, "I'm Sam, I run the show.", 0),
+            line(2, Speaker::Me, "Thanks, Sam.", 2_000),
+            line(3, Speaker::Them, "And I'm Joey.", 4_000),
+            line(4, Speaker::Them, "Mm.", 5_000),
+        ];
+        lines[0].voice = Some(0);
+        lines[2].voice = Some(1);
+        let names = VoiceNames::from([(0, "Sam Lee".to_owned())]);
+        let labels = SpeakerLabels::new(&lines, &names);
+        assert_eq!(labels.display(&lines[0]), "Sam Lee");
+        assert_eq!(labels.display(&lines[2]), "Them B");
+        assert_eq!(labels.display(&lines[1]), "You");
+        // A line without a voice among several voices stays unnamed.
+        assert_eq!(labels.display(&lines[3]), "Them");
+        assert_eq!(labels.voice_of(&lines[3]), None);
+        assert_eq!(labels.label(&lines[0]), "Them A (Sam Lee)");
+        assert_eq!(labels.voices(&lines), vec![0, 1]);
+        let rendered = render_transcript(&lines, &names, 1_000);
+        assert!(rendered.contains("[0:00] Them A (Sam Lee): I'm Sam"));
+        assert!(rendered.contains("[0:04] Them B: And I'm Joey."));
+        let notes =
+            meeting_notes_markdown("Show", "2026-10-13 09:00", 6_000, None, &lines, &names, &[]);
+        assert!(notes.contains("- **With:** Sam Lee\n"));
+        assert!(notes.contains("**[0:00] Sam Lee:** I'm Sam"));
+        assert_eq!(parse_meeting_notes(&notes).with, "Sam Lee");
+        assert_eq!(given_name("Sam Lee"), "Sam");
+
+        // Model-written labels map back to voices.
+        assert_eq!(labels.voice_for_label("Them B"), Some(1));
+        assert_eq!(labels.voice_for_label("them a (Sam Lee)"), Some(0));
+        assert_eq!(labels.voice_for_label("Them"), None);
+        assert_eq!(labels.voice_for_label("Me"), None);
+        assert_eq!(labels.voice_for_label("Them AB"), None);
+
+        // With one voice, every line from the other side is that person.
+        let mut one = vec![
+            line(1, Speaker::Them, "Hi there.", 0),
+            line(2, Speaker::Them, "Yes.", 1_000),
+        ];
+        one[0].voice = Some(2);
+        let names = VoiceNames::from([(2, "Ana".to_owned())]);
+        let labels = SpeakerLabels::new(&one, &names);
+        assert!(!labels.several_voices());
+        assert_eq!(labels.display(&one[1]), "Ana");
+        assert_eq!(labels.label(&one[1]), "Them (Ana)");
+        assert_eq!(labels.voice_for_label("Them"), Some(2));
+        assert_eq!(labels.voice_for_label("Them A"), Some(2));
+        assert_eq!(labels.voice_label(2), "Them");
+    }
+
+    #[test]
+    fn only_plausible_names_are_taken_from_models() {
+        assert_eq!(clean_person_name(" Sam Lee "), Some("Sam Lee".into()));
+        assert_eq!(clean_person_name("\"Sam\"."), Some("Sam".into()));
+        assert_eq!(clean_person_name("Sam Lee (Guest)"), Some("Sam Lee".into()));
+        assert_eq!(clean_person_name("Sam Lee | Acme"), Some("Sam Lee".into()));
+        assert_eq!(
+            clean_person_name("José Álvarez"),
+            Some("José Álvarez".into())
+        );
+        for bad in [
+            "",
+            "null",
+            "Unknown",
+            "Host",
+            "Them A",
+            "Speaker 2",
+            "the interviewer",
+            "sam@acme.com",
+            "User 1234",
+            "A very long phrase that is not a name",
+        ] {
+            assert_eq!(clean_person_name(bad), None, "{bad}");
+        }
+        let insights = parse_insights(
+            "{\"topic\":\"Intro\",\"speakers\":{\"Them A\":\"Sam\",\"Them B\":null,\"Them C\":\"Unknown\"}}",
+        )
+        .unwrap();
+        assert_eq!(
+            insights.speakers,
+            BTreeMap::from([("Them A".to_owned(), "Sam".to_owned())])
+        );
+        let odd = parse_insights("{\"topic\":\"Intro\",\"speakers\":[\"Sam\"]}").unwrap();
+        assert!(odd.speakers.is_empty());
+        assert!(insights_system_prompt().contains("\"speakers\""));
+    }
+
+    #[test]
+    fn meeting_windows_name_who_is_speaking() {
+        let view = parse_call_view(
+            "```json\n{\"call\":true,\"speaking\":\"Sam Lee (Guest)\",\"participants\":[\"Sam Lee\",\"James Gosnell\",\"You\",\"Joey\",\"joey\"],\"me\":\"James Gosnell\"}\n```",
+        )
+        .unwrap();
+        assert!(view.call);
+        assert_eq!(view.speaking.as_deref(), Some("Sam Lee"));
+        assert_eq!(view.participants, vec!["Sam Lee", "Joey"]);
+        // The user's own tile is never the other side.
+        let mine = parse_call_view(
+            "{\"call\":true,\"speaking\":\"James Gosnell\",\"participants\":[],\"me\":\"James Gosnell\"}",
+        )
+        .unwrap();
+        assert_eq!(mine.speaking, None);
+        let none = parse_call_view("{\"call\":false,\"speaking\":null}").unwrap();
+        assert!(!none.call);
+        assert!(parse_call_view("no json").is_none());
+        let prompt = call_view_user_prompt(Some("Weekly sync | Microsoft Teams"), "I'm James.");
+        assert!(prompt.contains("Window title: Weekly sync"));
+        assert!(prompt.contains("About the user: I'm James."));
     }
 
     #[test]
@@ -1691,6 +2141,7 @@ mod tests {
             125_000,
             Some("Overview"),
             &[line(1, Speaker::Them, "Hi", 0)],
+            &VoiceNames::new(),
             &[("What should I say?".into(), "Say hello.".into())],
         );
         assert!(notes.contains("**Duration:** 2:05"));

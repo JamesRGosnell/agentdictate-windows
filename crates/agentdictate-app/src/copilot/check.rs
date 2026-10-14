@@ -9,9 +9,10 @@ use std::{
 };
 
 use agentdictate_core::{
-    CopilotEffort, CopilotSettings, QuickAction, Speaker, TranscriptLine, answer_system_prompt,
-    answer_user_prompt, detected_question_instruction, insights_system_prompt,
-    insights_user_prompt, looks_like_question, parse_insights, render_transcript,
+    CopilotEffort, CopilotSettings, QuickAction, Speaker, TranscriptLine, VoiceNames,
+    answer_system_prompt, answer_user_prompt, detected_question_instruction,
+    insights_system_prompt, insights_user_prompt, looks_like_question, parse_insights,
+    render_transcript,
 };
 
 use super::{
@@ -203,7 +204,7 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
                 }
             }
         };
-    let transcript_text = render_transcript(&transcript, 24_000);
+    let transcript_text = render_transcript(&transcript, &VoiceNames::new(), 24_000);
     let request = AnswerRequest {
         system: answer_system_prompt(&settings),
         user: answer_user_prompt(&transcript_text, &instruction, false, ""),
@@ -252,7 +253,7 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
             voice: None,
         }];
         let probe_user = answer_user_prompt(
-            &render_transcript(&probe, 24_000),
+            &render_transcript(&probe, &VoiceNames::new(), 24_000),
             &detected_question_instruction(&probe[0].text),
             false,
             "",
@@ -605,4 +606,218 @@ pub(crate) fn voices(paths: &[std::path::PathBuf]) -> anyhow::Result<usize> {
         }
     }
     Ok(0)
+}
+
+/// Runs scripted calls through the live insights model and reports whether
+/// it names the right people and nobody else, as live naming would.
+pub(crate) fn names() -> anyhow::Result<usize> {
+    use agentdictate_core::SpeakerLabels;
+
+    type Case = (
+        &'static str,
+        &'static [(Option<u8>, &'static str)],
+        &'static [(u8, &'static str)],
+    );
+    let mut report = Report { failures: 0 };
+    let paths = crate::AppPaths::from_environment()?;
+    let mut settings = store::load(&store::settings_path(&paths.config_file));
+    settings.set_answer_model(settings.provider.default_fast_model());
+    let chatgpt = Arc::new(ChatGptCredentials::discover());
+    let provider =
+        providers::provider_for(&settings, &chatgpt, "", &[]).map_err(anyhow::Error::msg)?;
+    println!("Naming check with {}", settings.answer_model());
+    // Lines are (voice, text); `None` is the user.
+    let cases: [Case; 5] = [
+        (
+            "Interview, one interviewer",
+            &[
+                (
+                    Some(0),
+                    "Hi, thanks for making time. I'm Priya, I lead the platform team here.",
+                ),
+                (None, "Thanks Priya, great to meet you."),
+                (Some(0), "So tell me about your experience with Rust."),
+            ],
+            &[(0, "Priya")],
+        ),
+        (
+            "Sales call, two people introduce themselves",
+            &[
+                (
+                    Some(0),
+                    "Okay, we're all here. I'm Dana, I run operations at Northwind.",
+                ),
+                (None, "Great to meet you, Dana."),
+                (Some(1), "And I'm Marcus, I handle the IT side."),
+                (
+                    None,
+                    "Thanks Marcus. What does your current setup look like?",
+                ),
+                (Some(1), "We're on a mix of Teams and Zoom right now."),
+            ],
+            &[(0, "Dana"), (1, "Marcus")],
+        ),
+        (
+            "Someone addressed by name answers",
+            &[
+                (Some(0), "Let's get started, we have a lot to cover."),
+                (
+                    None,
+                    "Sure. Kevin, do you want to kick off with the numbers?",
+                ),
+                (
+                    Some(1),
+                    "Yeah, so revenue was up twelve percent last quarter.",
+                ),
+                (Some(0), "That's great. Can you also share the churn data?"),
+            ],
+            &[(1, "Kevin")],
+        ),
+        (
+            "Only people who are not on the call are mentioned",
+            &[
+                (
+                    Some(0),
+                    "Have you spoken to Mike in finance about the budget?",
+                ),
+                (None, "Not yet, I'll reach out to him this week."),
+                (
+                    Some(0),
+                    "Great. Sarah from legal also wants to review the contract.",
+                ),
+            ],
+            &[],
+        ),
+        (
+            "The other side uses the user's name",
+            &[
+                (Some(0), "Hey James, how was your weekend?"),
+                (None, "Good, thanks! Ready to dive in?"),
+                (Some(0), "Absolutely, let's go through the roadmap."),
+            ],
+            &[],
+        ),
+    ];
+    for (label, script, expected) in cases {
+        let lines: Vec<TranscriptLine> = script
+            .iter()
+            .enumerate()
+            .map(|(index, (voice, text))| TranscriptLine {
+                id: index as u64 + 1,
+                speaker: if voice.is_some() {
+                    Speaker::Them
+                } else {
+                    Speaker::Me
+                },
+                text: (*text).to_owned(),
+                at_ms: index as u64 * 4_000,
+                voice: *voice,
+            })
+            .collect();
+        let request = AnswerRequest {
+            system: insights_system_prompt().to_owned(),
+            user: insights_user_prompt(&render_transcript(&lines, &VoiceNames::new(), 8_000)),
+            image_jpeg: None,
+            model: settings.answer_model(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 800,
+            cache_key: uuid::Uuid::new_v4().to_string(),
+        };
+        let started = Instant::now();
+        let cancel = AtomicBool::new(false);
+        let insights = providers::complete(provider.as_ref(), &request, &cancel)
+            .map_err(anyhow::Error::msg)
+            .and_then(|text| {
+                parse_insights(&text).ok_or_else(|| anyhow::anyhow!("unreadable reply: {text}"))
+            });
+        let insights = match insights {
+            Ok(insights) => insights,
+            Err(error) => {
+                report.fail(label, error.to_string());
+                continue;
+            }
+        };
+        let labels = SpeakerLabels::new(&lines, &VoiceNames::new());
+        let named: VoiceNames = insights
+            .speakers
+            .iter()
+            .filter_map(|(label, name)| Some((labels.voice_for_label(label)?, name.clone())))
+            .collect();
+        let wanted: VoiceNames = expected
+            .iter()
+            .map(|(voice, name)| (*voice, (*name).to_owned()))
+            .collect();
+        let detail = format!(
+            "{} ms, named {:?}",
+            started.elapsed().as_millis(),
+            insights.speakers
+        );
+        if named == wanted {
+            report.pass(label, detail);
+        } else {
+            report.fail(label, format!("{detail}, wanted {wanted:?}"));
+        }
+    }
+    Ok(report.failures)
+}
+
+/// Captures the meeting window as live naming does, or reads a saved
+/// screenshot, and reports who the model sees speaking. Sends the image to
+/// the fast model.
+pub(crate) fn window(image: Option<&Path>) -> anyhow::Result<usize> {
+    use agentdictate_core::{call_view_system_prompt, call_view_user_prompt, parse_call_view};
+
+    let paths = crate::AppPaths::from_environment()?;
+    let mut settings = store::load(&store::settings_path(&paths.config_file));
+    settings.set_answer_model(settings.provider.default_fast_model());
+    let shot = match image {
+        Some(path) => super::engine::CallShot {
+            title: None,
+            jpeg: Arc::new(std::fs::read(path)?),
+        },
+        None => {
+            let shot = win::desktop::capture_call_window().map_err(anyhow::Error::msg)?;
+            let saved = std::env::temp_dir().join("agentdictate-meeting-window.jpg");
+            std::fs::write(&saved, shot.jpeg.as_slice())?;
+            println!(
+                "Captured {} ({} KB), saved to {}",
+                shot.title.as_deref().unwrap_or("the primary monitor"),
+                shot.jpeg.len() / 1024,
+                saved.display()
+            );
+            shot
+        }
+    };
+    let chatgpt = Arc::new(ChatGptCredentials::discover());
+    let provider =
+        providers::provider_for(&settings, &chatgpt, "", &[]).map_err(anyhow::Error::msg)?;
+    let request = AnswerRequest {
+        system: call_view_system_prompt().to_owned(),
+        user: call_view_user_prompt(shot.title.as_deref(), &settings.profile),
+        image_jpeg: Some(shot.jpeg),
+        model: settings.answer_model(),
+        effort: CopilotEffort::Low,
+        web_search: false,
+        max_output_tokens: 300,
+        cache_key: uuid::Uuid::new_v4().to_string(),
+    };
+    let started = Instant::now();
+    let cancel = AtomicBool::new(false);
+    let text =
+        providers::complete(provider.as_ref(), &request, &cancel).map_err(anyhow::Error::msg)?;
+    println!("{} ms: {}", started.elapsed().as_millis(), text.trim());
+    match parse_call_view(&text) {
+        Some(view) => {
+            println!(
+                "call {}, speaking {:?}, others {:?}, you {:?}",
+                view.call, view.speaking, view.participants, view.me
+            );
+            Ok(0)
+        }
+        None => {
+            println!("FAIL  the reply could not be read");
+            Ok(1)
+        }
+    }
 }

@@ -73,6 +73,18 @@ fn short_name(app: &str) -> String {
         .to_owned()
 }
 
+/// Whether a window title belongs to a meeting in progress. Teams names
+/// every window "... | Microsoft Teams", so its meetings and calls need
+/// saying so.
+#[must_use]
+pub(crate) fn is_meeting_title(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    MEETING_TITLES.iter().any(|pattern| lower.contains(pattern))
+        && (!lower.contains("| microsoft teams")
+            || lower.contains("meeting")
+            || lower.contains("call"))
+}
+
 /// Decides whether the user is in a meeting.
 ///
 /// `active_microphone_apps` are app identifiers currently capturing audio
@@ -102,12 +114,7 @@ pub(crate) fn classify(
         }
     }
     for title in window_titles {
-        let lower = title.to_lowercase();
-        if MEETING_TITLES.iter().any(|pattern| lower.contains(pattern))
-            && (!lower.contains("| microsoft teams")
-                || lower.contains("meeting")
-                || lower.contains("call"))
-        {
+        if is_meeting_title(title) {
             return MeetingSignal {
                 in_meeting: true,
                 reason: format!("meeting window \"{title}\""),

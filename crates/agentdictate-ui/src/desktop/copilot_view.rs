@@ -11,7 +11,8 @@ use std::{
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode, CopilotProvider,
     CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction, Situation, Speaker,
-    combined_answer, format_offset, has_several_voices, model_pace, researched_follow_up,
+    SpeakerLabels, TranscriptLine, VoiceNames, combined_answer, format_offset, given_name,
+    has_several_voices, model_pace, researched_follow_up,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
@@ -165,6 +166,23 @@ fn icon_button(id: &'static str, name: &'static str, tint: u32) -> Stateful<Div>
         .child(icon(name, 14., tint))
 }
 
+/// A speaker's label in the narrow transcript column: a given name, unless
+/// two people share it.
+fn short_label(labels: &SpeakerLabels, names: &VoiceNames, line: &TranscriptLine) -> String {
+    match labels.name(line) {
+        Some(name) => {
+            let given = given_name(name);
+            let shared = names
+                .values()
+                .filter(|other| given_name(other).eq_ignore_ascii_case(given))
+                .count()
+                > 1;
+            if shared { name } else { given }.to_owned()
+        }
+        None => labels.display(line),
+    }
+}
+
 fn divider() -> impl IntoElement + use<> {
     div().w(px(1.)).h(px(16.)).mx(px(2.)).bg(color(BORDER))
 }
@@ -241,6 +259,9 @@ pub struct CopilotWindow {
     visible: bool,
     typing: bool,
     ask: Entity<InputState>,
+    /// The voice being named, from the transcript.
+    naming: Option<u8>,
+    name_input: Entity<InputState>,
     profile: Entity<InputState>,
     instructions: Entity<InputState>,
     anthropic_key: Entity<InputState>,
@@ -343,6 +364,7 @@ impl CopilotWindow {
                 .placeholder("Ask about your screen or conversation\u{2026}")
                 .clean_on_escape()
         });
+        let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Their name"));
         let profile = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -383,6 +405,16 @@ impl CopilotWindow {
                 }
             },
         )];
+        subscriptions.push(cx.subscribe_in(
+            &name_input,
+            window,
+            |this, input, event: &InputEvent, _, cx| {
+                if let (InputEvent::PressEnter { .. }, Some(voice)) = (event, this.naming) {
+                    let name = input.read(cx).value().to_string();
+                    this.name_voice(voice, &name, cx);
+                }
+            },
+        ));
         subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() && this.typing {
                 this.stop_typing(false, cx);
@@ -403,6 +435,8 @@ impl CopilotWindow {
             visible: true,
             typing: false,
             ask,
+            naming: None,
+            name_input,
             profile,
             instructions,
             anthropic_key,
@@ -648,11 +682,41 @@ impl CopilotWindow {
         }
     }
 
+    /// Opens the name editor for one of the other side's voices.
+    pub fn begin_naming(&mut self, voice: u8, window: &mut Window, cx: &mut Context<Self>) {
+        self.naming = Some(voice);
+        let current = self
+            .model
+            .speaker_names
+            .get(&voice)
+            .cloned()
+            .unwrap_or_default();
+        self.name_input.update(cx, |input, cx| {
+            input.set_value(current, window, cx);
+            input.focus(window, cx);
+        });
+        self.start_settings_typing(cx);
+        cx.notify();
+    }
+
+    /// Names a voice; an empty name returns it to "Them A".
+    fn name_voice(&mut self, voice: u8, name: &str, cx: &mut Context<Self>) {
+        self.model.name_speaker(voice, name);
+        self.act(CopilotAction::NameSpeaker {
+            voice,
+            name: name.trim().to_owned(),
+        });
+        self.naming = None;
+        self.stop_typing(true, cx);
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" {
             if self.settings_open {
                 self.settings_open = false;
             }
+            self.naming = None;
             self.stop_typing(true, cx);
             cx.notify();
         }
@@ -898,7 +962,7 @@ impl CopilotWindow {
         let body: AnyElement = if self.settings_open {
             self.render_settings(cx).into_any_element()
         } else if self.tab == Tab::Transcript {
-            self.render_transcript().into_any_element()
+            self.render_transcript(cx).into_any_element()
         } else if self.model.ending || self.model.notes_path.is_some() {
             self.render_ending(window, cx).into_any_element()
         } else {
@@ -1762,8 +1826,165 @@ impl CopilotWindow {
             })
     }
 
-    fn render_transcript(&mut self) -> impl IntoElement + use<> {
+    /// The other side's people, each a chip that opens the name editor.
+    fn render_people(
+        &self,
+        labels: &SpeakerLabels,
+        lines: &[TranscriptLine],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let voices = labels.voices(lines);
+        if voices.is_empty() {
+            return None;
+        }
+        let several = labels.several_voices();
+        let mut row = h_flex()
+            .flex_none()
+            .w_full()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .px(px(16.))
+            .py(px(10.))
+            .border_b_1()
+            .border_color(color(HAIRLINE))
+            .child(
+                div()
+                    .mr(px(2.))
+                    .text_size(px(11.))
+                    .text_color(color(DIM))
+                    .child("People"),
+            );
+        for voice in voices {
+            let tint = if several {
+                VOICES[usize::from(voice) % VOICES.len()]
+            } else {
+                ACCENT
+            };
+            let name = labels.voice_name(voice).map(str::to_owned);
+            let editing = self.naming == Some(voice);
+            row = row.child(
+                chip(("copilot-person", usize::from(voice)), editing)
+                    .debug_selector(move || format!("copilot-person-{voice}"))
+                    .h(px(24.))
+                    .px(px(9.))
+                    .child(div().size(px(6.)).rounded_full().bg(color(tint)))
+                    .child(
+                        div()
+                            .text_color(color(TEXT))
+                            .child(name.clone().unwrap_or_else(|| labels.voice_label(voice))),
+                    )
+                    .when(name.is_none(), |chip| {
+                        chip.child(div().text_color(color(DIM)).child("Who?"))
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.begin_naming(voice, window, cx);
+                    })),
+            );
+        }
+        let editor = self.naming.map(|voice| {
+            let suggestions = self.model.name_suggestions();
+            let named = self.model.speaker_names.contains_key(&voice);
+            v_flex()
+                .flex_none()
+                .w_full()
+                .gap(px(8.))
+                .px(px(16.))
+                .py(px(10.))
+                .bg(color(0xffffff06))
+                .border_b_1()
+                .border_color(color(HAIRLINE))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.))
+                                .text_color(color(MUTED))
+                                .child(format!("Who is {}?", labels.voice_label(voice))),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "copilot-name-input".to_owned())
+                                .id("copilot-name-input")
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(30.))
+                                .px(px(2.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(8.))
+                                .bg(color(0xffffff0a))
+                                .border_1()
+                                .border_color(color(0xe6a48a80))
+                                .text_size(px(13.))
+                                .child(
+                                    Input::new(&self.name_input)
+                                        .appearance(false)
+                                        .bordered(false),
+                                ),
+                        )
+                        .child(
+                            chip("copilot-name-save", true)
+                                .debug_selector(|| "copilot-name-save".to_owned())
+                                .child("Save")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    let name = this.name_input.read(cx).value().to_string();
+                                    this.name_voice(voice, &name, cx);
+                                })),
+                        )
+                        .when(named, |row| {
+                            row.child(
+                                chip("copilot-name-clear", false)
+                                    .debug_selector(|| "copilot-name-clear".to_owned())
+                                    .child("Forget")
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.name_voice(voice, "", cx);
+                                    })),
+                            )
+                        }),
+                )
+                .when(!suggestions.is_empty(), |editor| {
+                    editor.child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(color(DIM))
+                                    .child("On screen"),
+                            )
+                            .children(suggestions.into_iter().enumerate().map(|(index, name)| {
+                                chip(("copilot-name-suggestion", index), false)
+                                    .debug_selector(move || {
+                                        format!("copilot-name-suggestion-{index}")
+                                    })
+                                    .h(px(24.))
+                                    .child(name.clone())
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.name_voice(voice, &name, cx);
+                                    }))
+                            })),
+                    )
+                })
+        });
+        Some(
+            v_flex()
+                .flex_none()
+                .w_full()
+                .child(row)
+                .children(editor)
+                .into_any_element(),
+        )
+    }
+
+    fn render_transcript(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let lines = self.model.transcript.clone();
+        let labels = self.model.speaker_labels();
+        let people = self.render_people(&labels, &lines, cx);
         let speaking_them = self.model.speaking_them;
         let speaking_me = self.model.speaking_me;
         let mut content = v_flex().w_full().gap(px(12.)).p(px(16.));
@@ -1787,6 +2008,25 @@ impl CopilotWindow {
                 }
                 (Speaker::Them, _) => ACCENT,
             };
+            let speaker = div()
+                .text_size(px(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color(tint))
+                .truncate()
+                .child(short_label(&labels, &self.model.speaker_names, &line));
+            // The other side's labels open the name editor.
+            let speaker = match labels.voice_of(&line) {
+                Some(voice) => speaker
+                    .id(("copilot-speaker", line.id))
+                    .debug_selector(move || format!("copilot-speaker-{}", line.id))
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.begin_naming(voice, window, cx);
+                    }))
+                    .into_any_element(),
+                None => speaker.into_any_element(),
+            };
             content = content.child(
                 h_flex()
                     .w_full()
@@ -1794,16 +2034,10 @@ impl CopilotWindow {
                     .gap(px(10.))
                     .child(
                         v_flex()
-                            .w(px(52.))
+                            .w(px(64.))
                             .flex_none()
                             .gap(px(1.))
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(color(tint))
-                                    .child(line.speaker_display(several_voices)),
-                            )
+                            .child(speaker)
                             .child(
                                 div()
                                     .text_size(px(10.5))
@@ -1841,12 +2075,16 @@ impl CopilotWindow {
                     .child(who),
             );
         }
-        div()
-            .id("copilot-transcript-body")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.transcript_scroll)
-            .child(content)
+        v_flex().size_full().children(people).child(
+            div()
+                .id("copilot-transcript-body")
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.transcript_scroll)
+                .child(content),
+        )
     }
 
     fn render_footer(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

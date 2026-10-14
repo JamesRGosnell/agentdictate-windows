@@ -72,6 +72,15 @@ does not reach other apps, including chat apps that use it to send.
   and so on, in the transcript, the notes, and what answers see. Voices are
   matched by timbre and pitch, on this PC; people who talk over each other or
   trade lines without a pause share one label.
+- **Names.** Labels become people's names as soon as they are clear: someone
+  introduces themselves ("Hi, I'm Sam"), answers after being addressed by
+  name, or is highlighted as speaking in the meeting app's window (Teams, Zoom,
+  Meet, and others) while their voice is heard. A name from the window needs
+  two sightings, or one when the call shows a single other person. Names
+  appear in the transcript, answers, notes, and the follow-up email. Click a
+  name or **Them B** in the transcript, or a chip in its **People** row, to
+  type a name or pick one shown on screen; your names always win, and
+  **Forget** clears one.
 - **Wrap-up.** When you end the session with **✕**, the copilot writes notes
   with a summary, key points, decisions, action items, and, when you took part
   in a conversation, a ready-to-send follow-up email. The wrap-up shows them
@@ -131,7 +140,10 @@ words are not written as **You**:
 
 `agentdictate copilot --check` reports whether Windows echo cancellation is
 active. `agentdictate copilot --voices a.wav b.wav` shows how recordings'
-voices are told apart. `agentdictate copilot --echo-test path\to\speech.wav` plays a recording
+voices are told apart. `agentdictate copilot --names` runs scripted calls
+through the naming model, and `agentdictate copilot --window [shot.jpg]`
+reads the open meeting window (or a saved screenshot) once and prints who it
+shows speaking. `agentdictate copilot --echo-test path\to\speech.wav` plays a recording
 through your speakers while the copilot listens and reports anything that
 reached **You**; run it in a quiet room without speaking.
 
@@ -165,7 +177,10 @@ and goals in **About you**, and standing rules in **Standing instructions**.
 - Transcription uses the ChatGPT dictation service through your sign-in, or the
   OpenAI API if you configured a key. Answers go to the engine you choose.
   Screenshots are sent only for Ask AI, typed questions, and Explain my screen,
-  and only while **Use my screen** is on.
+  and only while **Use my screen** is on. With it on, the meeting app's window
+  is also read while the other side speaks, until everyone has a name: at most
+  every few seconds and 40 times a session, and paused while no call is in
+  view.
 - Audio is not saved. Meeting notes are saved only while **Save meeting notes**
   is on.
 - The copilot hides itself from screen sharing, recordings, and screenshots

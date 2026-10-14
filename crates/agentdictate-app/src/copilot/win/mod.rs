@@ -9,7 +9,7 @@ pub(crate) mod instance;
 pub(crate) mod replay;
 pub(crate) mod signals;
 
-use super::engine::{AudioControl, AudioSink, Platform};
+use super::engine::{AudioControl, AudioSink, CallShot, Platform};
 
 pub(crate) struct WindowsPlatform;
 
@@ -30,6 +30,10 @@ impl Platform for WindowsPlatform {
 
     fn capture_screen(&self) -> Result<Vec<u8>, String> {
         desktop::capture_primary_jpeg()
+    }
+
+    fn capture_call_window(&self) -> Result<CallShot, String> {
+        desktop::capture_call_window()
     }
 
     fn copy_text(&self, text: &str) {

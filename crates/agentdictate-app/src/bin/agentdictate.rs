@@ -91,6 +91,17 @@ fn run() -> anyhow::Result<()> {
                 agentdictate_app::run_copilot_voices(&paths)?;
                 Ok(())
             }
+            Some("--names") => {
+                let failures = agentdictate_app::run_copilot_names()?;
+                anyhow::ensure!(failures == 0, "{failures} naming check(s) failed");
+                Ok(())
+            }
+            Some("--window") => {
+                let image = args.get(2).map(std::path::PathBuf::from);
+                let failures = agentdictate_app::run_copilot_window(image.as_deref())?;
+                anyhow::ensure!(failures == 0, "the meeting window could not be read");
+                Ok(())
+            }
             Some(other) => anyhow::bail!("unknown copilot option: {other}"),
         };
     }

@@ -2,7 +2,7 @@
 
 use agentdictate_core::{
     AnswerSource, AnswerStatus, CopilotEvent, CopilotInsights, CopilotSettings, CopilotShortcuts,
-    KnowledgeSummary, ListenState, ModelChoice, Speaker, TranscriptLine,
+    KnowledgeSummary, ListenState, ModelChoice, Speaker, SpeakerLabels, TranscriptLine, VoiceNames,
 };
 
 /// Logical window metrics. The window resizes between the bar alone and the
@@ -109,6 +109,10 @@ pub struct CopilotViewModel {
     pub wrap_up: Option<String>,
     pub follow_up: Option<String>,
     pub knowledge: KnowledgeSummary,
+    /// People's names on the other side, by voice.
+    pub speaker_names: VoiceNames,
+    /// Names the meeting window showed, offered when naming a voice.
+    pub seen_names: Vec<String>,
     pub session_started_unix_ms: i64,
 }
 
@@ -134,7 +138,41 @@ impl CopilotViewModel {
             wrap_up: None,
             follow_up: None,
             knowledge: KnowledgeSummary::default(),
+            speaker_names: VoiceNames::new(),
+            seen_names: Vec::new(),
             session_started_unix_ms,
+        }
+    }
+
+    /// How the transcript names who spoke.
+    #[must_use]
+    pub fn speaker_labels(&self) -> SpeakerLabels {
+        SpeakerLabels::new(&self.transcript, &self.speaker_names)
+    }
+
+    /// Names to offer when naming a voice: people the meeting window showed
+    /// who have no voice yet.
+    #[must_use]
+    pub fn name_suggestions(&self) -> Vec<String> {
+        self.seen_names
+            .iter()
+            .filter(|name| {
+                !self
+                    .speaker_names
+                    .values()
+                    .any(|taken| taken.eq_ignore_ascii_case(name))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Names a voice right away; the engine confirms it.
+    pub fn name_speaker(&mut self, voice: u8, name: &str) {
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            self.speaker_names.remove(&voice);
+        } else {
+            self.speaker_names.insert(voice, name);
         }
     }
 
@@ -290,6 +328,10 @@ impl CopilotViewModel {
             CopilotEvent::FocusAsk => return CopilotEffect::FocusAsk,
             CopilotEvent::Ending => self.ending = true,
             CopilotEvent::Knowledge(knowledge) => self.knowledge = knowledge,
+            CopilotEvent::Speakers { names, seen } => {
+                self.speaker_names = names;
+                self.seen_names = seen;
+            }
             CopilotEvent::NotesSaved {
                 path,
                 summary,

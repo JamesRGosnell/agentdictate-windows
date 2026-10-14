@@ -160,6 +160,11 @@ pub(crate) struct VoiceTracker {
 }
 
 impl VoiceTracker {
+    /// How many voices have been told apart.
+    pub(crate) fn count(&self) -> usize {
+        self.voices.len()
+    }
+
     /// The voice an utterance belongs to, from 0; `None` without a print.
     pub(crate) fn assign(&mut self, print: Option<VoicePrint>) -> Option<u8> {
         let print = print?;

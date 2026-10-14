@@ -46,7 +46,10 @@ impl fmt::Display for InjectionError {
                 write!(formatter, "paste chord emission failed: {source}")
             }
             Self::DeadlineBeforeInjection => {
-                write!(formatter, "delivery deadline expired before the paste chord started")
+                write!(
+                    formatter,
+                    "delivery deadline expired before the paste chord started"
+                )
             }
         }
     }
@@ -272,9 +275,11 @@ mod tests {
         while events.len() < expected && Instant::now() < deadline {
             match reader.fetch_events() {
                 Ok(batch) => {
-                    events.extend(batch.filter(|event| event.event_type() == EventType::KEY).map(
-                        |event| (KeyCode::new(event.code()), event.value()),
-                    ));
+                    events.extend(
+                        batch
+                            .filter(|event| event.event_type() == EventType::KEY)
+                            .map(|event| (KeyCode::new(event.code()), event.value())),
+                    );
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
@@ -301,11 +306,18 @@ mod tests {
 
     #[test]
     fn universal_chord_pairs_every_press_with_a_release_in_reverse_order() {
-        let Some(mut injector) = test_injector() else { return };
-        let Some(mut reader) = grabbed_reader(&mut injector) else { return };
+        let Some(mut injector) = test_injector() else {
+            return;
+        };
+        let Some(mut reader) = grabbed_reader(&mut injector) else {
+            return;
+        };
 
         injector
-            .inject(PasteShortcut::Universal, Instant::now() + Duration::from_secs(5))
+            .inject(
+                PasteShortcut::Universal,
+                Instant::now() + Duration::from_secs(5),
+            )
             .expect("universal chord is injected");
 
         assert_eq!(
@@ -322,11 +334,18 @@ mod tests {
 
     #[test]
     fn terminal_chord_releases_modifiers_in_reverse_order() {
-        let Some(mut injector) = test_injector() else { return };
-        let Some(mut reader) = grabbed_reader(&mut injector) else { return };
+        let Some(mut injector) = test_injector() else {
+            return;
+        };
+        let Some(mut reader) = grabbed_reader(&mut injector) else {
+            return;
+        };
 
         injector
-            .inject(PasteShortcut::Terminal, Instant::now() + Duration::from_secs(5))
+            .inject(
+                PasteShortcut::Terminal,
+                Instant::now() + Duration::from_secs(5),
+            )
             .expect("terminal chord is injected");
 
         assert_eq!(
@@ -345,23 +364,34 @@ mod tests {
 
     #[test]
     fn expired_deadline_fails_before_any_key_is_pressed() {
-        let Some(mut injector) = test_injector() else { return };
-        let Some(mut reader) = grabbed_reader(&mut injector) else { return };
+        let Some(mut injector) = test_injector() else {
+            return;
+        };
+        let Some(mut reader) = grabbed_reader(&mut injector) else {
+            return;
+        };
 
         let result = injector.inject(
             PasteShortcut::Standard,
             Instant::now() - Duration::from_secs(1),
         );
 
-        assert!(matches!(result, Err(InjectionError::DeadlineBeforeInjection)));
+        assert!(matches!(
+            result,
+            Err(InjectionError::DeadlineBeforeInjection)
+        ));
         assert_eq!(key_events(&mut reader, 1), vec![]);
         assert_nothing_pressed(&reader);
     }
 
     #[test]
     fn injection_device_uses_the_hotkey_excluded_name() {
-        let Some(mut injector) = test_injector() else { return };
-        let Some(reader) = grabbed_reader(&mut injector) else { return };
+        let Some(mut injector) = test_injector() else {
+            return;
+        };
+        let Some(reader) = grabbed_reader(&mut injector) else {
+            return;
+        };
 
         assert_eq!(reader.name(), Some(AGENTDICTATE_INJECTION_DEVICE_NAME));
     }

@@ -13,6 +13,7 @@ mod check;
 mod engine;
 mod knowledge;
 mod meeting;
+mod names;
 mod providers;
 mod reveal;
 mod store;
@@ -109,6 +110,20 @@ pub fn run_copilot_check(speech: Option<&std::path::Path>, latency: bool) -> any
 #[cfg(windows)]
 pub fn run_copilot_voices(paths: &[std::path::PathBuf]) -> anyhow::Result<usize> {
     check::voices(paths)
+}
+
+/// Checks that scripted calls name the right people. Returns the number of
+/// failed checks.
+#[cfg(windows)]
+pub fn run_copilot_names() -> anyhow::Result<usize> {
+    check::names()
+}
+
+/// Reads the meeting window once, as live naming does. Returns the number of
+/// failed checks.
+#[cfg(windows)]
+pub fn run_copilot_window(image: Option<&std::path::Path>) -> anyhow::Result<usize> {
+    check::window(image)
 }
 
 /// Plays a recording through the speakers and reports any echo that reached

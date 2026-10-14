@@ -88,6 +88,7 @@ mod tests {
                 at_ms: 0,
                 voice: None,
             }],
+            &agentdictate_core::VoiceNames::new(),
             &[],
         );
         std::fs::write(folder.join(name), markdown).unwrap();

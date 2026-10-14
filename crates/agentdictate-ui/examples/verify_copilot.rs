@@ -115,7 +115,13 @@ fn main() {
                 "Ask about rollout timeline".into(),
             ],
             situation: Situation::Conversation,
+            ..CopilotInsights::default()
         }));
+        // The buyer introduced herself; the engineer has no name yet.
+        feed(CopilotEvent::Speakers {
+            names: [(0, "Dana Ruiz".to_owned())].into(),
+            seen: vec!["Dana Ruiz".into(), "Priya Shah".into()],
+        });
         feed(CopilotEvent::AnswerStarted {
             id: 1,
             title: "Recap so far".into(),
@@ -313,6 +319,10 @@ fn main() {
                         view.update(cx, |view, cx| match state.as_str() {
                             "settings" => view.show_settings(window, cx),
                             "transcript" => view.show_transcript(cx),
+                            "naming" => {
+                                view.show_transcript(cx);
+                                view.begin_naming(1, window, cx);
+                            }
                             "collapsed" => view.set_panel_open(false, cx),
                             _ => view.set_panel_open(true, cx),
                         });
