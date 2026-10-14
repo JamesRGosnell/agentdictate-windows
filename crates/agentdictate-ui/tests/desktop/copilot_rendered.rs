@@ -70,7 +70,18 @@ impl DesktopHarness for Harness {
 }
 
 impl Harness {
+    /// A copilot whose user has already dismissed the first-run welcome.
     fn open(cx: &mut TestAppContext) -> Self {
+        Self::open_with(
+            cx,
+            CopilotSettings {
+                onboarded: true,
+                ..CopilotSettings::default()
+            },
+        )
+    }
+
+    fn open_with(cx: &mut TestAppContext, settings: CopilotSettings) -> Self {
         test_support::initialize_copilot(cx);
         let actions = Arc::new(Mutex::new(Vec::new()));
         let host = Rc::new(RefCell::new(Vec::new()));
@@ -90,7 +101,7 @@ impl Harness {
                     ..Default::default()
                 },
                 move |window, cx| {
-                    let mut model = CopilotViewModel::new(CopilotSettings::default(), 0);
+                    let mut model = CopilotViewModel::new(settings, 0);
                     model.listen = ListenState::Listening;
                     let view = cx.new(|cx| {
                         CopilotWindow::new(
@@ -376,6 +387,21 @@ fn a_complete_draft_is_marked_as_checked(cx: &mut TestAppContext) {
     stream_answer(&mut harness, "Nothing to add.");
     assert!(harness.has("copilot-answer-confirmed"));
     assert!(!harness.has("copilot-answer-more"));
+}
+
+#[gpui::test]
+fn the_first_run_welcome_explains_the_copilot_and_is_dismissed_once(cx: &mut TestAppContext) {
+    let mut harness = Harness::open_with(cx, CopilotSettings::default());
+    harness.click("copilot-panel");
+    assert!(harness.has("copilot-welcome"));
+    harness.click("copilot-welcome-knowledge");
+    harness.click("copilot-welcome-done");
+    let actions = harness.actions();
+    assert_eq!(actions[0], CopilotAction::OpenKnowledgeFolder);
+    assert!(matches!(
+        &actions[1],
+        CopilotAction::UpdateSettings(settings) if settings.onboarded
+    ));
 }
 
 #[gpui::test]

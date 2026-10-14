@@ -21,7 +21,7 @@ try {
     if ($LASTEXITCODE) { throw 'Isolated native Settings check failed.' }
     & cargo build --locked -p agentdictate-ui --features desktop --example verify_copilot
     if ($LASTEXITCODE) { throw 'Copilot verification binary failed to build.' }
-    foreach ($taskCopilotState in @('live','streaming','transcript','settings','collapsed','empty','wrapup')) {
+    foreach ($taskCopilotState in @('live','streaming','transcript','settings','collapsed','empty','welcome','wrapup')) {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-copilot.ps1 -State $taskCopilotState
         if ($LASTEXITCODE) { throw "Isolated native copilot check failed: $taskCopilotState" }
     }

@@ -370,6 +370,8 @@ pub struct CopilotSettings {
     pub save_notes: bool,
     /// Answers may draw on notes from earlier meetings.
     pub use_past_meetings: bool,
+    /// The user has dismissed the first-run welcome.
+    pub onboarded: bool,
     /// Optional ISO-639-1 transcription language; empty means automatic.
     pub language: String,
 }
@@ -397,6 +399,7 @@ impl Default for CopilotSettings {
             openai_api_key: String::new(),
             save_notes: true,
             use_past_meetings: true,
+            onboarded: false,
             language: String::new(),
         }
     }

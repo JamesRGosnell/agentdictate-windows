@@ -34,11 +34,16 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let mut model = CopilotViewModel::new(CopilotSettings::default(), now - 754_000);
+    // The "welcome" state shows the first-run welcome; others are past it.
+    let settings = CopilotSettings {
+        onboarded: state != "welcome",
+        ..CopilotSettings::default()
+    };
+    let mut model = CopilotViewModel::new(settings, now - 754_000);
     let mut feed = |event| {
         model.apply(event);
     };
-    if state != "empty" {
+    if state != "empty" && state != "welcome" {
         feed(CopilotEvent::Knowledge(KnowledgeSummary {
             documents: 3,
             meetings: 4,

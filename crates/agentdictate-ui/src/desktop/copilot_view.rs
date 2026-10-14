@@ -1173,7 +1173,9 @@ impl CopilotWindow {
                     }),
             );
         }
-        if self.model.answers.is_empty() && !has_insights {
+        if !self.model.settings.onboarded {
+            content = content.child(self.render_welcome(cx));
+        } else if self.model.answers.is_empty() && !has_insights {
             content = content.child(self.render_empty_state(cx));
         }
         if !earlier.is_empty() {
@@ -1239,6 +1241,111 @@ impl CopilotWindow {
             .overflow_y_scroll()
             .track_scroll(&self.body_scroll)
             .child(content)
+    }
+
+    /// The first-run welcome: how the copilot works and how to make it yours.
+    /// It never blocks; the copilot is already listening.
+    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let shortcuts = self.model.shortcuts.clone();
+        let row = |name: &'static str, text: &'static str| {
+            h_flex()
+                .items_start()
+                .gap(px(10.))
+                .child(div().mt(px(2.)).child(icon(name, 14., ACCENT)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.))
+                        .text_color(color(TEXT))
+                        .child(text),
+                )
+        };
+        let shortcut_row = |keys: &[String], text: &'static str| {
+            h_flex().gap(px(8.)).child(keycaps(keys)).child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(color(MUTED))
+                    .child(text),
+            )
+        };
+        v_flex()
+            .debug_selector(|| "copilot-welcome".to_owned())
+            .w_full()
+            .gap(px(12.))
+            .p(px(16.))
+            .rounded(px(14.))
+            .bg(color(GLASS_RAISED))
+            .border_1()
+            .border_color(color(0xe6a48a40))
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Welcome to Meeting Copilot"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(color(MUTED))
+                            .child("It's already listening. There's nothing to set up before a call."),
+                    ),
+            )
+            .child(row(
+                "message-question",
+                "When someone asks you something, an answer appears on its own. The large line is what to say; details follow underneath.",
+            ))
+            .child(row(
+                "eye-off",
+                "It's invisible in screen shares, recordings, and screenshots, and never takes focus from your call.",
+            ))
+            .child(
+                v_flex()
+                    .gap(px(6.))
+                    .child(shortcut_row(&shortcuts.assist, "What should I say right now?"))
+                    .child(shortcut_row(&shortcuts.toggle, "Show or hide"))
+                    .child(shortcut_row(&shortcuts.ask, "Type a question")),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap(px(6.))
+                    .pt(px(4.))
+                    .child(
+                        chip("copilot-welcome-about", false)
+                            .debug_selector(|| "copilot-welcome-about".to_owned())
+                            .child(icon("book", 12., ACCENT))
+                            .child("Tell it about you")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.settings_open = true;
+                                this.panel_open = true;
+                                this.load_text_settings(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        chip("copilot-welcome-knowledge", false)
+                            .debug_selector(|| "copilot-welcome-knowledge".to_owned())
+                            .child(icon("folder", 12., ACCENT))
+                            .child("Add your documents")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                                this.act(CopilotAction::OpenKnowledgeFolder);
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        chip("copilot-welcome-done", true)
+                            .debug_selector(|| "copilot-welcome-done".to_owned())
+                            .child("Got it")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.update_settings(|settings| settings.onboarded = true);
+                                cx.notify();
+                            })),
+                    ),
+            )
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
