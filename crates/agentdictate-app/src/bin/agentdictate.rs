@@ -96,6 +96,12 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(failures == 0, "{failures} naming check(s) failed");
                 Ok(())
             }
+            Some("--rewrites") => {
+                let failures =
+                    agentdictate_app::run_copilot_rewrites(args.get(2).map(String::as_str))?;
+                anyhow::ensure!(failures == 0, "{failures} rewrite check(s) failed");
+                Ok(())
+            }
             Some("--window") => {
                 let image = args.get(2).map(std::path::PathBuf::from);
                 let failures = agentdictate_app::run_copilot_window(image.as_deref())?;

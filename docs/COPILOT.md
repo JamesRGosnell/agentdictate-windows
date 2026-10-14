@@ -49,6 +49,11 @@ does not reach other apps, including chat apps that use it to send.
   researches, using web search when needed, and streams a verified answer with
   sources underneath. The instant draft never states specific prices, versions,
   dates, or news it cannot verify.
+- **Rewrites.** Under the line to say, **Shorter**, **More casual**, **More
+  specific**, and **Another way** rewrite it in about a second with the
+  quickest model. More specific draws on your documents and on what research
+  added to the answer, never on invented figures. **‹ ›** switches between
+  versions; copying and the meeting notes use the one you settle on.
 - **Automatic answers.** When the other side asks you something and pauses
   for your reply, an answer appears without a keypress. The fast model judges
   each thing they say in context, so requests without a question mark ("walk
@@ -141,7 +146,8 @@ words are not written as **You**:
 `agentdictate copilot --check` reports whether Windows echo cancellation is
 active. `agentdictate copilot --voices a.wav b.wav` shows how recordings'
 voices are told apart. `agentdictate copilot --names` runs scripted calls
-through the naming model, and `agentdictate copilot --window [shot.jpg]`
+through the naming model, `agentdictate copilot --rewrites [model]` rewrites a scripted
+line in every style, and `agentdictate copilot --window [shot.jpg]`
 reads the open meeting window (or a saved screenshot) once and prints who it
 shows speaking. `agentdictate copilot --echo-test path\to\speech.wav` plays a recording
 through your speakers while the copilot listens and reports anything that

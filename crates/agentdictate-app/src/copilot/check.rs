@@ -821,3 +821,139 @@ pub(crate) fn window(image: Option<&Path>) -> anyhow::Result<usize> {
         }
     }
 }
+
+/// Rewrites a scripted line in every style with the live instant model and
+/// reports each result, checking the length, the wording, and that specifics
+/// come from the user's knowledge.
+pub(crate) fn rewrites(model: Option<&str>) -> anyhow::Result<usize> {
+    use agentdictate_core::{RewriteStyle, rewrite_instruction};
+
+    let mut report = Report { failures: 0 };
+    let paths = crate::AppPaths::from_environment()?;
+    let mut settings = store::load(&store::settings_path(&paths.config_file));
+    let model = model.map_or_else(
+        || settings.provider.default_fast_model().to_owned(),
+        str::to_owned,
+    );
+    settings.set_answer_model(model.clone());
+    let chatgpt = Arc::new(ChatGptCredentials::discover());
+    let provider =
+        providers::provider_for(&settings, &chatgpt, "", &[]).map_err(anyhow::Error::msg)?;
+    println!("Rewrite check with {model}");
+    let lines: Vec<TranscriptLine> = [
+        (
+            Speaker::Them,
+            "We're looking at rolling this out to about forty people.",
+        ),
+        (
+            Speaker::Me,
+            "Great, that's a good size for the growth plan.",
+        ),
+        (Speaker::Them, "What would that cost us per year?"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (speaker, text))| TranscriptLine {
+        id: index as u64 + 1,
+        speaker,
+        text: text.to_owned(),
+        at_ms: index as u64 * 4_000,
+        voice: None,
+    })
+    .collect();
+    let transcript = render_transcript(&lines, &VoiceNames::new(), 8_000);
+    let knowledge = "[Pricing.md] Growth plan: $49 per seat per month, or $470 per seat per year \
+when billed annually. Teams over 25 seats get onboarding included.";
+    let line = "For forty seats on the growth plan, it comes to about twenty thousand a year, \
+and annual billing saves you a fair bit compared with paying monthly.";
+    for style in RewriteStyle::ALL {
+        let knowledge = if style == RewriteStyle::Specific {
+            knowledge
+        } else {
+            ""
+        };
+        let request = AnswerRequest {
+            system: answer_system_prompt(&settings),
+            user: answer_user_prompt(
+                &transcript,
+                &rewrite_instruction(style, line, ""),
+                false,
+                knowledge,
+            ),
+            image_jpeg: None,
+            model: model.clone(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 400,
+            cache_key: uuid::Uuid::new_v4().to_string(),
+        };
+        let started = Instant::now();
+        let cancel = AtomicBool::new(false);
+        let text = match providers::complete(provider.as_ref(), &request, &cancel) {
+            Ok(text) => text.trim().to_owned(),
+            Err(error) => {
+                report.fail(style.label(), error);
+                continue;
+            }
+        };
+        let words = text.split_whitespace().count();
+        let mut problems = Vec::new();
+        if text.is_empty() {
+            problems.push("empty");
+        }
+        if text.starts_with(['"', '\u{201c}', '-', '*']) || text.contains('\n') {
+            problems.push("not a single plain line");
+        }
+        match style {
+            RewriteStyle::Shorter if words > 22 => problems.push("too long"),
+            RewriteStyle::Specific if !text.contains("470") && !text.contains("18,800") => {
+                problems.push("no figure from the knowledge")
+            }
+            _ => {}
+        }
+        let detail = format!(
+            "{} ms, {words} words: {text}",
+            started.elapsed().as_millis()
+        );
+        if problems.is_empty() {
+            report.pass(style.label(), detail);
+        } else {
+            report.fail(style.label(), format!("{} ({detail})", problems.join(", ")));
+        }
+    }
+    // A draft that bought time becomes specific from what research found.
+    let draft = "Great question. For a team your size you'd be on our annual volume tier. \
+Let me give you the exact number.";
+    let researched = format!(
+        "{draft}\n\nFor 200 seats on annual billing it's $18 per seat per month, about $43,200 a year."
+    );
+    let request = AnswerRequest {
+        system: answer_system_prompt(&settings),
+        user: answer_user_prompt(
+            &transcript,
+            &rewrite_instruction(RewriteStyle::Specific, draft, &researched),
+            false,
+            "",
+        ),
+        image_jpeg: None,
+        model: model.clone(),
+        effort: CopilotEffort::Low,
+        web_search: false,
+        max_output_tokens: 400,
+        cache_key: uuid::Uuid::new_v4().to_string(),
+    };
+    let started = Instant::now();
+    let cancel = AtomicBool::new(false);
+    match providers::complete(provider.as_ref(), &request, &cancel) {
+        Ok(text) if text.contains("18") || text.contains("43,200") => report.pass(
+            "More specific from research",
+            format!("{} ms: {}", started.elapsed().as_millis(), text.trim()),
+        ),
+        Ok(text) => report.fail(
+            "More specific from research",
+            format!("the researched figure is missing: {}", text.trim()),
+        ),
+        Err(error) => report.fail("More specific from research", error),
+    }
+    Ok(report.failures)
+}

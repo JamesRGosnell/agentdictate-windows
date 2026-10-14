@@ -10,8 +10,8 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode, CopilotProvider,
-    CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction, Situation, Speaker,
-    SpeakerLabels, TranscriptLine, VoiceNames, combined_answer, format_offset, given_name,
+    CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction, RewriteStyle, Situation,
+    Speaker, SpeakerLabels, TranscriptLine, VoiceNames, combined_answer, format_offset, given_name,
     has_several_voices, model_pace, researched_follow_up,
 };
 use gpui::{
@@ -679,6 +679,20 @@ impl CopilotWindow {
         if self.typing {
             self.typing = false;
             self.with_host(cx, move |host| host.end_typing(restore_focus));
+        }
+    }
+
+    fn rewrite(&mut self, id: u64, style: RewriteStyle, cx: &mut Context<Self>) {
+        if let Some(text) = self.model.begin_rewrite(id, style) {
+            self.act(CopilotAction::Rewrite { id, style, text });
+            cx.notify();
+        }
+    }
+
+    fn step_version(&mut self, id: u64, forward: bool, cx: &mut Context<Self>) {
+        if let Some(text) = self.model.step_version(id, forward) {
+            self.act(CopilotAction::KeepVersion { id, text });
+            cx.notify();
         }
     }
 
@@ -1514,8 +1528,27 @@ impl CopilotWindow {
         } else {
             (body.clone(), FollowUp::Pending)
         };
+        // A rewrite replaces the line to say, including a correction it was
+        // made from.
+        let rewritten = answer.shown > 0;
+        let (hero, follow_up) = if rewritten {
+            let follow_up = match follow_up {
+                FollowUp::Correction(_) => FollowUp::Pending,
+                other => other,
+            };
+            (answer.line_to_say(), follow_up)
+        } else {
+            (hero, follow_up)
+        };
         let corrected = matches!(&follow_up, FollowUp::Correction(line) if !line.is_empty());
-        let copy_text = combined_answer(&instant, &body);
+        let copy_text = if rewritten {
+            answer.line_to_say()
+        } else {
+            combined_answer(&instant, &body)
+        };
+        let rewrite_row = (latest && (answer.line_ready() || answer.rewriting.is_some()))
+            .then(|| self.render_rewrites(answer, cx));
+        let rewriting_now = rewritten && hero.trim().is_empty();
         let style = TextViewStyle {
             is_dark: true,
             highlight_theme: HighlightTheme::default_dark(),
@@ -1661,7 +1694,9 @@ impl CopilotWindow {
                 .selectable(true)
         };
         let hero_view = (!hero.trim().is_empty()).then(|| {
-            let id = if has_instant {
+            let id = if rewritten {
+                format!("copilot-rewrite-text-{id}-{}", answer.shown)
+            } else if has_instant {
                 format!("copilot-instant-text-{id}")
             } else {
                 format!("copilot-answer-text-{id}")
@@ -1784,13 +1819,30 @@ impl CopilotWindow {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .text_size(px(if has_instant { 15.5 } else { 14. }))
+                                .text_size(px(if has_instant || rewritten { 15.5 } else { 14. }))
                                 .line_height(rems(1.45))
                                 .text_color(color(if corrected { MUTED } else { TEXT }))
                                 .child(hero_view),
                         ),
                 )
             })
+            .when(rewriting_now, |card| {
+                card.child(
+                    h_flex()
+                        .debug_selector(|| "copilot-rewriting".to_owned())
+                        .gap(px(8.))
+                        .text_size(px(12.))
+                        .text_color(color(DIM))
+                        .child(
+                            div()
+                                .size(px(5.))
+                                .rounded_full()
+                                .bg(color(ACCENT).opacity(0.3 + 0.7 * pulse(900.))),
+                        )
+                        .child("Rewriting"),
+                )
+            })
+            .when_some(rewrite_row, |card, row| card.child(row))
             .when_some(status_row, |card, row| card.child(row))
             .when_some(follow_up_view, |card, view| card.child(view))
             .when(!sources.is_empty(), |card| {
@@ -1822,6 +1874,90 @@ impl CopilotWindow {
                                     }))
                             }),
                     ),
+                )
+            })
+    }
+
+    /// One-click rewrites of the line to say, and the versions made so far.
+    fn render_rewrites(
+        &self,
+        answer: &AnswerCardModel,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let id = answer.id;
+        let busy = answer.rewriting.is_some();
+        let versions = answer.versions.len();
+        let shown = answer.shown;
+        let step = |selector: &'static str, glyph: &'static str, enabled: bool, forward: bool| {
+            div()
+                .debug_selector(move || selector.to_owned())
+                .id(selector)
+                .size(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .text_size(px(13.))
+                .text_color(color(if enabled { MUTED } else { 0xffffff26 }))
+                .when(enabled, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(|style| style.bg(color(HOVER)).text_color(color(TEXT)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.step_version(id, forward, cx);
+                        }))
+                })
+                .child(glyph)
+        };
+        h_flex()
+            .w_full()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .pl(px(15.))
+            .children(
+                RewriteStyle::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, style)| {
+                        chip(("copilot-rewrite", index), answer.rewriting == Some(style))
+                            .debug_selector(move || format!("copilot-rewrite-{index}"))
+                            .h(px(24.))
+                            .px(px(9.))
+                            .text_size(px(11.5))
+                            .child(style.label())
+                            .when(!busy, |chip| {
+                                chip.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.rewrite(id, style, cx);
+                                }))
+                            })
+                    }),
+            )
+            .when(versions > 0, |row| {
+                row.child(
+                    h_flex()
+                        .ml_auto()
+                        .gap(px(2.))
+                        .items_center()
+                        .child(step(
+                            "copilot-version-previous",
+                            "\u{2039}",
+                            !busy && shown > 0,
+                            false,
+                        ))
+                        .child(
+                            div()
+                                .debug_selector(|| "copilot-version-label".to_owned())
+                                .text_size(px(11.))
+                                .text_color(color(DIM))
+                                .child(format!("{}/{}", shown + 1, versions + 1)),
+                        )
+                        .child(step(
+                            "copilot-version-next",
+                            "\u{203a}",
+                            !busy && shown < versions,
+                            true,
+                        )),
                 )
             })
     }

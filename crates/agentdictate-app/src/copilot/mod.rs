@@ -119,6 +119,13 @@ pub fn run_copilot_names() -> anyhow::Result<usize> {
     check::names()
 }
 
+/// Rewrites a scripted line in every style with the live instant model.
+/// Returns the number of failed checks.
+#[cfg(windows)]
+pub fn run_copilot_rewrites(model: Option<&str>) -> anyhow::Result<usize> {
+    check::rewrites(model)
+}
+
 /// Reads the meeting window once, as live naming does. Returns the number of
 /// failed checks.
 #[cfg(windows)]

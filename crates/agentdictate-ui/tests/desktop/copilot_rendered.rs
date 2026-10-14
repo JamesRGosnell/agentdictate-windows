@@ -12,7 +12,7 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CopilotAction, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings,
-    KnowledgeSummary, ListenState, QuickAction, Situation, Speaker, TranscriptLine,
+    KnowledgeSummary, ListenState, QuickAction, RewriteStyle, Situation, Speaker, TranscriptLine,
 };
 use agentdictate_ui::{
     CopilotShape, CopilotViewModel, CopilotWindow, CopilotWindowHost, test_support,
@@ -388,6 +388,62 @@ fn a_complete_draft_is_marked_as_checked(cx: &mut TestAppContext) {
     stream_answer(&mut harness, "Nothing to add.");
     assert!(harness.has("copilot-answer-confirmed"));
     assert!(!harness.has("copilot-answer-more"));
+}
+
+#[gpui::test]
+fn the_line_to_say_is_rewritten_in_one_click_and_versions_compared(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    stream_answer(&mut harness, "Nothing to add.");
+    harness.click("copilot-rewrite-0");
+    assert_eq!(
+        harness.actions(),
+        vec![CopilotAction::Rewrite {
+            id: 7,
+            style: RewriteStyle::Shorter,
+            text: "\u{201c}It's $49 per seat on the growth plan.\u{201d}".into(),
+        }]
+    );
+    assert!(harness.has("copilot-rewriting"));
+    harness.send(CopilotEvent::RewriteDelta {
+        id: 7,
+        text: "$49 a seat.".into(),
+    });
+    harness.send(CopilotEvent::RewriteFinished { id: 7, error: None });
+    assert!(harness.has("copilot-version-label"));
+
+    // Earlier versions stay one click away, and the engine keeps the choice.
+    harness.click("copilot-version-previous");
+    harness.click("copilot-version-next");
+    assert_eq!(
+        harness.actions()[1..],
+        [
+            CopilotAction::KeepVersion { id: 7, text: None },
+            CopilotAction::KeepVersion {
+                id: 7,
+                text: Some("$49 a seat.".into()),
+            },
+        ]
+    );
+    // A rewrite of the rewrite starts from what is shown.
+    harness.click("copilot-rewrite-1");
+    assert_eq!(
+        harness.actions()[3],
+        CopilotAction::Rewrite {
+            id: 7,
+            style: RewriteStyle::Casual,
+            text: "$49 a seat.".into(),
+        }
+    );
+    harness.send(CopilotEvent::RewriteFinished {
+        id: 7,
+        error: Some("Rewrite stopped".into()),
+    });
+    // A failed rewrite leaves the earlier line in place, ready again.
+    harness.click("copilot-rewrite-2");
+    assert!(matches!(
+        &harness.actions()[4],
+        CopilotAction::Rewrite { style: RewriteStyle::Specific, text, .. } if text == "$49 a seat."
+    ));
 }
 
 #[gpui::test]

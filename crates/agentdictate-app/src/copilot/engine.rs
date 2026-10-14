@@ -19,13 +19,13 @@ use std::{
 use agentdictate_core::{
     AnswerStatus, CallView, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights,
     CopilotProvider, CopilotSettings, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction,
-    Speaker, SpeakerLabels, TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt,
-    call_view_system_prompt, call_view_user_prompt, combined_answer, detected_question_instruction,
-    insights_system_prompt, insights_user_prompt, is_echo_of, looks_like_question,
-    meeting_notes_markdown, notes_system_prompt, parse_call_view, parse_insights,
-    parse_turn_verdict, render_transcript, researched_guidance, split_follow_up,
-    turn_judge_system_prompt, turn_judge_user_prompt, typed_question_instruction,
-    utterance_similarity, worth_judging,
+    RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, TurnContext, answer_system_prompt,
+    answer_user_prompt, call_view_system_prompt, call_view_user_prompt, combined_answer,
+    detected_question_instruction, insights_system_prompt, insights_user_prompt, is_echo_of,
+    looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_call_view,
+    parse_insights, parse_turn_verdict, render_transcript, researched_guidance,
+    rewrite_instruction, split_follow_up, turn_judge_system_prompt, turn_judge_user_prompt,
+    typed_question_instruction, utterance_similarity, worth_judging,
 };
 
 use super::{
@@ -228,6 +228,11 @@ pub(crate) enum EngineMsg {
         at_ms: u64,
         shot: Result<CallShot, String>,
     },
+    /// A rewrite of an answer's line finished with this text.
+    Rewritten {
+        id: u64,
+        text: String,
+    },
     /// Who the meeting window showed speaking while `voice` spoke.
     WindowRead {
         voice: u8,
@@ -333,7 +338,12 @@ pub(crate) struct Engine {
     notes_path: Option<PathBuf>,
     next_answer: u64,
     active_answer: Option<ActiveAnswer>,
-    answers: Vec<(String, String)>,
+    /// Answers shown this session, for the notes: id, title, and text.
+    answers: Vec<(u64, String, String)>,
+    /// The rewritten lines the user kept, by answer.
+    kept: std::collections::HashMap<u64, String>,
+    /// Stops the rewrite in progress.
+    rewrite_cancel: Option<Arc<AtomicBool>>,
     last_auto_question: Option<(String, Instant)>,
     insights_in_flight: bool,
     last_insights_at: Option<Instant>,
@@ -381,6 +391,8 @@ impl Engine {
             next_answer: 1,
             active_answer: None,
             answers: Vec::new(),
+            kept: std::collections::HashMap::new(),
+            rewrite_cancel: None,
             last_auto_question: None,
             insights_in_flight: false,
             last_insights_at: None,
@@ -666,6 +678,9 @@ impl Engine {
                 }
             }
             EngineMsg::WindowRead { voice, view } => self.handle_window_read(voice, view),
+            EngineMsg::Rewritten { id, text } => {
+                self.kept.insert(id, text);
+            }
             EngineMsg::ModelsLoaded(provider, models) => {
                 if provider == CopilotProvider::ChatgptSubscription {
                     self.chatgpt_models = models.iter().map(|model| model.id.clone()).collect();
@@ -741,6 +756,15 @@ impl Engine {
                 self.services.platform.copy_text(&text);
                 (self.ui)(CopilotEvent::Notice("Copied".into()));
             }
+            CopilotAction::Rewrite { id, style, text } => self.rewrite(id, style, &text),
+            CopilotAction::KeepVersion { id, text } => match text {
+                Some(text) => {
+                    self.kept.insert(id, text);
+                }
+                None => {
+                    self.kept.remove(&id);
+                }
+            },
             CopilotAction::NameSpeaker { voice, name } => {
                 self.roster.note(voice, &name, Clue::User);
                 tracing::info!(voice, named = !name.trim().is_empty(), "speaker named");
@@ -1013,7 +1037,7 @@ impl Engine {
             draft.finished = Some((title, text));
             return;
         }
-        self.answers.push((title, text));
+        self.answers.push((id, title, text));
     }
 
     /// Judges whether a line from the other side calls for the user to
@@ -1150,8 +1174,8 @@ impl Engine {
                 "answering the other side automatically"
             );
             self.last_auto_question = Some((turn.text, Instant::now()));
-            if let Some(finished) = draft.finished {
-                self.answers.push(finished);
+            if let Some((title, text)) = draft.finished {
+                self.answers.push((draft.id, title, text));
             }
             return;
         }
@@ -1454,6 +1478,96 @@ impl Engine {
             return None;
         }
         Some((id, gate))
+    }
+
+    /// Rewrites an answer's line to say with the quickest model, streaming
+    /// the new line to the answer card: restyling a written line needs speed
+    /// more than knowledge, and specifics come from the user's documents.
+    fn rewrite(&mut self, id: u64, style: RewriteStyle, line: &str) {
+        if line.trim().is_empty() || self.ending {
+            return;
+        }
+        if let Some(cancel) = self.rewrite_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.rewrite_cancel = Some(Arc::clone(&cancel));
+        let names = self.roster.names();
+        let transcript = render_transcript(&self.transcript, &names, ANSWER_TRANSCRIPT_CHARS);
+        // Specifics come from the user's own documents.
+        let knowledge = if style == RewriteStyle::Specific {
+            self.knowledge_for(&AnswerKind::Typed(line.to_owned()))
+        } else {
+            String::new()
+        };
+        // What research added to the answer can make the line specific.
+        let details = self
+            .answers
+            .iter()
+            .rev()
+            .find(|(answer, _, _)| *answer == id)
+            .map(|(_, _, text)| text.as_str())
+            .unwrap_or_default();
+        let mut settings = self.settings.clone();
+        settings.set_answer_model(self.settings.provider.default_fast_model());
+        let request = AnswerRequest {
+            system: answer_system_prompt(&self.settings),
+            user: answer_user_prompt(
+                &transcript,
+                &rewrite_instruction(style, line, details),
+                false,
+                &knowledge,
+            ),
+            image_jpeg: None,
+            model: settings.answer_model(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 400,
+            cache_key: format!("{}-instant", self.session_key),
+        };
+        let providers = Arc::clone(&self.services.providers);
+        let ui = Arc::clone(&self.ui);
+        let messages = self.messages.clone();
+        let spawned = std::thread::Builder::new()
+            .name("copilot-rewrite".into())
+            .spawn(move || {
+                let mut text = String::new();
+                let result = providers(&settings).and_then(|provider| {
+                    provider.stream(&request, &cancel, &mut |event| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if let StreamEvent::Text(delta) = event {
+                            text.push_str(&delta);
+                            ui(CopilotEvent::RewriteDelta { id, text: delta });
+                        }
+                    })
+                });
+                if cancel.load(Ordering::Relaxed) {
+                    ui(CopilotEvent::RewriteFinished {
+                        id,
+                        error: Some("Rewrite stopped".into()),
+                    });
+                    return;
+                }
+                let error = match result {
+                    Err(error) => Some(error),
+                    Ok(()) if text.trim().is_empty() => Some("The rewrite came back empty".into()),
+                    Ok(()) => None,
+                };
+                if let Some(error) = &error {
+                    tracing::warn!(%error, "copilot rewrite failed");
+                } else {
+                    let _ = messages.send(EngineMsg::Rewritten {
+                        id,
+                        text: text.trim().to_owned(),
+                    });
+                }
+                ui(CopilotEvent::RewriteFinished { id, error });
+            });
+        if let Err(error) = spawned {
+            tracing::error!(%error, "could not start a copilot rewrite");
+        }
     }
 
     /// Excerpts from the user's documents and meetings for an answer: the
@@ -1904,6 +2018,18 @@ impl Engine {
             slug.chars().take(60).collect::<String>()
         );
         let path = self.services.notes_dir.join(name);
+        // A rewritten line the user kept follows the answer it came from.
+        let answers: Vec<(String, String)> = self
+            .answers
+            .iter()
+            .map(|(id, title, text)| {
+                let text = match self.kept.get(id) {
+                    Some(kept) => format!("{text}\n\n**Said instead:** {kept}"),
+                    None => text.clone(),
+                };
+                (title.clone(), text)
+            })
+            .collect();
         let markdown = meeting_notes_markdown(
             &title,
             &started.format("%Y-%m-%d %H:%M").to_string(),
@@ -1911,7 +2037,7 @@ impl Engine {
             summary,
             &self.transcript,
             &self.roster.names(),
-            &self.answers,
+            &answers,
         );
         std::fs::write(&path, markdown)?;
         Ok(path)
@@ -2842,7 +2968,7 @@ mod tests {
             at_ms: 0,
             voice: None,
         });
-        engine.answers.push(("Q".into(), "A".into()));
+        engine.answers.push((1, "Q".into(), "A".into()));
         let path = engine.write_notes(Some("Summary text")).unwrap();
         assert!(path.starts_with(directory.path().join("meetings")));
         let notes = std::fs::read_to_string(path).unwrap();
@@ -2999,6 +3125,66 @@ mod tests {
         engine.looks.speech_started = Some(Instant::now() - LOOK_AFTER);
         engine.tick();
         assert!(!engine.looks.busy && !engine.looks.captured);
+    }
+
+    #[test]
+    fn rewrites_stream_from_the_quickest_model_and_the_kept_line_reaches_the_notes() {
+        let (mut engine, incoming, events, requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.handle_transcribed(Speaker::Them, 0, 1_000, Ok("What does it cost?".into()));
+        engine.answers.push((
+            4,
+            "What does it cost?".into(),
+            "It's $20 per seat.\n\nVolume pricing starts at 150 seats.".into(),
+        ));
+        engine.handle_action(CopilotAction::Rewrite {
+            id: 4,
+            style: RewriteStyle::Shorter,
+            text: "It's $20 per seat.".into(),
+        });
+        loop {
+            let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+            let rewritten = matches!(message, EngineMsg::Rewritten { id: 4, .. });
+            engine.handle(message);
+            if rewritten {
+                break;
+            }
+        }
+        let request = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.user.contains("<line>"))
+            .cloned()
+            .unwrap();
+        assert_eq!(request.model, "gpt-6-luna");
+        assert!(!request.web_search);
+        assert!(request.user.contains("<line>\nIt's $20 per seat.\n</line>"));
+        assert!(request.user.contains("Them: What does it cost?"));
+        assert!(request.user.contains("Volume pricing starts at 150 seats."));
+        {
+            let events = events.lock().unwrap();
+            let streamed: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    CopilotEvent::RewriteDelta { id: 4, text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(streamed, "Say: **$20** per seat.");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                CopilotEvent::RewriteFinished { id: 4, error: None }
+            )));
+        }
+        let notes = std::fs::read_to_string(engine.write_notes(None).unwrap()).unwrap();
+        assert!(notes.contains("150 seats.\n\n**Said instead:** Say: **$20** per seat."));
+        // Going back to the original drops the rewrite from the notes.
+        engine.handle_action(CopilotAction::KeepVersion { id: 4, text: None });
+        let notes = std::fs::read_to_string(engine.write_notes(None).unwrap()).unwrap();
+        assert!(!notes.contains("Said instead"));
     }
 
     #[test]

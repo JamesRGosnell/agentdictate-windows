@@ -336,6 +336,68 @@ impl QuickAction {
     }
 }
 
+/// Ways to rewrite the line to say with one click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteStyle {
+    Shorter,
+    Casual,
+    Specific,
+    Another,
+}
+
+impl RewriteStyle {
+    pub const ALL: [Self; 4] = [Self::Shorter, Self::Casual, Self::Specific, Self::Another];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Shorter => "Shorter",
+            Self::Casual => "More casual",
+            Self::Specific => "More specific",
+            Self::Another => "Another way",
+        }
+    }
+
+    const fn guidance(self) -> &'static str {
+        match self {
+            Self::Shorter => {
+                "Make it shorter: one sentence of at most 20 words that keeps the key fact."
+            }
+            Self::Casual => {
+                "Make it more casual and conversational, as I would say it to a colleague, with the same facts."
+            }
+            Self::Specific => {
+                "Make it more specific with one concrete detail, such as a number, name, date, or example, \
+taken from my knowledge excerpts or the conversation. Never invent one; if none is available, make the wording more precise."
+            }
+            Self::Another => {
+                "Say it another way: the same meaning in different words and structure."
+            }
+        }
+    }
+}
+
+/// Instruction for rewriting a line the user is about to say. `details` is
+/// the full answer the line came from, including what research added.
+#[must_use]
+pub fn rewrite_instruction(style: RewriteStyle, line: &str, details: &str) -> String {
+    let details = details.trim();
+    let details = if details.is_empty() || details == line.trim() {
+        String::new()
+    } else {
+        format!(
+            "The full answer it came from, with checked details you may use:\n<answer>\n{details}\n</answer>\n"
+        )
+    };
+    format!(
+        "I'm about to say this:\n<line>\n{}\n</line>\n{details}{} Reply with only the new line to say, in the first person, \
+with no preamble, quotes, bullets, or mention of my documents.",
+        line.trim(),
+        style.guidance()
+    )
+}
+
 /// Persisted copilot preferences, stored beside the dictation settings in
 /// `copilot.json` so the meeting assistant evolves independently.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -898,6 +960,15 @@ pub enum CopilotEvent {
     InstantFinished {
         id: u64,
     },
+    /// Text of a rewrite of an answer's line to say.
+    RewriteDelta {
+        id: u64,
+        text: String,
+    },
+    RewriteFinished {
+        id: u64,
+        error: Option<String>,
+    },
     AnswerSource {
         id: u64,
         source: AnswerSource,
@@ -946,6 +1017,18 @@ pub enum CopilotAction {
     OpenKnowledgeFolder,
     OpenUrl(String),
     CopyText(String),
+    /// Rewrites an answer's line to say, `text`, in a style.
+    Rewrite {
+        id: u64,
+        style: RewriteStyle,
+        text: String,
+    },
+    /// The version of an answer's line the user settled on; `None` for the
+    /// original.
+    KeepVersion {
+        id: u64,
+        text: Option<String>,
+    },
     /// Names one of the other side's voices; an empty name forgets it.
     NameSpeaker {
         voice: u8,
@@ -2085,6 +2168,29 @@ mod tests {
         let prompt = call_view_user_prompt(Some("Weekly sync | Microsoft Teams"), "I'm James.");
         assert!(prompt.contains("Window title: Weekly sync"));
         assert!(prompt.contains("About the user: I'm James."));
+    }
+
+    #[test]
+    fn rewrites_quote_the_line_and_ask_for_only_the_new_one() {
+        let instruction = rewrite_instruction(RewriteStyle::Shorter, " It's $20 per seat. ", "");
+        assert!(instruction.contains("<line>\nIt's $20 per seat.\n</line>"));
+        assert!(instruction.contains("at most 20 words"));
+        assert!(instruction.contains("only the new line"));
+        assert!(!instruction.contains("<answer>"));
+        let specific = rewrite_instruction(
+            RewriteStyle::Specific,
+            "Let me get you the number.",
+            "Let me get you the number.\n\nIt's $18 per seat.",
+        );
+        assert!(specific.contains("Never invent"));
+        assert!(
+            specific
+                .contains("<answer>\nLet me get you the number.\n\nIt's $18 per seat.\n</answer>")
+        );
+        assert_eq!(
+            RewriteStyle::ALL.map(RewriteStyle::label),
+            ["Shorter", "More casual", "More specific", "Another way"]
+        );
     }
 
     #[test]

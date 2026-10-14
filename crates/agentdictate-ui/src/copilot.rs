@@ -2,7 +2,8 @@
 
 use agentdictate_core::{
     AnswerSource, AnswerStatus, CopilotEvent, CopilotInsights, CopilotSettings, CopilotShortcuts,
-    KnowledgeSummary, ListenState, ModelChoice, Speaker, SpeakerLabels, TranscriptLine, VoiceNames,
+    FollowUp, KnowledgeSummary, ListenState, ModelChoice, RewriteStyle, Speaker, SpeakerLabels,
+    TranscriptLine, VoiceNames, researched_follow_up,
 };
 
 /// Logical window metrics. The window resizes between the bar alone and the
@@ -56,9 +57,48 @@ pub struct AnswerCardModel {
     pub used_screen: bool,
     pub model: String,
     pub automatic: bool,
+    /// Rewrites of the line to say, oldest first.
+    pub versions: Vec<String>,
+    /// The version shown: 0 for the original, then each rewrite.
+    pub shown: usize,
+    /// The style of the rewrite streaming in.
+    pub rewriting: Option<RewriteStyle>,
 }
 
 impl AnswerCardModel {
+    /// The line to say as first written: the instant draft, the correction
+    /// that replaced it, or the answer itself.
+    #[must_use]
+    pub fn original_line(&self) -> String {
+        if self.instant.trim().is_empty() {
+            return self.body.trim().to_owned();
+        }
+        match researched_follow_up(&self.body) {
+            FollowUp::Correction(line) if !line.is_empty() => line,
+            _ => self.instant.trim().to_owned(),
+        }
+    }
+
+    /// The line to say as shown now.
+    #[must_use]
+    pub fn line_to_say(&self) -> String {
+        match self.shown {
+            0 => self.original_line(),
+            version => self.versions.get(version - 1).cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Whether the line to say is complete and can be rewritten.
+    #[must_use]
+    pub fn line_ready(&self) -> bool {
+        let written = if self.instant.trim().is_empty() {
+            self.status == AnswerStatus::Done
+        } else {
+            !self.instant_active
+        };
+        written && self.rewriting.is_none() && !self.line_to_say().trim().is_empty()
+    }
+
     #[must_use]
     pub fn status_label(&self) -> Option<String> {
         match &self.status {
@@ -166,6 +206,41 @@ impl CopilotViewModel {
             .collect()
     }
 
+    /// Starts rewriting an answer's line to say as shown; returns the line.
+    pub fn begin_rewrite(&mut self, id: u64, style: RewriteStyle) -> Option<String> {
+        let answer = self.answer_mut(id)?;
+        if !answer.line_ready() {
+            return None;
+        }
+        let line = answer.line_to_say();
+        answer.versions.push(String::new());
+        answer.shown = answer.versions.len();
+        answer.rewriting = Some(style);
+        Some(line)
+    }
+
+    /// Shows the previous or next version of an answer's line; returns the
+    /// rewrite now kept, or `None` inside for the original.
+    pub fn step_version(&mut self, id: u64, forward: bool) -> Option<Option<String>> {
+        let answer = self.answer_mut(id)?;
+        if answer.rewriting.is_some() {
+            return None;
+        }
+        let next = if forward {
+            answer.shown + 1
+        } else {
+            answer.shown.checked_sub(1)?
+        };
+        if next > answer.versions.len() {
+            return None;
+        }
+        answer.shown = next;
+        Some(
+            next.checked_sub(1)
+                .map(|index| answer.versions[index].clone()),
+        )
+    }
+
     /// Names a voice right away; the engine confirms it.
     pub fn name_speaker(&mut self, voice: u8, name: &str) {
         let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -260,6 +335,9 @@ impl CopilotViewModel {
                     used_screen,
                     model,
                     automatic,
+                    versions: Vec::new(),
+                    shown: 0,
+                    rewriting: None,
                 });
                 if self.answers.len() > 30 {
                     self.answers.remove(0);
@@ -296,6 +374,30 @@ impl CopilotViewModel {
             CopilotEvent::InstantFinished { id } => {
                 if let Some(answer) = self.answer_mut(id) {
                     answer.instant_active = false;
+                }
+            }
+            CopilotEvent::RewriteDelta { id, text } => {
+                if let Some(answer) = self.answer_mut(id)
+                    && answer.rewriting.is_some()
+                    && let Some(version) = answer.versions.last_mut()
+                {
+                    version.push_str(&text);
+                }
+            }
+            CopilotEvent::RewriteFinished { id, error } => {
+                if let Some(answer) = self.answer_mut(id) {
+                    answer.rewriting = None;
+                    if answer
+                        .versions
+                        .last()
+                        .is_some_and(|version| error.is_some() || version.trim().is_empty())
+                    {
+                        answer.versions.pop();
+                        answer.shown = answer.shown.min(answer.versions.len());
+                    }
+                }
+                if let Some(error) = error {
+                    self.notice = Some(error);
                 }
             }
             CopilotEvent::AnswerSource { id, source } => {
