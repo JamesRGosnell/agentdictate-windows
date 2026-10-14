@@ -9,10 +9,10 @@ use std::{
 };
 
 use agentdictate_core::{
-    CopilotEffort, CopilotSettings, QuickAction, Speaker, TranscriptLine, VoiceNames,
-    answer_system_prompt, answer_user_prompt, detected_question_instruction,
+    CopilotEffort, CopilotSettings, QuickAction, Situation, Speaker, TranscriptLine, TurnContext,
+    VoiceNames, answer_system_prompt, answer_user_prompt, detected_question_instruction,
     insights_system_prompt, insights_user_prompt, looks_like_question, parse_insights,
-    render_transcript,
+    parse_turn_verdict, render_transcript, turn_judge_system_prompt, turn_judge_user_prompt,
 };
 
 use super::{
@@ -293,6 +293,54 @@ pub(crate) fn run(speech: Option<&Path>, latency: bool) -> anyhow::Result<usize>
                             .collect::<Vec<_>>()
                             .join(" "),
                     );
+                }
+            }
+        }
+        // A question is shown only once the turn judge agrees, so the judge
+        // is timed to its complete verdict.
+        let conversation = [
+            TranscriptLine {
+                id: 1,
+                speaker: Speaker::Me,
+                text: "Happy to walk you through how we handle security reviews.".into(),
+                at_ms: 1_000,
+                voice: None,
+            },
+            TranscriptLine {
+                at_ms: 5_000,
+                ..probe[0].clone()
+            },
+        ];
+        let judge_user = turn_judge_user_prompt(
+            &render_transcript(&conversation, &VoiceNames::new(), 8_000),
+            &probe[0].text,
+            TurnContext {
+                situation: Situation::Conversation,
+                me_last_spoke_secs: Some(4),
+            },
+        );
+        for round in 1..=3 {
+            for model in ["gpt-6-luna", "gpt-5.6-luna", "gpt-6-sol", "gpt-5.6-sol"]
+                .iter()
+                .filter(|model| catalog.iter().any(|known| known == *model))
+            {
+                let mut model_settings = settings.clone();
+                model_settings.set_answer_model(*model);
+                let timed = AnswerRequest {
+                    system: turn_judge_system_prompt().to_owned(),
+                    user: judge_user.clone(),
+                    image_jpeg: None,
+                    model: (*model).to_owned(),
+                    effort: CopilotEffort::Low,
+                    web_search: false,
+                    max_output_tokens: 200,
+                    cache_key: uuid::Uuid::new_v4().to_string(),
+                };
+                let label = format!("Turn judge {model}, round {round}");
+                if let Some(text) = answer(&model_settings, &timed, &label, &mut report)
+                    && parse_turn_verdict(&text) != Some(true)
+                {
+                    report.fail(&label, format!("expected to answer, got {text:?}"));
                 }
             }
         }

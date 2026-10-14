@@ -39,6 +39,9 @@ use super::{
 };
 
 const TRANSCRIPTION_WORKERS: usize = 3;
+/// Provisional utterances whose early transcripts are kept at once; a few
+/// cover two playback devices carrying the same call.
+const MAX_EARLY_TRANSCRIPTS: usize = 4;
 const ANSWER_TRANSCRIPT_CHARS: usize = 24_000;
 const INSIGHTS_TRANSCRIPT_CHARS: usize = 8_000;
 const INSIGHTS_INTERVAL: Duration = Duration::from_secs(20);
@@ -71,6 +74,12 @@ const TURN_EXPIRY: Duration = Duration::from_secs(8);
 /// Longest the fast model's judgment is awaited before deciding from the
 /// wording alone.
 const TURN_VERDICT_WAIT: Duration = Duration::from_secs(3);
+/// Longest a line worded like a question waits for the judgment when the
+/// user is talking with one person. The judge mostly catches questions put
+/// to someone else, which such a call rarely has, and it can take seconds.
+const ONE_ON_ONE_VERDICT_WAIT: Duration = Duration::from_millis(1_500);
+/// The user spoke this recently, so they are in the conversation.
+const ONE_ON_ONE_RECENT_MS: u64 = 120_000;
 /// System-audio speech starting this long after a question ended is new
 /// speech. The segmenter needs over half a second of silence to end an
 /// utterance, while another device's copy of the question starts with it.
@@ -115,6 +124,12 @@ pub(crate) enum AudioMsg {
         speaker: Speaker,
         active: bool,
     },
+    /// Speech that paused long enough to have ended, sent ahead of its
+    /// [`AudioMsg::Utterance`] so transcription can start early.
+    Provisional {
+        speaker: Speaker,
+        utterance: Utterance,
+    },
     Utterance {
         speaker: Speaker,
         utterance: Utterance,
@@ -138,6 +153,7 @@ impl AudioMsg {
                 speaker,
                 active: false,
             }],
+            SegmentEvent::Provisional(utterance) => vec![Self::Provisional { speaker, utterance }],
             SegmentEvent::Utterance(utterance) => vec![
                 Self::Utterance { speaker, utterance },
                 Self::Speaking {
@@ -216,6 +232,11 @@ pub(crate) enum EngineMsg {
         end_ms: u64,
         text: Result<String, String>,
     },
+    /// A provisional utterance's transcript.
+    EarlyTranscribed {
+        id: u64,
+        text: Result<String, String>,
+    },
     AnswerFinished {
         id: u64,
         title: String,
@@ -256,6 +277,20 @@ struct TranscriptionJob {
     start_ms: u64,
     end_ms: u64,
     wav: Vec<u8>,
+    /// Set for a provisional utterance, whose transcript is used only if
+    /// the utterance ends as it stood.
+    early: Option<u64>,
+}
+
+/// A provisional utterance being transcribed ahead of its end.
+struct EarlyTranscript {
+    id: u64,
+    speaker: Speaker,
+    start_sample: u64,
+    samples: usize,
+    text: Option<Result<String, String>>,
+    /// The finished utterance's times, once it turned out to be this one.
+    adopted: Option<(u64, u64)>,
 }
 
 struct ThemSpan {
@@ -328,6 +363,8 @@ pub(crate) struct Engine {
     paused: bool,
     jobs: Option<Sender<TranscriptionJob>>,
     in_flight: Arc<AtomicUsize>,
+    early: Vec<EarlyTranscript>,
+    next_early: u64,
     transcript: Vec<TranscriptLine>,
     next_line: u64,
     them_spans: VecDeque<ThemSpan>,
@@ -391,6 +428,8 @@ impl Engine {
             paused: false,
             jobs: None,
             in_flight: Arc::new(AtomicUsize::new(0)),
+            early: Vec::new(),
+            next_early: 1,
             transcript: Vec::new(),
             next_line: 1,
             them_spans: VecDeque::new(),
@@ -481,18 +520,20 @@ impl Engine {
                             audio_ms = job.end_ms.saturating_sub(job.start_ms),
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             ok = text.is_ok(),
+                            early = job.early.is_some(),
                             "copilot utterance transcribed"
                         );
                         in_flight.fetch_sub(1, Ordering::AcqRel);
-                        if messages
-                            .send(EngineMsg::Transcribed {
+                        let message = match job.early {
+                            Some(id) => EngineMsg::EarlyTranscribed { id, text },
+                            None => EngineMsg::Transcribed {
                                 speaker: job.speaker,
                                 start_ms: job.start_ms,
                                 end_ms: job.end_ms,
                                 text,
-                            })
-                            .is_err()
-                        {
+                            },
+                        };
+                        if messages.send(message).is_err() {
                             return;
                         }
                     }
@@ -655,6 +696,7 @@ impl Engine {
                 end_ms,
                 text,
             } => self.handle_transcribed(speaker, start_ms, end_ms, text),
+            EngineMsg::EarlyTranscribed { id, text } => self.handle_early_transcribed(id, text),
             EngineMsg::AnswerFinished { id, title, text } => {
                 self.handle_answer_finished(id, title, text);
             }
@@ -870,6 +912,9 @@ impl Engine {
                 }
                 (self.ui)(CopilotEvent::Speaking { speaker, active });
             }
+            AudioMsg::Provisional { speaker, utterance } => {
+                self.transcribe_early(speaker, &utterance);
+            }
             AudioMsg::Utterance { speaker, utterance } => self.queue_utterance(speaker, utterance),
             AudioMsg::Problem(problem) => {
                 tracing::warn!(%problem, "copilot audio problem");
@@ -879,15 +924,72 @@ impl Engine {
         }
     }
 
-    fn queue_utterance(&mut self, speaker: Speaker, utterance: Utterance) {
-        // Times bound the speech itself on the session clock, so the two
-        // sides line up: the segmenter releases an utterance after a stretch
-        // of silence, and pads it with audio from before speech began.
+    /// When an utterance's speech began and ended on the session clock, so
+    /// the two sides line up: the segmenter releases an utterance after a
+    /// stretch of silence, and pads it with audio from before speech began.
+    fn speech_times(&self, utterance: &Utterance) -> (u64, u64) {
         let released = self
             .elapsed_ms()
             .saturating_sub(utterance.released_after_ms);
         let start_ms = released.saturating_sub(utterance.duration_ms()) + utterance.lead_ms;
         let end_ms = released.saturating_sub(utterance.tail_ms).max(start_ms);
+        (start_ms, end_ms)
+    }
+
+    /// Starts transcribing speech that paused, before the pause is long
+    /// enough to end it, so the text is ready sooner if it did end.
+    fn transcribe_early(&mut self, speaker: Speaker, utterance: &Utterance) {
+        let Some(jobs) = &self.jobs else { return };
+        // A longer copy of the same speech replaces a shorter one.
+        self.early.retain(|early| {
+            !(early.speaker == speaker && early.start_sample == utterance.start_sample)
+        });
+        if self.early.len() >= MAX_EARLY_TRANSCRIPTS {
+            self.early.remove(0);
+        }
+        let (start_ms, end_ms) = self.speech_times(utterance);
+        let id = self.next_early;
+        self.next_early += 1;
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let job = TranscriptionJob {
+            speaker,
+            start_ms,
+            end_ms,
+            wav: wav_bytes(&utterance.samples),
+            early: Some(id),
+        };
+        if jobs.send(job).is_err() {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        self.early.push(EarlyTranscript {
+            id,
+            speaker,
+            start_sample: utterance.start_sample,
+            samples: utterance.samples.len(),
+            text: None,
+            adopted: None,
+        });
+    }
+
+    /// Uses a provisional utterance's transcript once the utterance ended as
+    /// it stood; otherwise keeps it until that is known.
+    fn handle_early_transcribed(&mut self, id: u64, text: Result<String, String>) {
+        // Speech that went on is transcribed again in full.
+        let Some(index) = self.early.iter().position(|early| early.id == id) else {
+            return;
+        };
+        match self.early[index].adopted {
+            Some((start_ms, end_ms)) => {
+                let early = self.early.remove(index);
+                self.handle_transcribed(early.speaker, start_ms, end_ms, text);
+            }
+            None => self.early[index].text = Some(text),
+        }
+    }
+
+    fn queue_utterance(&mut self, speaker: Speaker, utterance: Utterance) {
+        let (start_ms, end_ms) = self.speech_times(&utterance);
         if speaker == Speaker::Them {
             // Voices are assigned in the order people spoke.
             let voice = self.voices.assign(voice_print(&utterance.samples));
@@ -906,6 +1008,22 @@ impl Engine {
             }
             self.match_shots();
         }
+        if let Some(index) = self.early.iter().position(|early| {
+            early.speaker == speaker && early.start_sample == utterance.start_sample
+        }) {
+            let mut early = self.early.remove(index);
+            // The pause ended the speech: its early transcript is this one.
+            if early.samples == utterance.samples.len() {
+                match early.text.take() {
+                    Some(text) => self.handle_transcribed(speaker, start_ms, end_ms, text),
+                    None => {
+                        early.adopted = Some((start_ms, end_ms));
+                        self.early.push(early);
+                    }
+                }
+                return;
+            }
+        }
         let Some(jobs) = &self.jobs else { return };
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         if jobs
@@ -914,6 +1032,7 @@ impl Engine {
                 start_ms,
                 end_ms,
                 wav: wav_bytes(&utterance.samples),
+                early: None,
             })
             .is_err()
         {
@@ -1134,15 +1253,9 @@ impl Engine {
         let mut settings = self.settings.clone();
         // Judging keeps pace with the call whatever model drafts answers.
         settings.set_answer_model(self.settings.provider.default_fast_model());
-        let now_ms = self.elapsed_ms();
         let context = TurnContext {
             situation: self.insights.situation,
-            me_last_spoke_secs: self
-                .transcript
-                .iter()
-                .rev()
-                .find(|line| line.speaker == Speaker::Me)
-                .map(|line| now_ms.saturating_sub(line.at_ms) / 1_000),
+            me_last_spoke_secs: self.since_me_spoke_ms().map(|since| since / 1_000),
         };
         let request = AnswerRequest {
             system: turn_judge_system_prompt().to_owned(),
@@ -1199,9 +1312,14 @@ impl Engine {
         if self.them_speaking || self.elapsed_ms() < turn.end_ms + QUESTION_PAUSE_MS {
             return;
         }
+        let verdict_wait = if turn.likely && self.one_on_one() {
+            ONE_ON_ONE_VERDICT_WAIT
+        } else {
+            TURN_VERDICT_WAIT
+        };
         let respond = match turn.verdict {
             Some(respond) => respond,
-            None if turn.heard.elapsed() >= TURN_VERDICT_WAIT => turn.likely,
+            None if turn.heard.elapsed() >= verdict_wait => turn.likely,
             None => return,
         };
         if !respond {
@@ -1226,6 +1344,25 @@ impl Engine {
             return;
         }
         self.maybe_auto_answer(turn.text);
+    }
+
+    /// How long ago the user last spoke, if they have.
+    fn since_me_spoke_ms(&self) -> Option<u64> {
+        let now_ms = self.elapsed_ms();
+        self.transcript
+            .iter()
+            .rev()
+            .find(|line| line.speaker == Speaker::Me)
+            .map(|line| now_ms.saturating_sub(line.at_ms))
+    }
+
+    /// Whether the user is talking with one person: a single voice on the
+    /// other side, and the user speaking recently.
+    fn one_on_one(&self) -> bool {
+        self.voices.count() <= 1
+            && self
+                .since_me_spoke_ms()
+                .is_some_and(|since| since <= ONE_ON_ONE_RECENT_MS)
     }
 
     /// Forgets the pending turn, discarding its hidden draft unseen.
@@ -2005,6 +2142,9 @@ impl Engine {
                     end_ms,
                     text,
                 }) => self.handle_transcribed(speaker, start_ms, end_ms, text),
+                Ok(EngineMsg::EarlyTranscribed { id, text }) => {
+                    self.handle_early_transcribed(id, text);
+                }
                 Ok(EngineMsg::AnswerFinished { id, title, text }) => {
                     self.handle_answer_finished(id, title, text);
                 }
@@ -2524,6 +2664,109 @@ mod tests {
         });
         drain(&mut engine, &incoming);
         assert_eq!(answers_started(&events), 1);
+    }
+
+    #[test]
+    fn a_slow_judge_holds_a_one_on_one_question_only_briefly() {
+        let (mut engine, _incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        let ask = |engine: &mut Engine| {
+            engine.pending_turn = Some(PendingTurn {
+                id: 1,
+                text: "What does pricing look like for a team of ten?".into(),
+                end_ms: 3_000,
+                verdict: None,
+                likely: true,
+                draft: None,
+                heard: Instant::now() - Duration::from_millis(1_600),
+            });
+            engine.evaluate_turn();
+        };
+        // Before the user takes part, the judge decides who was asked.
+        ask(&mut engine);
+        assert_eq!(answers_started(&events), 0);
+        assert!(engine.pending_turn.is_some());
+        // Talking with one person, the question is theirs to answer.
+        engine.publish(TranscriptLine {
+            id: 9,
+            speaker: Speaker::Me,
+            text: "Happy to walk you through it.".into(),
+            at_ms: 25_000,
+            voice: None,
+        });
+        ask(&mut engine);
+        assert_eq!(answers_started(&events), 1);
+        assert!(engine.pending_turn.is_none());
+    }
+
+    fn provisional(samples: usize) -> Utterance {
+        Utterance {
+            samples: vec![0; samples],
+            start_sample: 1_600,
+            voiced_blocks: 100,
+            peak_rms: 0.2,
+            lead_ms: 0,
+            tail_ms: 160,
+            released_after_ms: 140,
+        }
+    }
+
+    fn them_said(engine: &mut Engine, utterance: Utterance) {
+        for message in AudioMsg::from_segment(Speaker::Them, SegmentEvent::Utterance(utterance)) {
+            engine.handle_audio(message);
+        }
+    }
+
+    #[test]
+    fn a_pause_that_ends_speech_uses_the_transcript_started_early() {
+        let (mut engine, incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.start_transcription_workers();
+        engine.handle_audio(AudioMsg::Provisional {
+            speaker: Speaker::Them,
+            utterance: provisional(32_000),
+        });
+        // The pause went on long enough to end the utterance as it stood.
+        them_said(
+            &mut engine,
+            Utterance {
+                released_after_ms: 400,
+                ..provisional(32_000)
+            },
+        );
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(message, EngineMsg::EarlyTranscribed { .. }));
+        engine.handle(message);
+        assert_eq!(engine.transcript.len(), 1);
+        assert_eq!(engine.transcript[0].text, "64044 bytes");
+        assert!(engine.them_spans.iter().all(|span| span.text.is_some()));
+        // Nothing was transcribed twice.
+        assert!(incoming.recv_timeout(Duration::from_millis(200)).is_err());
+        assert!(engine.early.is_empty());
+    }
+
+    #[test]
+    fn speech_that_goes_on_after_a_pause_is_transcribed_in_full() {
+        let (mut engine, incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.start_transcription_workers();
+        engine.handle_audio(AudioMsg::Provisional {
+            speaker: Speaker::Them,
+            utterance: provisional(32_000),
+        });
+        them_said(&mut engine, provisional(48_000));
+        for _ in 0..2 {
+            let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+            engine.handle(message);
+        }
+        let lines: Vec<&str> = engine
+            .transcript
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(lines, vec!["96044 bytes"]);
+        assert!(engine.early.is_empty());
     }
 
     #[test]

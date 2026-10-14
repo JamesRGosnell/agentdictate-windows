@@ -22,6 +22,9 @@ pub(crate) struct SegmenterConfig {
     pub start_blocks: usize,
     /// Silence blocks that close an utterance.
     pub end_blocks: usize,
+    /// Silence blocks after which the utterance is released provisionally,
+    /// so transcription can start before the pause is confirmed; 0 never.
+    pub provisional_blocks: usize,
     /// Shorter pause that closes an utterance once it is long.
     pub soft_end_blocks: usize,
     /// Utterance length (blocks) after which the shorter pause applies.
@@ -41,6 +44,7 @@ impl SegmenterConfig {
             floor_ratio: 3.0,
             start_blocks: 3,
             end_blocks: 32,
+            provisional_blocks: 0,
             soft_end_blocks: 10,
             soft_max_blocks: 450,
             max_blocks: 900,
@@ -50,13 +54,16 @@ impl SegmenterConfig {
     }
 
     /// System audio is clean and digitally silent between speakers, so it can
-    /// use a lower threshold and react a little faster.
+    /// use a lower threshold and react a little faster. The other side's
+    /// questions are answered from it, so its speech is also released
+    /// provisionally after 300 ms of silence.
     pub(crate) const fn system_audio() -> Self {
         Self {
             min_threshold: 0.004,
             floor_ratio: 3.0,
             start_blocks: 2,
             end_blocks: 28,
+            provisional_blocks: 15,
             soft_end_blocks: 10,
             soft_max_blocks: 450,
             max_blocks: 900,
@@ -97,6 +104,10 @@ pub(crate) enum SegmentEvent {
     SpeechStarted,
     /// Speech ended without enough voiced audio to transcribe.
     SpeechDiscarded,
+    /// Speech paused long enough that it may have ended: the utterance as it
+    /// would end now. If the pause does end it, the [`SegmentEvent::Utterance`]
+    /// that follows has the same start and samples.
+    Provisional(Utterance),
     Utterance(Utterance),
 }
 
@@ -206,6 +217,12 @@ impl Segmenter {
             if active.silent_run >= end_after || active.blocks >= self.config.max_blocks {
                 return Some(self.close());
             }
+            if self.config.provisional_blocks > 0
+                && active.silent_run == self.config.provisional_blocks
+                && active.voiced_blocks >= self.config.min_speech_blocks
+            {
+                return Some(SegmentEvent::Provisional(Self::utterance(active)));
+            }
             return None;
         }
         if voiced {
@@ -245,10 +262,15 @@ impl Segmenter {
         if active.voiced_blocks < self.config.min_speech_blocks {
             return SegmentEvent::SpeechDiscarded;
         }
-        // Keep a little trailing silence; drop the rest of the hangover.
+        SegmentEvent::Utterance(Self::utterance(&active))
+    }
+
+    /// The utterance as it would end now. Silence past the kept tail is
+    /// dropped, so the samples stay the same however long the pause runs.
+    fn utterance(active: &Active) -> Utterance {
         let dropped_blocks = active.silent_run.saturating_sub(TAIL_BLOCKS);
         let keep = active.samples.len().saturating_sub(dropped_blocks * BLOCK);
-        SegmentEvent::Utterance(Utterance {
+        Utterance {
             samples: active.samples[..keep]
                 .iter()
                 .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16)
@@ -259,7 +281,7 @@ impl Segmenter {
             lead_ms: (active.lead_blocks * BLOCK_MS) as u64,
             tail_ms: (active.silent_run.min(TAIL_BLOCKS) * BLOCK_MS) as u64,
             released_after_ms: (dropped_blocks * BLOCK_MS) as u64,
-        })
+        }
     }
 
     /// Ends any utterance in progress (session end or pause).
@@ -381,6 +403,59 @@ mod tests {
         let released = samples_end + utterance.released_after_ms;
         assert!(released.abs_diff(2_340) <= 20, "{released}");
         assert!(!segmenter.is_speaking());
+    }
+
+    fn provisionals(events: &[SegmentEvent]) -> Vec<&Utterance> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SegmentEvent::Provisional(utterance) => Some(utterance),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pause_releases_the_utterance_provisionally_before_it_ends() {
+        let mut segmenter = Segmenter::new(SegmenterConfig::system_audio());
+        let mut events = segmenter.push(&tone(1_200, 0.3));
+        events.extend(segmenter.push(&silence(400)));
+        let early = provisionals(&events);
+        assert_eq!(early.len(), 1);
+        assert!(utterances(events.clone()).is_empty(), "not ended yet");
+        let early = early[0].clone();
+        events.extend(segmenter.push(&silence(600)));
+        let found = utterances(events);
+        assert_eq!(found.len(), 1);
+        // The pause ended it: the provisional copy is the utterance.
+        assert_eq!(found[0].start_sample, early.start_sample);
+        assert_eq!(found[0].samples, early.samples);
+        assert!(found[0].released_after_ms > early.released_after_ms);
+    }
+
+    #[test]
+    fn speech_resuming_after_a_provisional_release_makes_a_longer_utterance() {
+        let mut segmenter = Segmenter::new(SegmenterConfig::system_audio());
+        let mut events = segmenter.push(&tone(1_200, 0.3));
+        events.extend(segmenter.push(&silence(400)));
+        events.extend(segmenter.push(&tone(800, 0.3)));
+        events.extend(segmenter.push(&silence(1_000)));
+        let early = provisionals(&events);
+        assert_eq!(early.len(), 2, "one per pause");
+        let early = early[0].clone();
+        let found = utterances(events);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].start_sample, early.start_sample);
+        assert!(found[0].samples.len() > early.samples.len());
+    }
+
+    #[test]
+    fn microphone_speech_is_never_released_provisionally() {
+        let mut segmenter = Segmenter::new(SegmenterConfig::microphone());
+        let mut events = segmenter.push(&tone(1_200, 0.3));
+        events.extend(segmenter.push(&silence(1_000)));
+        assert!(provisionals(&events).is_empty());
+        assert_eq!(utterances(events).len(), 1);
     }
 
     #[test]
