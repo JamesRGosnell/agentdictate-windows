@@ -52,12 +52,20 @@ pub(crate) trait AnswerProvider: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// The process-wide HTTP client. Sharing it keeps connections open between
+/// requests, so answers after the first skip the TLS handshake.
 pub(crate) fn http_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(240))
-        .build()
-        .expect("the rustls HTTP client must be constructible")
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(240))
+                .pool_idle_timeout(Duration::from_secs(600))
+                .build()
+                .expect("the rustls HTTP client must be constructible")
+        })
+        .clone()
 }
 
 /// Builds the provider selected in settings.

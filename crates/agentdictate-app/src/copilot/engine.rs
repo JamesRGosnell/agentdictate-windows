@@ -44,6 +44,9 @@ const INSIGHTS_MIN_NEW_LINES: usize = 2;
 const AUTO_ANSWER_COOLDOWN: Duration = Duration::from_secs(6);
 /// How often the knowledge folders are checked for added or edited files.
 const KNOWLEDGE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+/// Connections opened when a session starts: the judge, the instant draft,
+/// and the researched answer run at the same time.
+const WARM_CONNECTIONS: usize = 3;
 /// Longest the researched answer waits for the instant draft it continues.
 const INSTANT_WAIT: Duration = Duration::from_secs(8);
 /// How long the wrap-up stays open when the user leaves it alone.
@@ -327,6 +330,7 @@ impl Engine {
         self.start_transcription_workers();
         self.load_models(self.settings.provider);
         self.load_knowledge();
+        self.warm_up();
         self.start_audio();
         loop {
             match incoming.recv_timeout(Duration::from_millis(250)) {
@@ -400,6 +404,49 @@ impl Engine {
                 let models = loader(provider);
                 let _ = messages.send(EngineMsg::ModelsLoaded(provider, models));
             });
+    }
+
+    /// Signs in and opens connections before the first question, one per
+    /// lane that runs at once (judge, instant draft, researched answer), so
+    /// the first answer is as quick as later ones.
+    fn warm_up(&self) {
+        if self.settings.provider == CopilotProvider::ClaudeCode {
+            // Each request starts a CLI process; there is nothing to keep warm.
+            return;
+        }
+        let mut settings = self.settings.clone();
+        settings.set_answer_model(self.settings.provider.default_fast_model());
+        let request = AnswerRequest {
+            system: "Reply with OK.".to_owned(),
+            user: "OK?".to_owned(),
+            image_jpeg: None,
+            model: settings.answer_model(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 16,
+            cache_key: format!("{}-warm-up", self.session_key),
+        };
+        for lane in 0..WARM_CONNECTIONS {
+            let providers = Arc::clone(&self.services.providers);
+            let settings = settings.clone();
+            let request = request.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("copilot-warm-up-{lane}"))
+                .spawn(move || {
+                    let started = Instant::now();
+                    let cancel = AtomicBool::new(false);
+                    let result = providers(&settings)
+                        .and_then(|provider| complete(provider.as_ref(), &request, &cancel));
+                    match result {
+                        Ok(_) => tracing::info!(
+                            lane,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "copilot connection warmed"
+                        ),
+                        Err(error) => tracing::warn!(lane, %error, "copilot warm-up failed"),
+                    }
+                });
+        }
     }
 
     /// The folders answers draw on: the knowledge folder, plus meeting notes
