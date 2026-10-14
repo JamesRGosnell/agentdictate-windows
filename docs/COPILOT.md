@@ -25,6 +25,12 @@ the bar and panel reach the window underneath. The copilot starts listening
 immediately; the timer shows the session length and the meter shows audio from
 both sides.
 
+While a session is listening, its own icon sits in the notification area, even
+when the window is hidden: click it to show or hide the copilot, or right-click
+it to end the session. A session also ends on its own, with its wrap-up and
+notes, a minute after the meeting it detected is over and the line goes quiet,
+or after 15 minutes in which no one speaks.
+
 ## Shortcuts
 
 | Shortcut | Action |

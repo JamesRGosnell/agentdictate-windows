@@ -94,6 +94,13 @@ const SHOT_TTL: Duration = Duration::from_secs(30);
 const SHOT_SLACK_MS: u64 = 300;
 /// Names seen in the meeting window kept for the user to pick from.
 const MAX_SEEN_NAMES: usize = 16;
+/// How often the desktop is checked for the meeting still going on.
+const MEETING_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+/// Once the meeting app has let go of the call, the session ends after this
+/// long without anyone speaking.
+const MEETING_OVER_QUIET: Duration = Duration::from_secs(60);
+/// A session no one has spoken in for this long ends, meeting or not.
+const IDLE_END: Duration = Duration::from_secs(15 * 60);
 
 /// Audio pipeline output, independent of the capture backend.
 #[derive(Clone, Debug)]
@@ -159,6 +166,8 @@ pub(crate) trait Platform: Send + Sync {
     fn capture_screen(&self) -> Result<Vec<u8>, String>;
     /// The meeting app's window, or the screen when none is found.
     fn capture_call_window(&self) -> Result<CallShot, String>;
+    /// Why the desktop looks like a meeting is in progress, or `None`.
+    fn meeting_signal(&self) -> Option<String>;
     fn copy_text(&self, text: &str);
     fn open(&self, target: &str);
 }
@@ -325,6 +334,13 @@ pub(crate) struct Engine {
     /// Names the meeting window showed, offered when the user names a voice.
     seen_names: Vec<String>,
     looks: WindowLooks,
+    /// A meeting was detected during this session.
+    meeting_seen: bool,
+    /// When the detected meeting stopped being detected.
+    meeting_gone_since: Option<Instant>,
+    meeting_checked_at: Option<Instant>,
+    /// When anyone last started speaking.
+    last_heard: Instant,
     pending_mine: Vec<PendingMine>,
     them_speaking: bool,
     pending_turn: Option<PendingTurn>,
@@ -378,6 +394,10 @@ impl Engine {
             roster: Roster::default(),
             seen_names: Vec::new(),
             looks: WindowLooks::default(),
+            meeting_seen: false,
+            meeting_gone_since: None,
+            meeting_checked_at: None,
+            last_heard: Instant::now(),
             pending_mine: Vec::new(),
             them_speaking: false,
             pending_turn: None,
@@ -424,7 +444,9 @@ impl Engine {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            self.tick();
+            if self.tick() {
+                break;
+            }
         }
         self.finish(&incoming);
     }
@@ -814,6 +836,9 @@ impl Engine {
                 });
             }
             AudioMsg::Speaking { speaker, active } => {
+                if active {
+                    self.last_heard = Instant::now();
+                }
                 if speaker == Speaker::Them {
                     self.them_speaking = active;
                     self.looks.speech_started = active.then(Instant::now);
@@ -1590,7 +1615,8 @@ impl Engine {
         self.knowledge.excerpts(&focus, &recent(6))
     }
 
-    fn tick(&mut self) {
+    /// Runs periodic work; returns true when the session should end.
+    fn tick(&mut self) -> bool {
         self.check_knowledge();
         if !self.pending_mine.is_empty() {
             self.resolve_pending_mine(false);
@@ -1598,6 +1624,45 @@ impl Engine {
         self.evaluate_turn();
         self.maybe_request_insights();
         self.maybe_look_at_window();
+        match self.session_over() {
+            Some(reason) => {
+                tracing::info!(reason, "copilot session ending on its own");
+                (self.ui)(CopilotEvent::Notice(format!("Wrapping up: {reason}")));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Why the session is over without the user ending it: the meeting it
+    /// listened to ended and the line went quiet, or no one has spoken for
+    /// a long time. A forgotten session never keeps listening.
+    fn session_over(&mut self) -> Option<&'static str> {
+        if self.ending {
+            return None;
+        }
+        if self
+            .meeting_checked_at
+            .is_none_or(|at| at.elapsed() >= MEETING_CHECK_INTERVAL)
+        {
+            self.meeting_checked_at = Some(Instant::now());
+            if self.services.platform.meeting_signal().is_some() {
+                self.meeting_seen = true;
+                self.meeting_gone_since = None;
+            } else if self.meeting_seen && self.meeting_gone_since.is_none() {
+                tracing::info!("the meeting is no longer detected");
+                self.meeting_gone_since = Some(Instant::now());
+            }
+        }
+        let quiet = self.last_heard.elapsed();
+        if quiet >= MEETING_OVER_QUIET
+            && self
+                .meeting_gone_since
+                .is_some_and(|since| since.elapsed() >= MEETING_OVER_QUIET)
+        {
+            return Some("the meeting ended");
+        }
+        (quiet >= IDLE_END && !self.paused).then_some("no one has spoken for 15 minutes")
     }
 
     fn publish_speakers(&self) {
@@ -2104,6 +2169,9 @@ mod tests {
                 title: Some("Weekly sync | Microsoft Teams".into()),
                 jpeg: Arc::new(vec![0xff, 0xd8]),
             })
+        }
+        fn meeting_signal(&self) -> Option<String> {
+            None
         }
         fn copy_text(&self, _text: &str) {}
         fn open(&self, _target: &str) {}
@@ -3185,6 +3253,39 @@ mod tests {
         engine.handle_action(CopilotAction::KeepVersion { id: 4, text: None });
         let notes = std::fs::read_to_string(engine.write_notes(None).unwrap()).unwrap();
         assert!(!notes.contains("Said instead"));
+    }
+
+    #[test]
+    fn sessions_end_on_their_own_once_the_meeting_is_over_and_quiet() {
+        let (mut engine, _incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        let long_ago = Instant::now() - Duration::from_secs(120);
+        assert!(!engine.tick());
+        // The meeting app let go of the call, but someone just spoke.
+        engine.meeting_seen = true;
+        engine.meeting_gone_since = Some(long_ago);
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: true,
+        });
+        assert!(!engine.tick());
+        engine.last_heard = long_ago;
+        assert!(engine.tick());
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::Notice(notice) if notice == "Wrapping up: the meeting ended"
+        )));
+
+        // Without a meeting, only a long silence ends it, and not while paused.
+        let (mut engine, _incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.last_heard = long_ago;
+        assert!(!engine.tick());
+        engine.last_heard = Instant::now() - IDLE_END;
+        engine.paused = true;
+        assert!(!engine.tick());
+        engine.paused = false;
+        assert!(engine.tick());
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub(crate) mod hotkeys;
 pub(crate) mod instance;
 pub(crate) mod replay;
 pub(crate) mod signals;
+pub(crate) mod tray;
 
 use super::engine::{AudioControl, AudioSink, CallShot, Platform};
 
@@ -34,6 +35,14 @@ impl Platform for WindowsPlatform {
 
     fn capture_call_window(&self) -> Result<CallShot, String> {
         desktop::capture_call_window()
+    }
+
+    fn meeting_signal(&self) -> Option<String> {
+        let signal = super::meeting::classify(
+            &signals::active_microphone_apps(),
+            &signals::window_titles(),
+        );
+        signal.in_meeting.then_some(signal.reason)
     }
 
     fn copy_text(&self, text: &str) {

@@ -320,6 +320,26 @@ pub fn run_copilot() -> anyhow::Result<()> {
             let _ = sender.send(EngineMsg::ShowRequested);
         });
     }
+    // A listening session always shows in the notification area, even with
+    // its window hidden.
+    let tray = {
+        let sender = engine_sender.clone();
+        win::tray::start(move |command| {
+            let _ = sender.send(match command {
+                win::tray::TrayCommand::ShowOrHide => {
+                    EngineMsg::Hotkey(engine::HotkeyCommand::Toggle)
+                }
+                win::tray::TrayCommand::End => EngineMsg::Action(CopilotAction::End),
+            });
+        })
+    };
+    let tray = match tray {
+        Ok(tray) => Some(tray),
+        Err(error) => {
+            tracing::warn!(%error, "copilot tray icon could not be shown");
+            None
+        }
+    };
 
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -344,6 +364,7 @@ pub fn run_copilot() -> anyhow::Result<()> {
     let _ = engine_sender.send(EngineMsg::Action(CopilotAction::End));
     drop(engine_sender);
     let _ = engine_thread.join();
+    drop(tray);
     drop(hotkeys);
     drop(instance);
     Ok(())

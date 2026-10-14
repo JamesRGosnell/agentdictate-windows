@@ -164,6 +164,7 @@ impl CopilotWindowHost for Win32CopilotHost {
     }
 
     fn set_visible(&self, visible: bool) {
+        tracing::info!(visible, "copilot window visibility changed");
         unsafe {
             if visible {
                 ShowWindow(self.handle(), SW_SHOWNOACTIVATE);
