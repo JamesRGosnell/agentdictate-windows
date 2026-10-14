@@ -211,27 +211,45 @@ fn main() {
                         phase: WorkflowPhase::Ready,
                     },
                 );
-                if meetings {
+                {
                     let note = MeetingNoteViewModel {
                         id: "2026-10-13 0900 Enterprise pricing.md".into(),
                         title: "Enterprise pricing for 200 engineers".into(),
                         started: "2026-10-13 09:00".into(),
                         duration: "32:14".into(),
                         overview: "Acme is evaluating dictation for about 200 engineers.".into(),
+                        with: "Dana Ruiz, Priya Shah".into(),
+                        search_text: String::new(),
                     };
+                    let earlier = [
+                        ("2026-10-12 1500 Hiring sync.md", "Hiring sync", "2026-10-12 15:00", "24:02", "Two backend roles open; offers by Friday.", "Marcus Webb"),
+                        ("2026-10-10 1000 Budget review.md", "Q4 budget review", "2026-10-10 10:00", "41:37", "Q4 budget approved with a 10% buffer.", ""),
+                    ]
+                    .map(|(id, title, started, duration, overview, with)| MeetingNoteViewModel {
+                        id: id.into(),
+                        title: title.into(),
+                        started: started.into(),
+                        duration: duration.into(),
+                        overview: overview.into(),
+                        with: with.into(),
+                        search_text: String::new(),
+                    });
+                    let mut notes = vec![note.clone()];
+                    notes.extend(earlier);
                     model = model.with_workspace(WorkspaceViewModel {
                         meetings: MeetingsViewModel {
-                            selected: Some(MeetingDetailViewModel {
+                            selected: meetings.then(|| MeetingDetailViewModel {
                                 id: note.id.clone(),
                                 title: note.title.clone(),
                                 started: note.started.clone(),
                                 duration: note.duration.clone(),
+                                with: note.with.clone(),
                                 summary: "Acme is evaluating dictation for about 200 engineers and asked for annual pricing.\n\n**Key points**\n- Needs strong technical vocabulary and terminal support\n- 200 seats on annual billing: **$18 per seat per month**\n\n**Decisions**\n- Start with a 30-day pilot for 25 engineers\n\n**Action items**\n- Me: send the pilot agreement by Friday\n- Them: name a pilot lead".into(),
                                 follow_up: Some("Hi Sam,\n\nThanks for the time today. As discussed, we'll start with a **30-day pilot for 25 engineers**.\n\nBest,\nJames".into()),
                                 answers: String::new(),
-                                transcript: "**[0:04] Them:** Thanks for making time. We're evaluating dictation tools for about two hundred engineers.\n\n**[0:11] You:** Great, happy to walk you through it.".into(),
+                                transcript: "**[0:04] Dana Ruiz:** Thanks for making time. We're evaluating dictation tools for about two hundred engineers.\n\n**[0:11] You:** Great, happy to walk you through it.".into(),
                             }),
-                            notes: vec![note],
+                            notes,
                         },
                         ..WorkspaceViewModel::default()
                     });

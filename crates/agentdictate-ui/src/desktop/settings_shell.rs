@@ -62,6 +62,8 @@ pub(super) struct WorkspaceActionState {
     pub(super) sink: Option<WorkspaceActionSink>,
     pub(super) in_flight: bool,
     pub(super) history_lane: HistoryActionLane,
+    /// Shown once the action being emitted succeeds.
+    pub(super) done_feedback: Option<String>,
 }
 
 #[derive(Clone)]
@@ -95,6 +97,9 @@ pub(super) struct RouteUiEntry {
 pub(super) struct RouteUiState {
     pub(super) entries: [RouteUiEntry; Route::ALL.len()],
     pub(super) history_search_input: Option<Entity<InputState>>,
+    pub(super) meetings_search_input: Option<Entity<InputState>>,
+    /// What the Meetings page is filtered by.
+    pub(super) meetings_query: String,
     pub(super) replacement_editor: Option<ReplacementEditorState>,
     pub(super) pending_destructive_action: Option<WorkspaceAction>,
     pub(super) overview_recent_expanded: bool,
@@ -105,6 +110,8 @@ impl Default for RouteUiState {
         Self {
             entries: std::array::from_fn(|_| RouteUiEntry::default()),
             history_search_input: None,
+            meetings_search_input: None,
+            meetings_query: String::new(),
             replacement_editor: None,
             pending_destructive_action: None,
             overview_recent_expanded: false,
@@ -212,6 +219,9 @@ impl SettingsShell {
                 .placeholder("Search every transcript")
                 .default_value(initial_history_search)
         });
+        let meetings_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Search meetings, people, and transcripts")
+        });
         let applied_model_catalog = model.workspace.model_catalog.clone();
         let form = SettingsFormState::new(&settings, &applied_model_catalog, window, cx);
         let mut subscriptions = form.subscriptions(window, cx);
@@ -223,6 +233,15 @@ impl SettingsShell {
                 }
             }),
         );
+        subscriptions.push(cx.subscribe(
+            &meetings_search_input,
+            |shell, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    shell.routes.meetings_query = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            },
+        ));
         subscriptions.push(cx.subscribe(
             &history_search_input,
             |shell, input, event: &InputEvent, cx| {
@@ -236,6 +255,7 @@ impl SettingsShell {
         let mut next_request_id = 1;
         let mut routes = RouteUiState {
             history_search_input: Some(history_search_input),
+            meetings_search_input: Some(meetings_search_input),
             ..RouteUiState::default()
         };
         if has_api_key && model.active_route == Route::Settings {
@@ -309,9 +329,10 @@ impl SettingsShell {
         if route == Route::Settings && previous_route != Route::Settings {
             self.request_model_catalog_refresh();
         }
-        // Meetings saved since the window opened appear when the page opens.
-        if route == Route::Meetings
-            && previous_route != Route::Meetings
+        // Meetings saved since the window opened appear when the page, or
+        // the Overview's recent meetings, open.
+        if matches!(route, Route::Meetings | Route::Overview)
+            && previous_route != route
             && !self.workspace_actions.in_flight
             && self.workspace_actions.sink.is_some()
         {

@@ -2416,10 +2416,19 @@ impl CopilotWindow {
             .border_color(color(HAIRLINE))
             .when_some(follow_up, |row, email| {
                 row.child(
-                    chip("copilot-copy-follow-up", true)
+                    chip("copilot-draft-email", true)
+                        .debug_selector(|| "copilot-draft-email".to_owned())
+                        .child(icon("mail", 12., ACCENT))
+                        .child("Draft email")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                            this.act(CopilotAction::DraftEmail);
+                        })),
+                )
+                .child(
+                    chip("copilot-copy-follow-up", false)
                         .debug_selector(|| "copilot-copy-follow-up".to_owned())
-                        .child(icon("copy", 12., ACCENT))
-                        .child("Copy follow-up email")
+                        .child(icon("copy", 12., MUTED))
+                        .child("Copy email")
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
                             this.act(CopilotAction::CopyText(email.clone()));
                         })),

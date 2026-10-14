@@ -94,16 +94,22 @@ does not reach other apps, including chat apps that use it to send.
   **Forget** clears one.
 - **Wrap-up.** When you end the session with **✕**, the copilot writes notes
   with a summary, key points, decisions, action items, and, when you took part
-  in a conversation, a ready-to-send follow-up email. The wrap-up shows them
-  with **Copy follow-up email**, **Open notes**, and the full transcript one
-  tab away; press **Done** when you are finished. Press **✕** again while the
+  in a conversation, a ready-to-send follow-up email with its subject line.
+  The wrap-up shows them with **Draft email**, which opens the email as a
+  draft in your mail app (Outlook, when it handles email links) and never sends
+  it, **Copy email**, **Open notes**, and the full transcript one tab away. An
+  email too long for a mail link opens with its subject, and its text waits on
+  the clipboard to paste in; press **Done** when you are finished. Press **✕** again while the
   notes are being written to close as soon as they are saved. Notes, with the
   copilot's answers and the transcript, are saved in
   `%LOCALAPPDATA%\AgentDictate\meetings`.
 - **Meetings.** Every saved meeting is listed, newest first, on the
   **Meetings** page of the AgentDictate window; the tray's **Meeting notes**
-  opens it. Open a meeting to read its summary and transcript or copy its
-  follow-up email.
+  opens it, and the **Overview** shows the latest three. Search finds meetings
+  by every word you type, across titles, people, summaries, and transcripts.
+  Open a meeting to read its summary and transcript, draft or copy its
+  follow-up email, or delete it: **Delete**, then **Confirm delete**, moves its
+  notes to the Recycle Bin, where they can be restored.
 
 The panel opens when there is something to show and collapses to the bar with
 the chevron. While collapsed, new answers reopen it.

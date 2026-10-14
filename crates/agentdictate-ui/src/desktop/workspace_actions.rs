@@ -43,6 +43,10 @@ impl SettingsShell {
             action,
             WorkspaceAction::CopyRecovery { .. } | WorkspaceAction::CopyTranscript { .. }
         );
+        let done =
+            self.workspace_actions.done_feedback.take().or_else(|| {
+                copies_text.then(|| "Copied. Paste into your destination app.".to_owned())
+            });
         let sink = Arc::clone(sink);
         let closes_editor = matches!(
             action,
@@ -65,11 +69,8 @@ impl SettingsShell {
                                     &shell.settings.current.currency,
                                 );
                                 shell.clear_route_feedback_for(feedback_route);
-                                if copies_text {
-                                    shell.set_route_feedback_for(
-                                        feedback_route,
-                                        "Copied. Paste into your destination app.".to_owned(),
-                                    );
+                                if let Some(done) = done {
+                                    shell.set_route_feedback_for(feedback_route, done);
                                 }
                                 if closes_editor {
                                     shell.routes.replacement_editor = None;
@@ -137,6 +138,18 @@ impl SettingsShell {
         self.emit_history_action(WorkspaceAction::SearchHistory { query }, cx);
     }
 
+    /// Emits an action and shows `done` once it succeeds.
+    pub(super) fn emit_workspace_action_then(
+        &mut self,
+        action: WorkspaceAction,
+        done: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_actions.done_feedback = Some(done);
+        self.emit_workspace_action(action, cx);
+        self.workspace_actions.done_feedback = None;
+    }
+
     pub(super) fn request_destructive_action(
         &mut self,
         action: WorkspaceAction,
@@ -146,11 +159,13 @@ impl SettingsShell {
             self.routes.pending_destructive_action = None;
             self.emit_workspace_action(action, cx);
         } else {
-            self.routes.pending_destructive_action = Some(action);
-            self.set_route_feedback(
+            let feedback = if matches!(action, WorkspaceAction::DeleteMeeting { .. }) {
+                "Click Confirm delete to move this meeting's notes to the Recycle Bin, or continue elsewhere to cancel."
+            } else {
                 "Click Confirm delete to permanently remove this item, or continue elsewhere to cancel."
-                    .to_owned(),
-            );
+            };
+            self.routes.pending_destructive_action = Some(action);
+            self.set_route_feedback(feedback.to_owned());
         }
     }
 

@@ -29,6 +29,7 @@ icons!(
     "folder.svg",
     "globe.svg",
     "inbox.svg",
+    "mail.svg",
     "message-question.svg",
     "mic.svg",
     "minus.svg",

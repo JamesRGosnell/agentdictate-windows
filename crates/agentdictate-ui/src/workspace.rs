@@ -54,6 +54,14 @@ pub enum WorkspaceAction {
     OpenMeetingFile {
         id: String,
     },
+    /// Opens a saved meeting's follow-up email as a draft in the mail app.
+    DraftMeetingEmail {
+        id: String,
+    },
+    /// Moves a saved meeting's notes to the Recycle Bin.
+    DeleteMeeting {
+        id: String,
+    },
 }
 
 impl WorkspaceAction {
@@ -76,6 +84,8 @@ impl WorkspaceAction {
             Self::CloseMeeting => "meetings-back".to_owned(),
             Self::OpenMeetingsFolder => "meetings-open-folder".to_owned(),
             Self::OpenMeetingFile { id } => format!("meetings-open-file-{id}"),
+            Self::DraftMeetingEmail { id } => format!("meetings-draft-email-{id}"),
+            Self::DeleteMeeting { id } => format!("meetings-delete-{id}"),
         }
     }
 }

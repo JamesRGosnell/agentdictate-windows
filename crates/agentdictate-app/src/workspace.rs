@@ -69,9 +69,13 @@ pub enum WorkspaceError {
     UnexpectedHistoryPage,
 }
 
+/// Removes a saved meeting's notes file.
+type NoteRemover = fn(&std::path::Path) -> std::io::Result<()>;
+
 pub struct WorkspaceClient {
     runtime_directory: PathBuf,
     meetings_dir: Option<PathBuf>,
+    remove_note: NoteRemover,
     next_request_id: AtomicU64,
     request_gate: Mutex<()>,
     state: Mutex<WorkspaceClientState>,
@@ -91,6 +95,7 @@ impl WorkspaceClient {
         Self {
             runtime_directory,
             meetings_dir: None,
+            remove_note: crate::meetings::recycle,
             next_request_id: AtomicU64::new(10_000),
             request_gate: Mutex::new(()),
             state: Mutex::new(WorkspaceClientState {
@@ -166,6 +171,32 @@ impl WorkspaceClient {
                     .ok_or(WorkspaceError::MeetingNotFound)?;
                 crate::meetings::reveal(&file).map_err(WorkspaceError::MeetingsUnavailable)?;
             }
+            WorkspaceAction::DraftMeetingEmail { id } => {
+                let draft = folder
+                    .as_deref()
+                    .and_then(|folder| crate::meetings::email_draft(folder, &id))
+                    .ok_or(WorkspaceError::MeetingNotFound)?;
+                let (link, _) = draft.mailto();
+                crate::meetings::open_link(&link).map_err(WorkspaceError::MeetingsUnavailable)?;
+            }
+            WorkspaceAction::DeleteMeeting { id } => {
+                let file = folder
+                    .as_deref()
+                    .and_then(|folder| crate::meetings::note_path(folder, &id))
+                    .filter(|file| file.is_file())
+                    .ok_or(WorkspaceError::MeetingNotFound)?;
+                (self.remove_note)(&file).map_err(WorkspaceError::MeetingsUnavailable)?;
+                self.rescan_meetings()?;
+                let mut state = self.lock_state()?;
+                if state
+                    .meetings
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.id == id)
+                {
+                    state.meetings.selected = None;
+                }
+            }
             _ => unreachable!("only meetings actions are routed here"),
         }
         Ok(Self::project(&*self.lock_state()?))
@@ -195,6 +226,8 @@ impl WorkspaceClient {
                 | WorkspaceAction::CloseMeeting
                 | WorkspaceAction::OpenMeetingsFolder
                 | WorkspaceAction::OpenMeetingFile { .. }
+                | WorkspaceAction::DraftMeetingEmail { .. }
+                | WorkspaceAction::DeleteMeeting { .. }
         ) {
             return self.perform_meetings(action);
         }
@@ -319,7 +352,9 @@ impl WorkspaceClient {
             | WorkspaceAction::OpenMeeting { .. }
             | WorkspaceAction::CloseMeeting
             | WorkspaceAction::OpenMeetingsFolder
-            | WorkspaceAction::OpenMeetingFile { .. } => {
+            | WorkspaceAction::OpenMeetingFile { .. }
+            | WorkspaceAction::DraftMeetingEmail { .. }
+            | WorkspaceAction::DeleteMeeting { .. } => {
                 unreachable!("handled above")
             }
         };
@@ -803,6 +838,42 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn deleting_a_meeting_removes_its_notes_and_closes_it() {
+        fn remove(path: &std::path::Path) -> std::io::Result<()> {
+            std::fs::remove_file(path)
+        }
+        let folder = tempdir().unwrap();
+        for name in ["2026-10-13 0900 Pilot.md", "2026-10-14 1000 Budget.md"] {
+            std::fs::write(folder.path().join(name), format!("# {name}\n")).unwrap();
+        }
+        let mut client =
+            WorkspaceClient::new(folder.path().join("runtime"), WorkspaceSnapshot::default())
+                .with_meetings_dir(folder.path().to_path_buf());
+        client.remove_note = remove;
+        let id = "2026-10-13 0900 Pilot.md".to_owned();
+        client
+            .perform(WorkspaceAction::OpenMeeting { id: id.clone() })
+            .unwrap();
+        let view = client
+            .perform(WorkspaceAction::DeleteMeeting { id: id.clone() })
+            .unwrap();
+        assert!(!folder.path().join(&id).exists());
+        assert_eq!(view.meetings.notes.len(), 1);
+        assert!(view.meetings.selected.is_none());
+        assert!(matches!(
+            client.perform(WorkspaceAction::DeleteMeeting { id }),
+            Err(WorkspaceError::MeetingNotFound)
+        ));
+        // Paths outside the folder are never removed.
+        assert!(matches!(
+            client.perform(WorkspaceAction::DeleteMeeting {
+                id: "../2026-10-14 1000 Budget.md".to_owned()
+            }),
+            Err(WorkspaceError::MeetingNotFound)
+        ));
+    }
 
     #[test]
     fn maps_workspace_data_and_switches_period_without_losing_activity() {

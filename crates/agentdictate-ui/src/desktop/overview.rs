@@ -7,8 +7,8 @@ use gpui_component::{
 use crate::action::action_button;
 use crate::usage::format_currency_amount;
 use crate::{
-    HistoryViewModel, Route, ThemeTokens, TranscriptViewModel, UsageDayViewModel, UsagePeriod,
-    UsageViewModel, WorkspaceAction,
+    HistoryViewModel, MeetingNoteViewModel, Route, ThemeTokens, TranscriptViewModel,
+    UsageDayViewModel, UsagePeriod, UsageViewModel, WorkspaceAction,
 };
 
 use super::{SettingsShell, gpui_color, single_line::single_line_clip};
@@ -25,6 +25,7 @@ pub(super) fn surface(
     history: HistoryViewModel,
     recent_transcripts: Vec<TranscriptViewModel>,
     recent_history_expanded: bool,
+    recent_meetings: Vec<MeetingNoteViewModel>,
     theme: ThemeTokens,
     cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
@@ -90,6 +91,9 @@ pub(super) fn surface(
             page.child(recovery_notice(&history, theme, cx))
         })
         .child(copilot_card(theme, cx))
+        .when(!recent_meetings.is_empty(), |page| {
+            page.child(recent_meetings_section(recent_meetings, theme, cx))
+        })
         .child(recent_history(
             recent_transcripts,
             recent_history_expanded,
@@ -418,6 +422,45 @@ fn copilot_card(theme: ThemeTokens, cx: &mut Context<SettingsShell>) -> gpui::Di
                 .on_click(cx.listener(|shell, _, _, cx| {
                     shell.emit_workspace_action(WorkspaceAction::OpenCopilot, cx);
                 })),
+        )
+}
+
+/// The latest saved meetings, each opening its notes on the Meetings page.
+fn recent_meetings_section(
+    meetings: Vec<MeetingNoteViewModel>,
+    theme: ThemeTokens,
+    cx: &mut Context<SettingsShell>,
+) -> gpui::Div {
+    v_flex()
+        .debug_selector(|| "overview-recent-meetings".to_owned())
+        .gap_1()
+        .child(
+            h_flex()
+                .justify_between()
+                .items_center()
+                .pb_2()
+                .border_b_1()
+                .border_color(gpui_color(theme.border))
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .font_semibold()
+                        .child("Recent meetings"),
+                )
+                .child(
+                    action_button("overview-meetings-view-all")
+                        .debug_selector(|| "overview-meetings-view-all".to_owned())
+                        .small()
+                        .label("View all")
+                        .on_click(cx.listener(|shell, _, _, cx| {
+                            shell.select_route(Route::Meetings, false, cx);
+                        })),
+                ),
+        )
+        .children(
+            meetings
+                .into_iter()
+                .map(|note| super::meetings_page::meeting_row(note, theme, cx)),
         )
 }
 

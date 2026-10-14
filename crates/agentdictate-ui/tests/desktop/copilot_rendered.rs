@@ -299,6 +299,26 @@ fn ending_shows_a_wrap_up_with_the_follow_up_ready_to_copy(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn the_wrap_up_drafts_the_follow_up_email(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Ending);
+    harness.send(CopilotEvent::NotesSaved {
+        path: "C:/notes/meeting.md".into(),
+        summary: Some("Agreed on a pilot.".into()),
+        follow_up: Some("Subject: Pilot\n\nHi Sam,".into()),
+    });
+    harness.click("copilot-draft-email");
+    harness.click("copilot-copy-follow-up");
+    assert_eq!(
+        harness.actions(),
+        vec![
+            CopilotAction::DraftEmail,
+            CopilotAction::CopyText("Subject: Pilot\n\nHi Sam,".into()),
+        ]
+    );
+}
+
+#[gpui::test]
 fn settings_show_the_knowledge_and_what_cannot_be_read(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);
     harness.click("copilot-settings");

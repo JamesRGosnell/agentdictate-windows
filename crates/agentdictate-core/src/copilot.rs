@@ -1017,6 +1017,8 @@ pub enum CopilotAction {
     OpenKnowledgeFolder,
     OpenUrl(String),
     CopyText(String),
+    /// Opens the follow-up email as a draft in the user's mail app.
+    DraftEmail,
     /// Rewrites an answer's line to say, `text`, in a style.
     Rewrite {
         id: u64,
@@ -1691,9 +1693,86 @@ pub const fn notes_system_prompt() -> &'static str {
     "You write concise meeting notes from a transcript where \"Me\" is the user and \"Them\" is everyone else. \
 Use Markdown with these sections: a one-sentence overview, **Key points** (bullets), **Decisions** (bullets, or \"None\"), \
 and **Action items** (bullets with an owner when known, or \"None\"). If Me took part in a conversation with Them, \
-finish with **Follow-up email**: a short, ready-to-send email from Me to Them, in Me's voice, that thanks them, recaps \
-what was agreed, and lists next steps; omit it for presentations or recordings Me only listened to. \
+finish with **Follow-up email**: a line \"Subject: ...\", then a short, ready-to-send email from Me to Them, in Me's voice, \
+that greets them by name when known, thanks them, recaps what was agreed, and lists next steps; omit it for presentations \
+or recordings Me only listened to. \
 Be factual and brief; do not invent details."
+}
+
+/// A follow-up email ready for the user's mail app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmailDraft {
+    pub subject: String,
+    pub body: String,
+}
+
+/// Longest `mailto:` link handed to a mail app; mail apps cut longer links,
+/// so a longer email opens with its subject and is pasted in.
+pub const MAILTO_MAX_CHARS: usize = 2_000;
+
+impl EmailDraft {
+    /// Reads a follow-up email from meeting notes: its "Subject:" line when it
+    /// has one, otherwise a subject from the meeting's title.
+    #[must_use]
+    pub fn from_follow_up(email: &str, title: &str) -> Self {
+        let plain = email.replace("**", "").replace("\r\n", "\n");
+        let mut lines = plain
+            .lines()
+            .skip_while(|line| line.trim().is_empty())
+            .peekable();
+        let subject = lines.peek().and_then(|line| {
+            let line = line.trim();
+            line.get(..8)
+                .filter(|label| label.eq_ignore_ascii_case("subject:"))
+                .and_then(|_| line.get(8..))
+                .map(|subject| subject.trim().to_owned())
+        });
+        if subject.is_some() {
+            lines.next();
+        }
+        let body = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
+        let title = title.trim();
+        let subject = subject
+            .filter(|subject| !subject.is_empty())
+            .unwrap_or_else(|| {
+                if title.is_empty() || title == "Meeting notes" {
+                    "Follow-up".to_owned()
+                } else {
+                    format!("Follow-up: {title}")
+                }
+            });
+        Self { subject, body }
+    }
+
+    /// A `mailto:` link that opens this draft, and whether the body fits in
+    /// it; when it does not, the link carries only the subject.
+    #[must_use]
+    pub fn mailto(&self) -> (String, bool) {
+        let subject = format!("mailto:?subject={}", percent_encode(&self.subject));
+        let full = format!(
+            "{subject}&body={}",
+            percent_encode(&self.body.replace('\n', "\r\n"))
+        );
+        if full.len() <= MAILTO_MAX_CHARS {
+            (full, true)
+        } else {
+            (subject, false)
+        }
+    }
+}
+
+/// Percent-encodes everything but unreserved characters (RFC 3986), as
+/// `mailto:` fields require.
+fn percent_encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// Separates the follow-up email from the rest of a notes summary.
@@ -2191,6 +2270,37 @@ mod tests {
             RewriteStyle::ALL.map(RewriteStyle::label),
             ["Shorter", "More casual", "More specific", "Another way"]
         );
+    }
+
+    #[test]
+    fn follow_up_emails_open_as_drafts_with_their_subject() {
+        let draft = EmailDraft::from_follow_up(
+            "**Subject:** Pilot next steps\n\nHi Sam,\n\nThanks for today & see you soon.",
+            "Pilot planning",
+        );
+        assert_eq!(draft.subject, "Pilot next steps");
+        assert_eq!(draft.body, "Hi Sam,\n\nThanks for today & see you soon.");
+        let (link, complete) = draft.mailto();
+        assert!(complete);
+        assert_eq!(
+            link,
+            "mailto:?subject=Pilot%20next%20steps&body=Hi%20Sam%2C%0D%0A%0D%0AThanks%20for%20today%20%26%20see%20you%20soon."
+        );
+        // Without a subject line, the meeting's title makes one.
+        let untitled = EmailDraft::from_follow_up("Hi Ana,\n\nThanks.", "Budget review");
+        assert_eq!(untitled.subject, "Follow-up: Budget review");
+        assert_eq!(untitled.body, "Hi Ana,\n\nThanks.");
+        assert_eq!(
+            EmailDraft::from_follow_up("Hi.", "Meeting notes").subject,
+            "Follow-up"
+        );
+        // A long email opens with its subject alone, to be pasted in.
+        let long = EmailDraft {
+            subject: "Recap".into(),
+            body: "word ".repeat(600),
+        };
+        assert_eq!(long.mailto(), ("mailto:?subject=Recap".to_owned(), false));
+        assert!(notes_system_prompt().contains("Subject:"));
     }
 
     #[test]

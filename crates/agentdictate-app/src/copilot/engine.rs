@@ -18,11 +18,11 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, CallView, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights,
-    CopilotProvider, CopilotSettings, INSTANT_GUIDANCE, ListenState, ModelChoice, QuickAction,
-    RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, TurnContext, answer_system_prompt,
-    answer_user_prompt, call_view_system_prompt, call_view_user_prompt, combined_answer,
-    detected_question_instruction, insights_system_prompt, insights_user_prompt, is_echo_of,
-    looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_call_view,
+    CopilotProvider, CopilotSettings, EmailDraft, INSTANT_GUIDANCE, ListenState, ModelChoice,
+    QuickAction, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, TurnContext,
+    answer_system_prompt, answer_user_prompt, call_view_system_prompt, call_view_user_prompt,
+    combined_answer, detected_question_instruction, insights_system_prompt, insights_user_prompt,
+    is_echo_of, looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_call_view,
     parse_insights, parse_turn_verdict, render_transcript, researched_guidance,
     rewrite_instruction, split_follow_up, turn_judge_system_prompt, turn_judge_user_prompt,
     typed_question_instruction, utterance_similarity, worth_judging,
@@ -352,6 +352,8 @@ pub(crate) struct Engine {
     knowledge_loading: bool,
     knowledge_checked_at: Instant,
     notes_path: Option<PathBuf>,
+    /// The follow-up email written with the notes.
+    follow_up_email: Option<EmailDraft>,
     next_answer: u64,
     active_answer: Option<ActiveAnswer>,
     /// Answers shown this session, for the notes: id, title, and text.
@@ -408,6 +410,7 @@ impl Engine {
             knowledge_loading: false,
             knowledge_checked_at: Instant::now(),
             notes_path: None,
+            follow_up_email: None,
             next_answer: 1,
             active_answer: None,
             answers: Vec::new(),
@@ -777,6 +780,22 @@ impl Engine {
             CopilotAction::CopyText(text) => {
                 self.services.platform.copy_text(&text);
                 (self.ui)(CopilotEvent::Notice("Copied".into()));
+            }
+            CopilotAction::DraftEmail => {
+                if let Some(draft) = &self.follow_up_email {
+                    // Mail apps cut long links: such an email waits on the
+                    // clipboard to be pasted in.
+                    let (link, complete) = draft.mailto();
+                    if !complete {
+                        self.services.platform.copy_text(&draft.body);
+                    }
+                    self.services.platform.open(&link);
+                    (self.ui)(CopilotEvent::Notice(if complete {
+                        "Opening a draft in your mail app".into()
+                    } else {
+                        "Opening a draft; paste the email from your clipboard".into()
+                    }));
+                }
             }
             CopilotAction::Rewrite { id, style, text } => self.rewrite(id, style, &text),
             CopilotAction::KeepVersion { id, text } => match text {
@@ -1976,6 +1995,9 @@ impl Engine {
                     .map_or((None, None), |(notes, email)| {
                         ((!notes.is_empty()).then_some(notes), email)
                     });
+                self.follow_up_email = follow_up
+                    .as_deref()
+                    .map(|email| EmailDraft::from_follow_up(email, &self.notes_title()));
                 (self.ui)(CopilotEvent::NotesSaved {
                     path: path.to_string_lossy().into_owned(),
                     summary,
@@ -2000,6 +2022,7 @@ impl Engine {
                 Ok(EngineMsg::Action(CopilotAction::End)) => return,
                 Ok(EngineMsg::Action(
                     action @ (CopilotAction::CopyText(_)
+                    | CopilotAction::DraftEmail
                     | CopilotAction::OpenNotes
                     | CopilotAction::OpenNotesFolder
                     | CopilotAction::OpenUrl(_)),
@@ -2054,16 +2077,21 @@ impl Engine {
         }
     }
 
+    /// The meeting's title: the topic insights last named.
+    fn notes_title(&self) -> String {
+        let topic = self.insights.topic.trim();
+        if topic.is_empty() {
+            "Meeting notes".to_owned()
+        } else {
+            topic.to_owned()
+        }
+    }
+
     fn write_notes(&self, summary: Option<&str>) -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(&self.services.notes_dir)?;
         let started = chrono::Local::now()
             - chrono::Duration::milliseconds(self.started.elapsed().as_millis() as i64);
-        let topic = self.insights.topic.trim();
-        let title = if topic.is_empty() {
-            "Meeting notes".to_owned()
-        } else {
-            topic.to_owned()
-        };
+        let title = self.notes_title();
         let slug: String = title
             .chars()
             .map(|character| {
@@ -2174,7 +2202,14 @@ mod tests {
             None
         }
         fn copy_text(&self, _text: &str) {}
-        fn open(&self, _target: &str) {}
+        fn open(&self, target: &str) {
+            OPENED.with(|opened| opened.borrow_mut().push(target.to_owned()));
+        }
+    }
+
+    thread_local! {
+        /// What the engine opened on this test's thread.
+        static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     struct ScriptedProvider {
@@ -2642,6 +2677,39 @@ mod tests {
         assert_eq!(
             model_for(&|request| request.user.contains(INSTANT_GUIDANCE)).as_deref(),
             Some("gpt-6-astra")
+        );
+    }
+
+    #[test]
+    fn the_wrap_up_opens_the_follow_up_as_a_mail_draft() {
+        let (mut engine, incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        for (index, text) in ["Can we start small?", "Yes.", "Great."]
+            .into_iter()
+            .enumerate()
+        {
+            engine.publish(TranscriptLine {
+                id: index as u64 + 1,
+                speaker: Speaker::Them,
+                text: text.into(),
+                at_ms: index as u64 * 2_000,
+                voice: None,
+            });
+        }
+        // The first message is read while notes are written; the draft is
+        // asked for during the wrap-up.
+        for message in [
+            EngineMsg::ShowRequested,
+            EngineMsg::Action(CopilotAction::DraftEmail),
+            EngineMsg::Action(CopilotAction::End),
+        ] {
+            engine.messages.send(message).unwrap();
+        }
+        engine.finish(&incoming);
+        let opened = OPENED.with(|opened| opened.borrow().clone());
+        assert_eq!(
+            opened,
+            ["mailto:?subject=Follow-up&body=Hi%20Sam%2C%0D%0A%0D%0AThanks%20for%20today."]
         );
     }
 

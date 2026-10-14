@@ -1161,12 +1161,15 @@ fn meetings_model(selected: bool) -> ShellViewModel {
         started: "2026-10-13 09:00".to_owned(),
         duration: "11:33".to_owned(),
         overview: "Agreed on a 25-seat pilot.".to_owned(),
+        with: "Sam Lee".to_owned(),
+        search_text: String::new(),
     };
     let detail = selected.then(|| agentdictate_ui::MeetingDetailViewModel {
         id: note.id.clone(),
         title: note.title.clone(),
         started: note.started.clone(),
         duration: note.duration.clone(),
+        with: note.with.clone(),
         summary: "Agreed on a **25-seat pilot**.\n\n**Action items**\n- Send the agreement"
             .to_owned(),
         follow_up: Some("Hi Sam,\n\nThanks for today.".to_owned()),
@@ -1246,6 +1249,128 @@ fn an_opened_meeting_copies_its_follow_up_and_returns_to_the_list(cx: &mut TestA
         actions.lock().unwrap().as_slice(),
         [WorkspaceAction::CloseMeeting]
     );
+}
+
+/// Two saved meetings, the second from a budget review.
+fn two_meetings() -> ShellViewModel {
+    let mut model = meetings_model(false);
+    model
+        .workspace
+        .meetings
+        .notes
+        .push(agentdictate_ui::MeetingNoteViewModel {
+            id: "2026-10-10 1000 Budget review.md".to_owned(),
+            title: "Budget review".to_owned(),
+            overview: "Q4 budget approved.".to_owned(),
+            ..agentdictate_ui::MeetingNoteViewModel::default()
+        });
+    model
+}
+
+#[gpui::test]
+fn meetings_are_searched_as_you_type(cx: &mut TestAppContext) {
+    test_support::initialize(cx);
+    let model = two_meetings();
+    let list = model.workspace.clone();
+    let shell_slot = Rc::new(RefCell::new(None));
+    let window_slot = Rc::clone(&shell_slot);
+    let window = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(1_100.), px(780.)),
+                ))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                let shell = cx.new(|cx| {
+                    SettingsShell::connected_with_workspace_actions(
+                        model,
+                        agentdictate_core::Settings::default(),
+                        false,
+                        Arc::new(|_| Ok(())),
+                        Arc::new(move |_| Ok(list.clone())),
+                        window,
+                        cx,
+                    )
+                });
+                *window_slot.borrow_mut() = Some(shell.clone());
+                let frame = cx.new(|_| AgentDictateWindowFrame::new(shell));
+                cx.new(|cx| Root::new(frame, window, cx))
+            },
+        )
+        .expect("headless meetings window opens")
+    });
+    let shell = shell_slot.borrow_mut().take().unwrap();
+    let visual = VisualTestContext::from_window(*window.deref(), cx).into_mut();
+    visual.run_until_parked();
+    let mut harness = Harness { shell, cx: visual };
+    assert!(harness.has("meetings-item-2026-10-10 1000 Budget review.md"));
+    harness.type_text("meetings-search-input", "sam pilot");
+    assert!(harness.has("meetings-item-2026-10-13 0900 Pilot planning.md"));
+    harness.type_text("meetings-search-input", " budget");
+    assert!(harness.has("meetings-no-matches"));
+}
+
+#[gpui::test]
+fn an_opened_meeting_drafts_its_email_and_deletes_only_once_confirmed(cx: &mut TestAppContext) {
+    let opened = meetings_model(true).workspace;
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&actions);
+    let mut harness = Harness::open_model_with_actions(
+        cx,
+        size(px(1_100.), px(780.)),
+        meetings_model(true),
+        Arc::new(move |action| {
+            captured.lock().unwrap().push(action);
+            Ok(opened.clone())
+        }),
+    );
+    let id = "2026-10-13 0900 Pilot planning.md".to_owned();
+    harness.click("meetings-draft-email-2026-10-13 0900 Pilot planning.md");
+    assert!(harness.has("meetings-feedback"));
+    harness.click("meetings-delete-2026-10-13 0900 Pilot planning.md");
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [WorkspaceAction::DraftMeetingEmail { id: id.clone() }]
+    );
+    harness.click("confirm-meetings-delete-2026-10-13 0900 Pilot planning.md");
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [
+            WorkspaceAction::DraftMeetingEmail { id: id.clone() },
+            WorkspaceAction::DeleteMeeting { id },
+        ]
+    );
+}
+
+#[gpui::test]
+fn the_overview_lists_recent_meetings_that_open_on_the_meetings_page(cx: &mut TestAppContext) {
+    let mut model = two_meetings();
+    model.select_route(Route::Overview);
+    let opened = meetings_model(true).workspace;
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&actions);
+    let mut harness = Harness::open_model_with_actions(
+        cx,
+        size(px(1_100.), px(900.)),
+        model,
+        Arc::new(move |action| {
+            captured.lock().unwrap().push(action);
+            Ok(opened.clone())
+        }),
+    );
+    assert!(harness.has("overview-recent-meetings"));
+    harness.click("meetings-item-2026-10-13 0900 Pilot planning.md");
+    assert_eq!(harness.active_route(), Route::Meetings);
+    assert_eq!(
+        actions.lock().unwrap().first(),
+        Some(&WorkspaceAction::OpenMeeting {
+            id: "2026-10-13 0900 Pilot planning.md".to_owned()
+        })
+    );
+    assert!(harness.has("meetings-detail"));
 }
 
 #[gpui::test]

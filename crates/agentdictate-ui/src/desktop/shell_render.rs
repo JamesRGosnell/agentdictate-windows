@@ -5,9 +5,9 @@ use gpui_component::{input::InputState, scroll::Scrollbar, v_flex};
 
 use crate::sidebar_motion::SidebarFrame;
 use crate::{
-    HistoryViewModel, MeetingsViewModel, NavigationItemViewModel, ReplacementsViewModel, Route,
-    SIDEBAR_OVERLAY_BREAKPOINT, SettingsDraft, ThemeTokens, TranscriptViewModel, UsageViewModel,
-    WorkspaceAction, sidebar_open_for_layout,
+    HistoryViewModel, MeetingNoteViewModel, MeetingsViewModel, NavigationItemViewModel,
+    ReplacementsViewModel, Route, SIDEBAR_OVERLAY_BREAKPOINT, SettingsDraft, ThemeTokens,
+    TranscriptViewModel, UsageViewModel, WorkspaceAction, sidebar_open_for_layout,
 };
 
 use super::{
@@ -43,6 +43,7 @@ enum RoutePageModel {
         history: HistoryViewModel,
         recent_transcripts: Vec<TranscriptViewModel>,
         recent_expanded: bool,
+        recent_meetings: Vec<MeetingNoteViewModel>,
     },
     History {
         history: HistoryViewModel,
@@ -52,6 +53,9 @@ enum RoutePageModel {
     Meetings {
         meetings: MeetingsViewModel,
         feedback: Option<String>,
+        search_input: Option<Entity<InputState>>,
+        query: String,
+        pending_destructive_action: Option<WorkspaceAction>,
     },
     Replacements {
         replacements: ReplacementsViewModel,
@@ -71,6 +75,7 @@ impl RoutePageModel {
                 history: workspace.history.clone(),
                 recent_transcripts: workspace.recent_transcripts.clone(),
                 recent_expanded: shell.routes.overview_recent_expanded,
+                recent_meetings: workspace.meetings.notes.iter().take(3).cloned().collect(),
             },
             Route::History => Self::History {
                 history: workspace.history.clone(),
@@ -80,6 +85,9 @@ impl RoutePageModel {
             Route::Meetings => Self::Meetings {
                 meetings: workspace.meetings.clone(),
                 feedback: shell.routes.entry(Route::Meetings).feedback.clone(),
+                search_input: shell.routes.meetings_search_input.clone(),
+                query: shell.routes.meetings_query.clone(),
+                pending_destructive_action: shell.routes.pending_destructive_action.clone(),
             },
             Route::Replacements => Self::Replacements {
                 replacements: workspace.replacements.clone(),
@@ -135,11 +143,13 @@ impl RoutePageModel {
                 history,
                 recent_transcripts,
                 recent_expanded,
+                recent_meetings,
             } => overview::surface(
                 usage,
                 history,
                 recent_transcripts,
                 recent_expanded,
+                recent_meetings,
                 theme,
                 cx,
             ),
@@ -150,9 +160,24 @@ impl RoutePageModel {
             } => {
                 history_page::surface(history, search_input, pending_destructive_action, theme, cx)
             }
-            Self::Meetings { meetings, feedback } => {
-                meetings_page::surface(meetings, feedback, theme, window, cx)
-            }
+            Self::Meetings {
+                meetings,
+                feedback,
+                search_input,
+                query,
+                pending_destructive_action,
+            } => meetings_page::surface(
+                meetings,
+                meetings_page::MeetingsPageState {
+                    feedback,
+                    search_input,
+                    query,
+                    pending_destructive_action,
+                },
+                theme,
+                window,
+                cx,
+            ),
             Self::Replacements {
                 replacements,
                 editor,
