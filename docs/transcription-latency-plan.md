@@ -433,3 +433,103 @@ already present. Shortening the silence gate alone may do little when model
 generation is the limiting stage. The next copilot comparison should time the
 first useful visible sentence as well as the final answer, with repeated
 identical prompts/audio, alternating old/new order and unchanged model settings.
+
+## Overlay shutdown optimization: October 18, 2026
+
+The Windows placement watcher slept for 250 ms between monitor checks. Its
+destructor set a stop flag and joined the worker, so normal overlay shutdown
+could wait for the remainder of that sleep. Paste then waited for the complete
+overlay process to exit.
+
+Use a wakeable thread wait and unpark the worker during destruction. Check the
+stop flag again before any placement call. This removes the sleeping-worker
+delay while retaining the 150 ms fade hold, confirmed process exit before paste,
+the existing focus checks and primary-monitor bottom-center placement. The
+controller also logs `overlay_wait_ms` to separate dismissal from later delivery
+and bookkeeping.
+
+### Controlled measurement
+
+The extended isolated-desktop probe compares the previously installed release
+with release commit `c38ac3f`. It warms both graphics processes, alternates old/new
+order, and uses the same post-frame hold within each pair. Twelve hold phases
+cover the watcher's refresh interval. The timer runs from closing the helper's
+input pipe until Windows reports process exit; it excludes recognition, network
+and recording. Every sample also checks position, window styles, a submitted
+frame, successful exit and preservation of the user's foreground window.
+
+| Overlay shutdown | Before | After |
+| --- | ---: | ---: |
+| Samples | 12 | 12 |
+| Median | 328.5 ms | 207.6 ms |
+| Observed range | 232.1–452.8 ms | 201.9–222.7 ms |
+
+The difference of medians is 120.9 ms (36.8% of this stage). The median saving
+within pairs is 125.1 ms. This is a measured stage improvement, not a 37% claim
+for the whole dictation path. Remaining fade and process teardown still cost
+about 208 ms in this probe.
+
+Reproduce before replacing the old installed binary:
+
+```powershell
+.\scripts\test-windows-overlay.ps1 `
+  -Binary "$env:LOCALAPPDATA\Programs\AgentDictate\agentdictated.exe" `
+  -ComparisonBinary .\target\release\agentdictated.exe `
+  -State transcribing -Samples 12 -TimingsPath .\.windows-dev\overlay-comparison.json
+```
+
+The regression test and focused lints passed. The complete Windows gate passed,
+including native overlay, Settings and copilot probes and packaging. Cargo-deny
+was unavailable. The installed executables match the new release, and the
+restarted daemon reports ready workflow and hotkey states.
+
+### Installed dictation measurement
+
+Nine successful subscription dictations were recorded before the overlay change
+and nine after installing it, including the seven spoken tests James supplied
+in the final run. All nine new recordings were delivered. The two earlier
+intentional silence tests belong to the previous cohort and are not counted as
+spoken failures or successful deliveries.
+
+| Median measurement | Before overlay fix, nine runs | After overlay fix, nine runs |
+| --- | ---: | ---: |
+| App-reported stop-to-paste | 1,381 ms | 1,228 ms |
+| Transcription response to flow completion | 462.3 ms | 288.4 ms |
+| HTTP transcription request | 866 ms | 811 ms |
+| Recording duration | 3.98 s | 4.14 s |
+| Foreground auth wait | 0 ms | 0 ms |
+
+The observed total reduction is 153 ms, or 11.1%. The post-response tail falls
+by 173.9 ms, or 37.6%. These are differences between cohort medians; stage
+medians do not add to the median total. The requests contain different speech
+and network/server timings vary. Attribute the controlled 120.9 ms shutdown
+reduction above to the watcher fix; do not attribute the entire observed total
+or tail reduction to it. The same stop-to-paste timer definition and its limits
+described above apply here.
+
+The new production overlay wait has a median of 205 ms, range 189–309 ms.
+Total new stop-to-paste times range from 931 to 1,679 ms. Auth preparation took
+124–1,131 ms, completed during recording, and added no foreground auth wait in
+any of these nine attempts.
+
+James's seven final spoken tests, in order:
+
+| Test | Captured audio duration | App-reported stop-to-paste |
+| --- | ---: | ---: |
+| Five-second test | 5.39 s | 1,252 ms |
+| Eight-second test | 8.17 s | 1,387 ms |
+| Three-second test | 3.30 s | 1,022 ms |
+| Two-second test | 2.31 s | 1,040 ms |
+| One-second test | 1.35 s | 931 ms |
+| “Very fast” | 1.06 s | 948 ms |
+| Slow ten-second test | 10.31 s | 1,675 ms |
+
+Those seven have a median of 1,040 ms. The nine-run comparison includes the
+first two deliveries after restart rather than selecting only the later warm
+run. These measurements establish no new end-to-end copilot result: this run
+exercised dictation only.
+
+The separate [continuous-recognition investigation](research/continuous-transcription.md)
+records the current subscription-stream contract, live diagnostic limitation,
+local English/French CPU experiment, and the quality conditions for adopting a
+different recognition path. No provider or model selection was changed.
