@@ -257,6 +257,9 @@ impl AnswerProvider for ResponsesProvider {
         let mut refreshed = false;
         let mut index = 0;
         while index < models.len() {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let model = &models[index];
             let mut builder = self
                 .client
@@ -275,6 +278,9 @@ impl AnswerProvider for ResponsesProvider {
                 }
                 ResponsesAuth::ApiKey(key) => builder.bearer_auth(key),
             };
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let response = builder
                 .send()
                 .map_err(|error| format!("Could not reach {service}: {error}"))?;
@@ -377,6 +383,9 @@ impl AnswerProvider for AnthropicProvider {
         // The first attempt opts into effort control and server-side refusal
         // fallbacks; a plain request is retried if the account rejects them.
         for full in [true, false] {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let mut builder = self
                 .client
                 .post(ANTHROPIC_MESSAGES_ENDPOINT)
@@ -386,6 +395,9 @@ impl AnswerProvider for AnthropicProvider {
                 .json(&anthropic_body(request, full));
             if full && supports_server_fallback(&request.model) {
                 builder = builder.header("anthropic-beta", "server-side-fallback-2026-07-01");
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
             }
             let response = builder
                 .send()
@@ -454,6 +466,9 @@ impl AnswerProvider for ClaudeCodeProvider {
         cancel: &AtomicBool,
         sink: &mut dyn FnMut(StreamEvent),
     ) -> Result<(), String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let tools = if request.web_search {
             "WebSearch,WebFetch"
         } else {
@@ -517,6 +532,9 @@ impl AnswerProvider for ClaudeCodeProvider {
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
         }
         let mut child = command
             .spawn()
@@ -687,6 +705,32 @@ mod tests {
             web_search: true,
             max_output_tokens: 2048,
             cache_key: "session".into(),
+        }
+    }
+
+    #[test]
+    fn cancelled_requests_do_not_start_http_or_cli_work() {
+        let providers: Vec<Box<dyn AnswerProvider>> = vec![
+            Box::new(ResponsesProvider {
+                client: http_client(),
+                endpoint: "http://127.0.0.1:1",
+                auth: ResponsesAuth::ApiKey("unused".into()),
+                fallback_models: vec![],
+            }),
+            Box::new(AnthropicProvider {
+                client: http_client(),
+                api_key: "unused".into(),
+            }),
+            Box::new(ClaudeCodeProvider {
+                binary: "missing-claude-must-not-start".into(),
+            }),
+        ];
+        for provider in providers {
+            provider
+                .stream(&request(), &AtomicBool::new(true), &mut |_| {
+                    panic!("cancelled request emitted an event")
+                })
+                .unwrap();
         }
     }
 

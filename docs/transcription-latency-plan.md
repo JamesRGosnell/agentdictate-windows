@@ -234,3 +234,103 @@ Avoid speculative duplicate transcription requests, arbitrary shorter timeouts,
 or pasting unstable partial text: they can increase cost, lose speech, or force
 the user to repair output. No new provider, model, UI or paid service is needed
 for the implemented authentication optimization.
+
+Production observation later on October 18: a successful 2.96-second dictation
+logged HTTP 200, `auth_wait_millis=0`, request elapsed 866 ms and reported
+stop-to-paste 1,381 ms. This verifies that preparation completed before stop in
+the working daemon. It is one observation, not a controlled overall speedup
+estimate against the historical 2,005 ms median.
+
+## Meeting copilot follow-up: October 18, 2026
+
+The copilot has its own capture, transcription and answer pipeline. It already
+starts transcription on a provisional pause, drafts likely questions while a
+separate model judges them, warms HTTP connections, and primes the answer
+prompts with the user's knowledge. Those existing features should be measured
+before proposing them as new improvements.
+
+### Evidence and current settings
+
+The October 13–14 logs contain the following historical stage timings. They
+include earlier builds, not a controlled benchmark of the current release:
+
+| Stage | Samples | Median | 90th percentile |
+| --- | ---: | ---: | ---: |
+| Transcription request | 260 | 908.5 ms | 1,394 ms |
+| Instant draft first text | 27 | 2,302 ms | 3,602 ms |
+| Researched answer first text | 26 | 5,593.5 ms | 8,443 ms |
+| Whole answer worker | 27 | 6,968 ms | 11,473 ms |
+
+First-text timings start at the answer worker, after transcription. They do not
+measure the full speech-end-to-visible-suggestion delay, and the researched
+timing includes waiting for the instant draft. The small reveal-wait sample
+(three events) is insufficient for a percentile conclusion.
+
+The saved subscription settings select `gpt-6-astra` for quick drafts and
+`gpt-6.1-sol` for researched answers. Both stay selected. A model's label or its
+presence in `model/list` does not establish its latency or successful access.
+
+### Implemented improvements
+
+- **Share successful cold authentication across lanes.** Multiple warm-up,
+  transcription and answer threads could all miss the credential cache before
+  taking its provider lock, then each start a Codex check in sequence. Check
+  the cache again after obtaining the provider lock, and publish the result
+  before unlocking. Eight concurrent mock lanes now need one successful load.
+  Near-expiry tokens and explicit refresh after rejection retain their behavior.
+- **Stop canceled work before the next stage.** The answer worker previously
+  waited up to eight seconds for a complete quick draft even after cancellation,
+  then could start research anyway. Check cancellation while waiting and before
+  handing off to research. Providers check before authentication/network work,
+  retries and CLI launch. Existing blocking network reads can still finish
+  after cancellation; this is not an instantaneous network-abort guarantee.
+- **Wake at question deadlines.** During quiet audio, the engine's 250 ms
+  maintenance tick could round a confirmation or verdict deadline up by almost
+  another 250 ms. Schedule the receive timeout for the actual remaining pause
+  and verdict wait. The original pause length, audience judgment, continued
+  speech checks and reveal gate remain intact. Normal audio events may already
+  wake the engine sooner, so real savings vary.
+- **Separate queueing from service time.** Log transcription queue wait, judge
+  duration, answer IDs and speech-end-to-reveal time. These supplement the
+  existing request-to-first-text timings without logging speech or credentials.
+- **Report missing-token state accurately.** Codex can report a ChatGPT sign-in
+  while returning no access token. Distinguish that from being signed out.
+
+### Professional patterns and retained tradeoffs
+
+[Deepgram's eager end-of-turn guidance](https://developers.deepgram.com/docs/flux/voice-agent-eager-eot)
+prepares an answer before final confirmation, cancels when speech resumes, and
+reveals only after confirmation. The copilot already follows that pattern;
+the cancellation fix removes work that could survive a rejected draft.
+[Go's singleflight package](https://pkg.go.dev/golang.org/x/sync/singleflight)
+documents suppressing duplicate concurrent work. The credential fix applies
+that principle to successful cold authentication checks.
+
+Retain the complete quick draft as input to research. The current research
+prompt explicitly continues what the user is already reading, verifies it and
+corrects it when needed. Starting research from only the first token would
+change that contract and can repeat or contradict later draft text. A future
+version could hand off a completed first sentence, but should evaluate the
+whole displayed answer and its corrections before shipping that tradeoff.
+
+### Live model comparison: blocked, with no timing result
+
+A one-round comparison of `gpt-6-luna` and `gpt-6-astra` used the existing
+synthetic-handbook diagnostic (four judge, five instant, three rewrite and two
+research cases per model). All 28 checks stopped in local authentication before
+a model request: Codex reported `authMethod: chatgpt` but returned no access
+token, including after an explicit refresh. Both installed Codex executables
+were checked through app-server; no credential files were read directly and no
+credentials were exported. James confirmed that dictation is working, so the
+diagnostic failure does not establish a broken account or a need to sign in
+again. The mismatch between the diagnostic and the working runtime remains
+unresolved. A subsequent working-daemon log also confirms HTTP 200 and delivery,
+with zero foreground authentication wait. These are not 28 model-quality
+failures or evidence that one model is faster.
+
+Resolve the diagnostic's token handoff before repeating live comparisons,
+without disturbing the working sign-in. Then compare
+first useful sentence, full draft, factual correctness, corrections and
+rhetorical-question handling on representative calls. Keep the existing models
+until that evidence justifies changing them. Public model latency expectations
+and the historical table above are not a substitute for those measurements.

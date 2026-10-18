@@ -90,6 +90,10 @@ enum CodexSubscriptionError {
     InvalidAuthResponse,
     #[error("Codex is not signed in with ChatGPT.")]
     ChatGptSignInRequired,
+    #[error(
+        "Codex reports a ChatGPT sign-in but did not provide an access token. Reconnect ChatGPT in AgentDictate or check Codex compatibility."
+    )]
+    ChatGptTokenUnavailable,
     #[error("The ChatGPT sign-in does not include an account identifier.")]
     MissingAccountId,
     #[error("Could not read the captured recording: {0}")]
@@ -579,7 +583,7 @@ fn parse_chatgpt_auth(result: &Value) -> Result<ChatGptAuth, CodexSubscriptionEr
         .get("authToken")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
-        .ok_or(CodexSubscriptionError::ChatGptSignInRequired)?;
+        .ok_or(CodexSubscriptionError::ChatGptTokenUnavailable)?;
     let claims = parse_jwt_claims(token)?;
     let account_id = claims
         .get("https://api.openai.com/auth")
@@ -621,8 +625,9 @@ fn stop_child(child: &mut Child) {
 /// dictation, a meeting issues many requests, so the access token is cached
 /// in memory until it nears expiry or the service rejects it.
 pub(crate) struct ChatGptCredentials {
-    provider: std::sync::Mutex<CodexAppServerAuthProvider>,
-    cached: std::sync::Mutex<Option<CachedChatGptAuth>>,
+    provider: Mutex<Box<dyn ChatGptAuthProvider>>,
+    codex_binary: OsString,
+    cached: Mutex<Option<CachedChatGptAuth>>,
 }
 
 struct CachedChatGptAuth {
@@ -640,10 +645,24 @@ pub(crate) struct ChatGptBearer {
 
 impl ChatGptCredentials {
     pub(crate) fn discover() -> Self {
+        let provider = CodexAppServerAuthProvider::discover();
         Self {
-            provider: std::sync::Mutex::new(CodexAppServerAuthProvider::discover()),
-            cached: std::sync::Mutex::new(None),
+            codex_binary: provider.codex_binary.clone(),
+            provider: Mutex::new(Box::new(provider)),
+            cached: Mutex::new(None),
         }
+    }
+
+    fn cached_bearer(&self, now: u64) -> Option<ChatGptBearer> {
+        let cached = self.cached.lock().ok()?;
+        let cached = cached.as_ref()?;
+        cached
+            .expires_at_unix
+            .is_none_or(|expires| expires > now + 120)
+            .then(|| ChatGptBearer {
+                token: cached.token.clone(),
+                account_id: cached.account_id.clone(),
+            })
     }
 
     /// Returns cached credentials, loading or refreshing them through Codex.
@@ -652,17 +671,8 @@ impl ChatGptCredentials {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !force_refresh
-            && let Ok(cached) = self.cached.lock()
-            && let Some(cached) = cached.as_ref()
-            && cached
-                .expires_at_unix
-                .is_none_or(|expires| expires > now + 120)
-        {
-            return Ok(ChatGptBearer {
-                token: cached.token.clone(),
-                account_id: cached.account_id.clone(),
-            });
+        if !force_refresh && let Some(bearer) = self.cached_bearer(now) {
+            return Ok(bearer);
         }
         let expiry = |auth: &ChatGptAuth| {
             parse_jwt_claims(auth.access_token.expose())
@@ -673,6 +683,11 @@ impl ChatGptCredentials {
             .provider
             .lock()
             .map_err(|_| "ChatGPT sign-in state is unavailable".to_owned())?;
+        // Several transcription and answer lanes can miss the cache together.
+        // The lane ahead of us may have filled it while we waited for Codex.
+        if !force_refresh && let Some(bearer) = self.cached_bearer(now) {
+            return Ok(bearer);
+        }
         let mut auth = provider
             .load(force_refresh)
             .map_err(|error| error.to_string())?;
@@ -681,7 +696,6 @@ impl ChatGptCredentials {
         if !force_refresh && expiry(&auth).is_some_and(|expires| expires <= now + 120) {
             auth = provider.load(true).map_err(|error| error.to_string())?;
         }
-        drop(provider);
         let expires_at_unix = expiry(&auth);
         let bearer = ChatGptBearer {
             token: auth.access_token.expose().to_owned(),
@@ -694,19 +708,15 @@ impl ChatGptCredentials {
                 expires_at_unix,
             });
         }
+        // Publish the cache before releasing the provider to the next lane.
+        drop(provider);
         Ok(bearer)
     }
 
     /// Lists models available to the signed-in account as `(id, label)`.
     pub(crate) fn list_models(&self) -> Result<Vec<(String, String)>, String> {
-        let binary = self
-            .provider
-            .lock()
-            .map_err(|_| "ChatGPT sign-in state is unavailable".to_owned())?
-            .codex_binary
-            .clone();
-        let result =
-            call_app_server(&binary, "model/list", json!({})).map_err(|error| error.to_string())?;
+        let result = call_app_server(&self.codex_binary, "model/list", json!({}))
+            .map_err(|error| error.to_string())?;
         Ok(parse_model_list(&result))
     }
 }
@@ -989,6 +999,71 @@ mod tests {
         }
     }
 
+    fn credentials(provider: impl ChatGptAuthProvider + 'static) -> ChatGptCredentials {
+        ChatGptCredentials {
+            provider: Mutex::new(Box::new(provider)),
+            codex_binary: "unused-codex".into(),
+            cached: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn concurrent_copilot_lanes_share_one_cold_authentication_check() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let credentials = Arc::new(credentials(CallbackAuth(move |refresh: bool| {
+            assert!(!refresh);
+            counted.fetch_add(1, Ordering::Relaxed);
+            // Model a slow external sign-in check while all lanes arrive.
+            thread::sleep(Duration::from_millis(25));
+            Ok(auth("shared-token"))
+        })));
+        let barrier = Arc::new(Barrier::new(8));
+        let lanes: Vec<_> = (0..8)
+            .map(|_| {
+                let credentials = Arc::clone(&credentials);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    credentials.bearer(false).unwrap().token
+                })
+            })
+            .collect();
+        for lane in lanes {
+            assert_eq!(lane.join().unwrap(), "shared-token");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cached_copilot_credentials_still_refresh_when_expiring_or_rejected() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1}"#);
+        let credentials = credentials(FixedAuthProvider {
+            calls: Arc::clone(&calls),
+            responses: VecDeque::from([
+                auth(&format!("header.{payload}.signature")),
+                auth("fresh"),
+                auth("replaced-after-rejection"),
+            ]),
+        });
+        assert_eq!(credentials.bearer(false).unwrap().token, "fresh");
+        assert_eq!(credentials.bearer(false).unwrap().token, "fresh");
+        assert_eq!(
+            credentials.bearer(true).unwrap().token,
+            "replaced-after-rejection"
+        );
+        assert_eq!(
+            credentials.bearer(false).unwrap().token,
+            "replaced-after-rejection"
+        );
+        assert_eq!(*calls.lock().unwrap(), [false, true, true]);
+    }
+
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 4096];
@@ -1152,6 +1227,10 @@ mod tests {
         assert!(matches!(
             parse_chatgpt_auth(&json!({"authMethod": "apikey", "authToken": "secret"})),
             Err(CodexSubscriptionError::ChatGptSignInRequired)
+        ));
+        assert!(matches!(
+            parse_chatgpt_auth(&json!({"authMethod": "chatgpt", "authToken": null})),
+            Err(CodexSubscriptionError::ChatGptTokenUnavailable)
         ));
     }
 }

@@ -55,6 +55,8 @@ const KNOWLEDGE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const WARM_CONNECTIONS: usize = 3;
 /// Longest the researched answer waits for the instant draft it continues.
 const INSTANT_WAIT: Duration = Duration::from_secs(8);
+const CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
+const IDLE_TICK: Duration = Duration::from_millis(250);
 /// How long the wrap-up stays open when the user leaves it alone.
 const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(180);
 const ECHO_WAIT: Duration = Duration::from_secs(4);
@@ -283,6 +285,28 @@ struct TranscriptionJob {
     /// Set for a provisional utterance, whose transcript is used only if
     /// the utterance ends as it stood.
     early: Option<u64>,
+    queued_at: Instant,
+}
+
+/// Wait for a complete draft so research can continue it without repetition,
+/// but stop promptly when the question or answer has been cancelled.
+fn wait_for_instant(done: &Receiver<()>, cancel: &AtomicBool) -> bool {
+    let deadline = Instant::now() + INSTANT_WAIT;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        match done.recv_timeout(left.min(CANCEL_CHECK_INTERVAL)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                return !cancel.load(Ordering::Relaxed);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 /// A provisional utterance being transcribed ahead of its end.
@@ -485,7 +509,7 @@ impl Engine {
         self.warm_up();
         self.start_audio();
         loop {
-            match incoming.recv_timeout(Duration::from_millis(250)) {
+            match incoming.recv_timeout(self.next_wait()) {
                 Ok(message) => {
                     if self.handle(message) {
                         break;
@@ -519,6 +543,7 @@ impl Engine {
                             Err(_) => return,
                         };
                         let Ok(job) = job else { return };
+                        let queue_wait_ms = job.queued_at.elapsed().as_millis() as u64;
                         let started = Instant::now();
                         let text = transcriber(job.wav, &language);
                         tracing::info!(
@@ -527,6 +552,7 @@ impl Engine {
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             ok = text.is_ok(),
                             early = job.early.is_some(),
+                            queue_wait_ms,
                             "copilot utterance transcribed"
                         );
                         in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -1022,6 +1048,7 @@ impl Engine {
             end_ms,
             wav: wav_bytes(&utterance.samples),
             early: Some(id),
+            queued_at: Instant::now(),
         };
         if jobs.send(job).is_err() {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -1098,6 +1125,7 @@ impl Engine {
                 end_ms,
                 wav: wav_bytes(&utterance.samples),
                 early: None,
+                queued_at: Instant::now(),
             })
             .is_err()
         {
@@ -1345,13 +1373,46 @@ impl Engine {
         let _ = std::thread::Builder::new()
             .name("copilot-turn".into())
             .spawn(move || {
+                let started = Instant::now();
                 let cancel = AtomicBool::new(false);
                 let respond = providers(&settings)
                     .and_then(|provider| complete(provider.as_ref(), &request, &cancel))
                     .ok()
                     .and_then(|text| parse_turn_verdict(&text));
+                tracing::info!(
+                    turn_id = id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    ?respond,
+                    "copilot turn judged"
+                );
                 let _ = messages.send(EngineMsg::TurnVerdict { id, respond });
             });
+    }
+
+    fn verdict_wait(&self, likely: bool) -> Duration {
+        if likely && self.one_on_one() {
+            ONE_ON_ONE_VERDICT_WAIT
+        } else {
+            TURN_VERDICT_WAIT
+        }
+    }
+
+    /// Wake at the question's actual confirmation deadline when audio goes
+    /// quiet, rather than rounding it up to the next 250 ms maintenance tick.
+    fn next_wait(&self) -> Duration {
+        let Some(turn) = self.pending_turn.as_ref().filter(|_| !self.them_speaking) else {
+            return IDLE_TICK;
+        };
+        let pause_left = Duration::from_millis(
+            (turn.end_ms + QUESTION_PAUSE_MS).saturating_sub(self.elapsed_ms()),
+        );
+        let verdict_left = if turn.verdict.is_some() {
+            Duration::ZERO
+        } else {
+            self.verdict_wait(turn.likely)
+                .saturating_sub(turn.heard.elapsed())
+        };
+        IDLE_TICK.min(pause_left.max(verdict_left).max(Duration::from_millis(1)))
     }
 
     /// Shows or starts the answer to the pending turn once the other side has
@@ -1377,11 +1438,7 @@ impl Engine {
         if self.them_speaking || self.elapsed_ms() < turn.end_ms + QUESTION_PAUSE_MS {
             return;
         }
-        let verdict_wait = if turn.likely && self.one_on_one() {
-            ONE_ON_ONE_VERDICT_WAIT
-        } else {
-            TURN_VERDICT_WAIT
-        };
+        let verdict_wait = self.verdict_wait(turn.likely);
         let respond = match turn.verdict {
             Some(respond) => respond,
             None if turn.heard.elapsed() >= verdict_wait => turn.likely,
@@ -1399,7 +1456,10 @@ impl Engine {
             && draft.gate.reveal()
         {
             tracing::info!(
+                answer_id = draft.id,
+                turn_id = turn.id,
                 waited_ms = turn.heard.elapsed().as_millis() as u64,
+                speech_end_to_reveal_ms = self.elapsed_ms().saturating_sub(turn.end_ms),
                 "answering the other side automatically"
             );
             self.last_auto_question = Some((turn.text, Instant::now()));
@@ -1561,6 +1621,14 @@ impl Engine {
             .name("copilot-answer".into())
             .spawn(move || {
                 let gate = thread_gate;
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = messages.send(EngineMsg::AnswerFinished {
+                        id,
+                        title,
+                        text: String::new(),
+                    });
+                    return;
+                }
                 let started = Instant::now();
                 let image = if use_screen {
                     match platform.capture_screen() {
@@ -1608,6 +1676,7 @@ impl Engine {
                                         if first {
                                             first = false;
                                             tracing::info!(
+                                                answer_id = id,
                                                 first_text_ms =
                                                     started.elapsed().as_millis() as u64,
                                                 "copilot instant draft streaming"
@@ -1632,7 +1701,14 @@ impl Engine {
                 // The researched answer continues the draft the user is
                 // already reading, so it starts once the draft is written.
                 let draft = if instant {
-                    let _ = instant_finished.recv_timeout(INSTANT_WAIT);
+                    if !wait_for_instant(&instant_finished, &cancel) {
+                        let _ = messages.send(EngineMsg::AnswerFinished {
+                            id,
+                            title,
+                            text: String::new(),
+                        });
+                        return;
+                    }
                     instant_text
                         .lock()
                         .map(|text| text.clone())
@@ -1640,6 +1716,14 @@ impl Engine {
                 } else {
                     String::new()
                 };
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = messages.send(EngineMsg::AnswerFinished {
+                        id,
+                        title,
+                        text: String::new(),
+                    });
+                    return;
+                }
                 let has_draft = !draft.trim().is_empty();
                 let request = AnswerRequest {
                     system,
@@ -1667,6 +1751,7 @@ impl Engine {
                                 if !streaming {
                                     streaming = true;
                                     tracing::info!(
+                                        answer_id = id,
                                         first_text_ms = started.elapsed().as_millis() as u64,
                                         "copilot answer streaming"
                                     );
@@ -1710,6 +1795,7 @@ impl Engine {
                     gate.send(CopilotEvent::AnswerStatus { id, status });
                 }
                 tracing::info!(
+                    answer_id = id,
                     total_ms = started.elapsed().as_millis() as u64,
                     chars = text.len(),
                     "copilot answer finished"
@@ -2594,6 +2680,90 @@ mod tests {
     }
 
     #[test]
+    fn question_timers_wake_at_confirmation_and_verdict_deadlines() {
+        let (mut engine, _incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        assert_eq!(engine.next_wait(), IDLE_TICK);
+        engine.started = Instant::now() - Duration::from_millis(QUESTION_PAUSE_MS - 20);
+        engine.pending_turn = Some(PendingTurn {
+            id: 1,
+            text: "What is the price?".into(),
+            end_ms: 0,
+            verdict: Some(true),
+            likely: true,
+            draft: None,
+            heard: Instant::now(),
+        });
+        assert!(engine.next_wait() <= Duration::from_millis(20));
+        engine.them_speaking = true;
+        assert_eq!(
+            engine.next_wait(),
+            IDLE_TICK,
+            "continuing speech must not busy-poll"
+        );
+        engine.them_speaking = false;
+        after_a_pause(&mut engine);
+        let turn = engine.pending_turn.as_mut().unwrap();
+        turn.verdict = None;
+        turn.heard = Instant::now() - TURN_VERDICT_WAIT + Duration::from_millis(20);
+        assert!(engine.next_wait() <= Duration::from_millis(20));
+        assert!(engine.next_wait() >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn cancelling_an_unfinished_instant_draft_never_starts_research() {
+        struct HeldDraft {
+            started: mpsc::Sender<()>,
+            finish: Arc<Mutex<Receiver<()>>>,
+        }
+        impl AnswerProvider for HeldDraft {
+            fn stream(
+                &self,
+                _: &AnswerRequest,
+                _: &AtomicBool,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), String> {
+                self.started.send(()).unwrap();
+                self.finish
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                sink(StreamEvent::Text("A late draft.".into()));
+                Ok(())
+            }
+        }
+        let (mut engine, incoming, _events, _requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            live_insights: false,
+            ..CopilotSettings::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let (started, waiting) = mpsc::channel();
+        let (finish, held) = mpsc::channel();
+        let held = Arc::new(Mutex::new(held));
+        engine.services.providers = Arc::new(move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(HeldDraft {
+                started: started.clone(),
+                finish: Arc::clone(&held),
+            }))
+        });
+        engine.answer(AnswerKind::Typed("What is the price?".into()));
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        engine.cancel_answer();
+        // The answer worker must finish while the instant provider is still
+        // blocked, not wait eight seconds and then send a researched request.
+        let message = incoming.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(&message, EngineMsg::AnswerFinished { text, .. } if text.is_empty()));
+        engine.handle(message);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(engine.answers.is_empty());
+        finish.send(()).unwrap();
+    }
+
+    #[test]
     fn question_from_the_other_side_triggers_an_automatic_streamed_answer() {
         let (mut engine, incoming, events, requests, _directory) =
             harness(CopilotSettings::default());
@@ -2850,8 +3020,15 @@ mod tests {
         );
         drain(&mut engine, &incoming);
         assert_eq!(answers_started(&events), 0);
-        // The draft started early, but never reaches the window or the notes.
-        assert!(requests.lock().unwrap().len() > 1);
+        // A fast rejection can now cancel before the draft starts. Any
+        // draft that did start still never reaches the window or notes.
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.system == turn_judge_system_prompt())
+        );
         assert!(events.lock().unwrap().iter().all(|event| !matches!(
             event,
             CopilotEvent::AnswerDelta { .. } | CopilotEvent::InstantDelta { .. }
