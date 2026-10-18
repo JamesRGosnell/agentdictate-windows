@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agentdictate_runtime::{DeliveryGate, DeliveryGateError};
@@ -102,11 +102,12 @@ impl OverlayController {
     }
 
     pub fn dismiss_and_wait(&self) -> Result<(), OverlayTeardownError> {
+        let started = Instant::now();
         let (reply, acknowledgment) = sync_channel(1);
         self.commands
             .send(OverlayCommand::Dismiss { reply })
             .map_err(|_| OverlayTeardownError::PresenterUnavailable)?;
-        match acknowledgment.recv_timeout(OVERLAY_TEARDOWN_TIMEOUT) {
+        let result = match acknowledgment.recv_timeout(OVERLAY_TEARDOWN_TIMEOUT) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 tracing::warn!(
@@ -126,7 +127,13 @@ impl OverlayController {
                 }
             }
             Err(RecvTimeoutError::Disconnected) => Err(OverlayTeardownError::PresenterUnavailable),
-        }
+        };
+        tracing::info!(
+            overlay_wait_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "recording overlay dismissal completed"
+        );
+        result
     }
 }
 

@@ -1,5 +1,11 @@
 [CmdletBinding()]
-param([string]$Binary, [ValidateSet('starting','recording','transcribing','cleaning')][string]$State = 'recording')
+param(
+    [string]$Binary,
+    [ValidateSet('starting','recording','transcribing','cleaning')][string]$State = 'recording',
+    [ValidateRange(1,50)][int]$Samples = 1,
+    [string]$TimingsPath,
+    [string]$ComparisonBinary
+)
 if (!$Binary) { $Binary = Join-Path (Split-Path $PSScriptRoot) 'target/debug/agentdictated.exe' }
 $ErrorActionPreference = 'Stop'
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
@@ -9,6 +15,7 @@ using System.Text;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 public class AgentDictateOverlayProbe {
+ public static double LastShutdownMilliseconds;
  [StructLayout(LayoutKind.Sequential)] struct SA { public int size; public IntPtr descriptor; public int inherit; }
  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct SI {public int cb; public string reserved; public string desktop; public string title; public int x,y,cx,cy,cxchars,cychars,fill,flags; public short show,reserved2;public IntPtr reservedPtr,input,output,error;}
  [StructLayout(LayoutKind.Sequential)] struct PI {public IntPtr process,thread;public int pid,tid;}
@@ -39,7 +46,7 @@ public class AgentDictateOverlayProbe {
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr monitor,ref MONITORINFO info);
  [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
  [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
- public static string Run(string exe,string data,string json) {
+ public static string Run(string exe,string data,string json,int holdMilliseconds) {
   var dpiContext=SetThreadDpiAwarenessContext(new IntPtr(-4));
   var original=GetForegroundWindow();var name="AgentDictateProbe-"+Guid.NewGuid().ToString("N");
   var desktop=CreateDesktop(name,IntPtr.Zero,IntPtr.Zero,0,0x000F01FF,IntPtr.Zero);
@@ -52,6 +59,7 @@ public class AgentDictateOverlayProbe {
    var si=new SI{cb=Marshal.SizeOf(typeof(SI)),desktop=name,flags=0x100,input=childRead,output=childWrite,error=childWrite};
    if(!CreateProcess(exe,new StringBuilder("\""+exe+"\" --overlay-helper"),IntPtr.Zero,IntPtr.Zero,true,0x08000000,IntPtr.Zero,Path.GetDirectoryName(exe),ref si,out pi))throw new Exception("CreateProcess: "+Marshal.GetLastWin32Error());
    CloseHandle(childRead);childRead=IntPtr.Zero;CloseHandle(childWrite);childWrite=IntPtr.Zero;
+   System.Diagnostics.Stopwatch shutdown=null;
    using(var write=new FileStream(new SafeFileHandle(parentWrite,true),FileAccess.Write)){
     parentWrite=IntPtr.Zero;var bytes=Encoding.UTF8.GetBytes(json+"\n");write.Write(bytes,0,bytes.Length);write.Flush();
     var deadline=DateTime.UtcNow.AddSeconds(20);var status=new StringBuilder();
@@ -82,8 +90,11 @@ public class AgentDictateOverlayProbe {
       }
       found=true;}return true;},IntPtr.Zero);
     if(!found)throw new Exception("No native overlay window found");
+    System.Threading.Thread.Sleep(holdMilliseconds);
+    shutdown=System.Diagnostics.Stopwatch.StartNew();
    }
    if(WaitForSingleObject(pi.process,10000)!=0)throw new Exception("Overlay did not exit after its input pipe closed");
+   LastShutdownMilliseconds=shutdown.Elapsed.TotalMilliseconds;
    uint exit;GetExitCodeProcess(pi.process,out exit);if(exit!=0)throw new Exception("Overlay exited with "+exit);
    if(GetForegroundWindow()!=original)throw new Exception("User foreground window changed during isolated probe");
    return "Native overlay submitted a frame, was centered above the primary taskbar with no-activate/tool-window styles, and exited on pipe close on an isolated desktop.";
@@ -120,6 +131,25 @@ try {
         $taskActiveRecording = @{audio_path=$taskWavePath;started_at_unix_millis=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 6000}
     }
     $taskOverlayJson = @{workflow=@{phase=$taskPhase};active_recording=$taskActiveRecording} | ConvertTo-Json -Depth 5 -Compress
-    [AgentDictateOverlayProbe]::Run([IO.Path]::GetFullPath($Binary),$taskProbeData,$taskOverlayJson)
+    $taskVariants = @([pscustomobject]@{label='baseline';binary=[IO.Path]::GetFullPath($Binary)})
+    if ($ComparisonBinary) {
+        $taskVariants += [pscustomobject]@{label='candidate';binary=[IO.Path]::GetFullPath($ComparisonBinary)}
+        # Warm both graphics processes before collecting alternating pairs.
+        foreach ($taskVariant in $taskVariants) {
+            $null = [AgentDictateOverlayProbe]::Run($taskVariant.binary,$taskProbeData,$taskOverlayJson,0)
+        }
+    }
+    $taskTimings = for ($taskIteration = 0; $taskIteration -lt $Samples; $taskIteration++) {
+        # Vary the close phase within the watcher's 250 ms refresh interval.
+        $taskHold = if ($Samples -gt 1) { ($taskIteration * 53) % 250 } else { 0 }
+        $taskOrder = if ($taskVariants.Count -gt 1 -and $taskIteration % 2) { @($taskVariants[1],$taskVariants[0]) } else { $taskVariants }
+        foreach ($taskVariant in $taskOrder) {
+            $taskResult = [AgentDictateOverlayProbe]::Run($taskVariant.binary,$taskProbeData,$taskOverlayJson,$taskHold)
+            if ($Samples -eq 1) { Write-Host $taskResult }
+            [pscustomobject]@{ variant=$taskVariant.label; sample=$taskIteration + 1; hold_ms=$taskHold; shutdown_ms=[AgentDictateOverlayProbe]::LastShutdownMilliseconds }
+        }
+    }
+    $taskTimings | Format-Table -AutoSize
+    if ($TimingsPath) { $taskTimings | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $TimingsPath -Encoding UTF8 }
     Write-Host "Native window capture: $taskProbeData\overlay.png"
 } finally { $env:AGENTDICTATE_DATA_HOME = $previousDataHome }

@@ -76,7 +76,11 @@ impl OverlayPlacementWatcher {
         let control = stop.clone();
         let worker = std::thread::spawn(move || {
             while !control.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(250));
+                // Drop wakes this wait so teardown never joins a sleeping poller.
+                std::thread::park_timeout(Duration::from_millis(250));
+                if control.load(Ordering::Relaxed) {
+                    return;
+                }
                 if unsafe { IsWindow(window as HWND) } == 0 {
                     return;
                 }
@@ -96,7 +100,38 @@ impl Drop for OverlayPlacementWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
+            // Unpark is retained even if the worker has not entered its wait yet.
+            worker.thread().unpark();
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_watcher_wakes_its_waiting_worker() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let control = Arc::clone(&stop);
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            while !control.load(Ordering::Relaxed) {
+                std::thread::park_timeout(Duration::from_secs(2));
+            }
+        });
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let watcher = OverlayPlacementWatcher {
+            stop,
+            worker: Some(worker),
+        };
+        let started = std::time::Instant::now();
+        drop(watcher);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "dropping the watcher must interrupt its maintenance wait"
+        );
     }
 }
