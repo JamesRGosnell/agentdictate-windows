@@ -334,3 +334,102 @@ first useful sentence, full draft, factual correctness, corrections and
 rhetorical-question handling on representative calls. Keep the existing models
 until that evidence justifies changing them. Public model latency expectations
 and the historical table above are not a substitute for those measurements.
+
+## Measurement follow-up: October 18, 2026
+
+### Dictation observed before and after
+
+The October 9–16 daemon logs contain 59 delivered subscription dictations with
+both a successful HTTP response and a `stop_to_paste_ms` value. Since the auth
+preparation change, there are nine such deliveries, including five spoken
+attempts in James's latest measurement run. Two additional attempts returned
+empty transcripts and were retained in Recovery; James confirmed that those
+were intentional silence tests. They are not included as successful deliveries.
+
+| Cohort | Before median | After median | Observed reduction |
+| --- | ---: | ---: | ---: |
+| All successful dictations | 2,005 ms (59) | 1,381 ms (9) | 624 ms / 31% |
+| Recordings shorter than 10 seconds | 1,742 ms (21) | 1,331 ms (7) | 411 ms / 24% |
+| Recordings from 10 to 30 seconds | 1,958 ms (17) | 2,043 ms (2) | No improvement established |
+
+These are observational comparisons, not a randomized A/B measurement. The
+after recordings are shorter overall: median 3.98 seconds versus 17.91 seconds
+before. Even within the short-recording bucket, their median lengths differ
+(2.96 versus 5.95 seconds). Network conditions, spoken content and earlier
+builds also vary. The table therefore does not establish that the change alone
+caused a 24% or 31% improvement, or that longer recordings improved.
+
+The latest five spoken attempts completed in 1,262–2,160 ms, with a median of
+1,327 ms. All five were delivered. Across all nine successful after recordings,
+the measured auth work took 125–1,047 ms and finished during recording:
+`auth_wait_millis` was zero in every case. This directly verifies that the
+foreground auth wait was removed for these recordings. It does not establish
+the hypothetical duration of a separate auth lookup after each recording.
+
+The existing `stop_to_paste_ms` name is broader than physical paste latency:
+the timer begins when the daemon handles Stop and ends after delivery,
+bookkeeping, audio cleanup and the final state update. It neither measures
+hotkey dispatch before the handler nor when the destination paints the text.
+Before and after use the same timer definition.
+
+Response events were paired with delivered jobs on the same processing thread,
+within that job's stop-to-completion interval. The comparison uses timing fields
+only; no speech, credentials, recording files or raw runtime records are added
+to this repository.
+
+### Copilot measurement limits
+
+There is no post-update meeting session in the logs. James chose to measure
+dictation during this run, so there is no measured copilot speech-end-to-useful-
+answer speedup. The earlier headless live comparison still has the unresolved
+token-handoff limitation described above; it provides no model timing result.
+
+Three focused tests were rerun successfully:
+
+- Eight concurrent cold credential lanes need one successful auth load rather
+  than potentially eight serialized loads. This is a request-count result under a
+  mock provider, not an eightfold answer-speed improvement.
+- A canceled answer worker finishes while its instant draft is still blocked
+  and never starts research. The wait checks cancellation at 25 ms intervals;
+  this does not abort an existing blocking network read.
+- Quiet question timers schedule the actual pause/verdict deadline, removing
+  the old maintenance tick's possible extra wait of almost 250 ms. Ordinary
+  audio events may already have woken the old loop sooner.
+
+### Next experiments, in priority order
+
+1. **Profile and reduce the delivery tail.** After the successful transcription
+   response, another 361–526 ms elapses before flow completion (median 462 ms).
+   This includes overlay dismissal, paste and durable bookkeeping; it is not
+   all avoidable delay. The delivery gate currently waits for the entire overlay
+   helper process to exit, including a 150 ms fade hold. Add stage timings, then
+   evaluate acknowledging an observed hidden window before asynchronous process
+   cleanup, or retaining a hidden overlay host. Preserve focus checks, the
+   bottom-center placement and duplicate-paste protection. Do not simply remove
+   the gate or classify all 462 ms as a promised saving.
+2. **Transcribe while speaking on the default route.** The optional API-key
+   dictation path already uses continuous `gpt-live-transcribe`; the selected
+   subscription path uploads a completed recording, and the copilot uses
+   provisional file segments. A warm local streaming recognizer, or a separately
+   authorized streaming service, could move more recognition before Stop and
+   provide stable partial questions earlier. [OpenAI's realtime guide](https://developers.openai.com/api/docs/guides/realtime-transcription)
+   distinguishes live transcription from transcription that begins at commit.
+   API access is a separate route; do not assume that the subscription endpoint
+   offers it or silently change billing. Evaluate French/English, names,
+   numbers, continuations and silence, with the current cloud path as fallback.
+3. **Give the copilot a shorter complete first answer.** It currently waits for
+   up to two sentences and two bullets before starting the research that
+   continues them. Compare one useful complete sentence, and a faster draft
+   model, against the current answer for factual quality as well as latency.
+   Independently gathering research facts in parallel is another experiment,
+   but they must be reconciled with the actual draft before display. [OpenAI's
+   latency guidance](https://developers.openai.com/api/docs/guides/latency-optimization)
+   supports reducing generated output and overlapping independent work. Do not
+   launch the existing continuation prompt from an incomplete draft or promise
+   a first-token improvement merely from a lower output cap.
+
+Keep the existing speculative question drafting and prompt priming: they are
+already present. Shortening the silence gate alone may do little when model
+generation is the limiting stage. The next copilot comparison should time the
+first useful visible sentence as well as the final answer, with repeated
+identical prompts/audio, alternating old/new order and unchanged model settings.
