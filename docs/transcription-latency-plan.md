@@ -5,7 +5,10 @@ minute to transcribe after stopping. Measured, not guessed: numbers below come
 from the daemon logs, the history database, and a live timing harness that
 replayed a retained recording against the OpenAI API. Status: Phases 1 and 2 were implemented on 2026-09-01
 (Opus-compressed uploads with WAV fallback, per-stage timing logs, whisper-1
-fallback pass removed). Phase 3 (realtime streaming) remains open.
+fallback pass removed). Realtime streaming was subsequently implemented for
+the API provider. See the October 18 follow-up below for the current Windows
+subscription path and remaining opportunities; the original diagnosis below
+describes the September 1 configuration.
 
 ## Symptom
 
@@ -139,3 +142,95 @@ useful regardless as the retry/recovery path.
   job can outlive the user's presence; consider a systemd idle-inhibit while
   a job is processing (optional — Phase 1 makes waits short enough that this
   mostly stops mattering).
+
+## Windows follow-up: October 18, 2026
+
+### Current measurements and critical path
+
+The current installation uses ChatGPT subscription transcription, with streaming
+and cleanup disabled. The API provider's Opus compression and live WebSocket
+path therefore do not accelerate these subscription jobs.
+
+Across 59 completed jobs in the October 9–16 logs, median reported
+`stop_to_paste_ms` was **2,005 ms**. Across 66 successful subscription responses
+in the same log selection, median request elapsed time was **1,471.5 ms**. These
+are different populations, so subtracting their medians is not a stage timing.
+The completion metric also includes bookkeeping after paste submission.
+
+The subscription request previously obtained credentials by starting a fresh
+`codex app-server` after recording stopped. Three local, read-only
+`getAuthStatus` probes without token output measured **1,148 / 598 / 474 ms**
+for startup, status and shutdown; startup/initialization accounted for
+1,107 / 577 / 452 ms. These are startup probes, not transcription benchmarks.
+
+### Implemented improvements
+
+- **Overlap authentication with recording.** Dispatch the recording lifecycle
+  to the selected provider and obtain subscription credentials on a background
+  worker after the first durable audio frame. Only the matching recording may
+  consume the result, once. Keep at most one preparation worker across rapid
+  start/discard cycles. Cancellation invalidates its result without waiting.
+  Failed preparation and unrelated recovery requests check authentication again;
+  tokens near expiry refresh, and HTTP 401/403 still trigger the existing single
+  refresh. No audio is uploaded during this preparation. This removes the
+  completed preparation time from the stop path; very short recordings can
+  still wait for it. Actual production improvement remains to be measured.
+- **Drain live audio in bounded bursts.** The optional API stream used to read
+  one 100 ms audio chunk, then wait up to 40 ms for a server event. A backlog of
+  20 seconds could incur about eight seconds of artificial waiting, exceeding
+  the six-second finish deadline and forcing a file retry. Send up to 32 chunks
+  per event read, retaining cancellation, deadline checks, finalized WAV bounds,
+  final-item matching and saved-audio fallback. A silent mock WebSocket peer
+  verifies that all 20 seconds reach commit within the existing deadline.
+- **Attribute the remaining delay.** Log subscription audio-read and auth-wait
+  time, preparation duration, and live finalization time and pending PCM bytes.
+  Logs contain timings and identifiers, never credentials or transcript text.
+
+### What professional systems suggest
+
+[Wispr's engineering write-up](https://wisprflow.ai/post/technical-challenges)
+describes a roughly 700 ms stop-to-result target, with separate ASR, formatting
+and networking budgets. That is their stated target, not a benchmark of this
+app. Its useful lesson here is to budget each stage and avoid speed changes
+that create more corrections.
+
+[OpenAI's Realtime transcription guidance](https://developers.openai.com/api/docs/guides/realtime-transcription)
+supports sending audio while speaking, committing at the end, and matching
+final results by item ID. It explicitly describes the delay/accuracy tradeoff
+and recommends representative microphone recordings rather than synthetic-only
+evaluation. [Deepgram's endpointing guidance](https://developers.deepgram.com/docs/endpointing)
+shows how automatic systems finalize at speech pauses. This app already has an
+explicit stop shortcut, so adding a silence timeout after that shortcut would
+add latency without supplying a needed endpoint decision.
+
+### Next opportunities, in priority order
+
+1. **Measure production auth wait after this change.** Compare similar short
+   and long recordings, separating successful first attempts, refreshed tokens
+   and errors. Add monotonic timings for capture finalization, overlay dismissal
+   and the actual paste submission before tuning those stages. Keep durable
+   transcript and delivery checkpoints intact.
+2. **Use the existing API live path for a larger architectural gain.** Moving
+   upload and recognition into recording time can reduce the work left at stop.
+   This requires an API key and separate API usage; it is not available through
+   the currently implemented subscription endpoint. Do not silently switch the
+   installed provider or claim that subscription streaming is supported.
+3. **Evaluate the 150 ms overlay dismissal hold.** It deliberately covers a
+   120 ms fade plus frame margin, and the delivery gate waits for helper exit.
+   A safe redesign could fade during finalization while still confirming the
+   overlay cannot intercept paste. Simply bypassing the delivery gate would
+   weaken focus and failure handling.
+4. **Evaluate lossless compression or earlier encoding for subscription audio.**
+   The private endpoint is currently verified with finalized WAV only. Establish
+   codec acceptance and real encoding/upload crossover timings before changing
+   it. The API path already compresses uploads; those savings cannot be assumed
+   for subscription jobs.
+5. **For a larger experiment, compare local streaming recognition.** It could
+   eliminate network latency, but needs real microphone, bilingual, names and
+   punctuation evaluation on this machine's Intel Arc graphics. No local model
+   or GPU inference stack was installed as part of this change.
+
+Avoid speculative duplicate transcription requests, arbitrary shorter timeouts,
+or pasting unstable partial text: they can increase cost, lose speech, or force
+the user to repair output. No new provider, model, UI or paid service is needed
+for the implemented authentication optimization.

@@ -161,6 +161,8 @@ fn stream_audio(
     let mut commit_id: Option<String> = None;
     let mut completed = std::collections::BTreeMap::<String, String>::new();
     let mut finish_deadline = None;
+    let mut finish_started = None;
+    let mut pending_audio_bytes = 0;
     loop {
         let control = command.load(Ordering::Acquire);
         anyhow::ensure!(control != CANCEL, "canceled");
@@ -175,54 +177,68 @@ fn stream_audio(
             );
         }
         if control == FINISH && finish_deadline.is_none() {
+            finish_started = Some(Instant::now());
             finish_deadline = Some(Instant::now() + Duration::from_secs(6));
         }
         if let Some(deadline) = finish_deadline {
             anyhow::ensure!(Instant::now() < deadline, "final transcript timeout");
         }
         if ready && !committed {
-            let mut read_end = final_end;
-            if final_end.is_none() {
-                let position = file.stream_position()?;
-                file.seek(SeekFrom::Start(data_offset - 4))?;
-                let mut size = [0; 4];
-                file.read_exact(&mut size)?;
-                let size = u64::from(u32::from_le_bytes(size));
-                let end = data_offset + size;
-                if size > 0 && end <= file.metadata()?.len() {
-                    read_end = Some(end);
+            // Drain buffered audio in bounded bursts. Waiting for a server
+            // event after every 100 ms chunk adds 40 ms per queued chunk,
+            // even when the peer has nothing to say until commit.
+            for _ in 0..32 {
+                anyhow::ensure!(command.load(Ordering::Acquire) != CANCEL, "canceled");
+                if let Some(deadline) = finish_deadline {
+                    anyhow::ensure!(Instant::now() < deadline, "final transcript timeout");
                 }
-                if control == FINISH {
-                    final_end = read_end;
-                    anyhow::ensure!(final_end.is_some(), "WAV not finalized");
+                let mut read_end = final_end;
+                if final_end.is_none() {
+                    let position = file.stream_position()?;
+                    file.seek(SeekFrom::Start(data_offset - 4))?;
+                    let mut size = [0; 4];
+                    file.read_exact(&mut size)?;
+                    let size = u64::from(u32::from_le_bytes(size));
+                    let end = data_offset + size;
+                    if size > 0 && end <= file.metadata()?.len() {
+                        read_end = Some(end);
+                    }
+                    if control == FINISH {
+                        let end = read_end.ok_or_else(|| anyhow::anyhow!("WAV not finalized"))?;
+                        final_end = Some(end);
+                        pending_audio_bytes = end.saturating_sub(position);
+                    }
+                    file.seek(SeekFrom::Start(position))?;
                 }
-                file.seek(SeekFrom::Start(position))?;
-            }
-            let remaining = if let Some(end) = read_end {
-                let position = file.stream_position()?;
-                anyhow::ensure!(
-                    position <= end,
-                    "audio was read beyond finalized PCM; use saved audio"
-                );
-                (end - position).min(buffer.len() as u64) as usize
-            } else {
-                buffer.len()
-            };
-            let count = file.read(&mut buffer[..remaining])?;
-            if count > 0 {
-                let pcm = resampler.push(&buffer[..count]);
-                if !pcm.is_empty() {
-                    socket.send(Message::text(
+                let remaining = if let Some(end) = read_end {
+                    let position = file.stream_position()?;
+                    anyhow::ensure!(
+                        position <= end,
+                        "audio was read beyond finalized PCM; use saved audio"
+                    );
+                    (end - position).min(buffer.len() as u64) as usize
+                } else {
+                    buffer.len()
+                };
+                let count = file.read(&mut buffer[..remaining])?;
+                if count > 0 {
+                    let pcm = resampler.push(&buffer[..count]);
+                    if !pcm.is_empty() {
+                        socket.send(Message::text(
                         json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(pcm)})
                             .to_string(),
                     ))?;
+                    }
+                } else if control == FINISH {
+                    anyhow::ensure!(resampler.pending_byte.is_none(), "incomplete PCM sample");
+                    socket.send(Message::text(
+                        json!({"type":"input_audio_buffer.commit"}).to_string(),
+                    ))?;
+                    committed = true;
+                    break;
+                } else {
+                    break;
                 }
-            } else if control == FINISH {
-                anyhow::ensure!(resampler.pending_byte.is_none(), "incomplete PCM sample");
-                socket.send(Message::text(
-                    json!({"type":"input_audio_buffer.commit"}).to_string(),
-                ))?;
-                committed = true;
             }
         }
         match socket.read() {
@@ -264,6 +280,11 @@ fn stream_audio(
         }
         if let Some(text) = commit_id.as_ref().and_then(|id| completed.get(id)) {
             anyhow::ensure!(!text.trim().is_empty(), "empty transcript");
+            tracing::info!(
+                pending_audio_bytes,
+                finish_millis = finish_started.map(|started| started.elapsed().as_millis()),
+                "live transcription final transcript received"
+            );
             let _ = socket.close(None);
             return Ok(text.trim().into());
         }
@@ -274,6 +295,64 @@ fn stream_audio(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn queued_audio_drains_before_the_final_transcript_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recording.wav");
+        // A slow handshake can leave 20 seconds of captured PCM queued.
+        // A peer may send no further events until all audio is committed.
+        let samples = 20 * 16000u32;
+        let mut wav = b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data\0\0\0\0".to_vec();
+        wav[4..8].copy_from_slice(&(36 + samples * 2).to_le_bytes());
+        wav[40..44].copy_from_slice(&(samples * 2).to_le_bytes());
+        wav.resize(44 + samples as usize * 2, 0);
+        std::fs::write(&path, wav).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut ws = tungstenite::accept(tcp).unwrap();
+            ws.read().unwrap(); // session.update
+            ws.send(Message::text(json!({"type":"session.updated"}).to_string()))
+                .unwrap();
+            let mut bytes = 0;
+            loop {
+                let event: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                if event["type"] == "input_audio_buffer.commit" {
+                    break;
+                }
+                assert_eq!(event["type"], "input_audio_buffer.append");
+                bytes += STANDARD
+                    .decode(event["audio"].as_str().unwrap())
+                    .unwrap()
+                    .len();
+            }
+            assert_eq!(bytes, samples as usize * 3 - 2);
+            for event in [
+                json!({"type":"input_audio_buffer.committed","item_id":"all"}),
+                json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"all","transcript":"All the audio."}),
+            ] {
+                ws.send(Message::text(event.to_string())).unwrap();
+            }
+        });
+        let options =
+            DictationOptions::from_settings(&agentdictate_core::Settings::default(), vec![]);
+        assert_eq!(
+            stream_audio(
+                path,
+                &options,
+                "test",
+                &format!("ws://{address}"),
+                &AtomicU8::new(FINISH)
+            )
+            .unwrap(),
+            "All the audio."
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn live_stream_sends_before_stop_and_waits_for_matching_final_item() {

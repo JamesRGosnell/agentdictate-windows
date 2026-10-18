@@ -3,10 +3,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agentdictate_runtime::ExternalError;
+use agentdictate_core::{DictationOptions, JobId};
+use agentdictate_runtime::{ExternalError, RecordingJob};
 use base64::Engine as _;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -140,7 +142,14 @@ fn subscription_error_kind(error: &CodexSubscriptionError) -> &'static str {
 pub struct CodexSubscriptionTransport {
     client: reqwest::blocking::Client,
     endpoint: String,
-    auth_provider: Box<dyn ChatGptAuthProvider>,
+    auth_provider: Arc<Mutex<Box<dyn ChatGptAuthProvider>>>,
+    prepared_auth: Option<PreparedAuth>,
+}
+
+struct PreparedAuth {
+    job_id: Option<JobId>,
+    audio_path: PathBuf,
+    worker: thread::JoinHandle<Result<ChatGptAuth, CodexSubscriptionError>>,
 }
 
 impl CodexSubscriptionTransport {
@@ -153,7 +162,8 @@ impl CodexSubscriptionTransport {
                 .build()
                 .expect("the rustls HTTP client must be constructible"),
             endpoint: CHATGPT_TRANSCRIPTION_ENDPOINT.to_owned(),
-            auth_provider: Box::new(CodexAppServerAuthProvider::discover()),
+            auth_provider: Arc::new(Mutex::new(Box::new(CodexAppServerAuthProvider::discover()))),
+            prepared_auth: None,
         }
     }
 
@@ -169,8 +179,85 @@ impl CodexSubscriptionTransport {
                 .build()
                 .expect("the test HTTP client must be constructible"),
             endpoint: endpoint.into(),
-            auth_provider: Box::new(auth_provider),
+            auth_provider: Arc::new(Mutex::new(Box::new(auth_provider))),
+            prepared_auth: None,
         }
+    }
+
+    fn load_auth(&self, refresh: bool) -> Result<ChatGptAuth, CodexSubscriptionError> {
+        self.auth_provider
+            .lock()
+            .map_err(|_| CodexSubscriptionError::InvalidAuthResponse)?
+            .load(refresh)
+    }
+
+    fn prepare_auth(&mut self, job_id: JobId, audio_path: PathBuf) {
+        // Keep at most one worker, even across rapid start/discard cycles.
+        if self
+            .prepared_auth
+            .as_ref()
+            .is_some_and(|pending| !pending.worker.is_finished())
+        {
+            return;
+        }
+        let provider = Arc::clone(&self.auth_provider);
+        match thread::Builder::new()
+            .name("dictation-subscription-auth".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let result = provider
+                    .lock()
+                    .map_err(|_| CodexSubscriptionError::InvalidAuthResponse)?
+                    .load(false);
+                tracing::info!(
+                    %job_id,
+                    auth_millis = started.elapsed().as_millis(),
+                    success = result.is_ok(),
+                    "ChatGPT transcription authentication prepared"
+                );
+                result
+            }) {
+            Ok(worker) => {
+                self.prepared_auth = Some(PreparedAuth {
+                    job_id: Some(job_id),
+                    audio_path,
+                    worker,
+                });
+            }
+            Err(_) => tracing::warn!("could not prepare ChatGPT authentication during recording"),
+        }
+    }
+
+    fn recording_auth(
+        &mut self,
+        audio_path: &std::path::Path,
+    ) -> Result<ChatGptAuth, CodexSubscriptionError> {
+        if self
+            .prepared_auth
+            .as_ref()
+            .is_some_and(|pending| pending.job_id.is_some() && pending.audio_path == audio_path)
+            && let Some(pending) = self.prepared_auth.take()
+            && let Ok(Ok(auth)) = pending.worker.join()
+        {
+            // A long recording can outlive the token obtained at its start.
+            let expires = parse_jwt_claims(auth.access_token.expose())
+                .ok()
+                .and_then(|claims| claims.get("exp").and_then(Value::as_u64));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if expires.is_some_and(|expires| expires <= now + 120) {
+                return self.load_auth(true);
+            }
+            return Ok(auth);
+        }
+        // Recovery, cancelled jobs and failed preparation still use a fresh
+        // foreground check. Credentials are never reused across recordings.
+        if let Some(pending) = &mut self.prepared_auth {
+            pending.job_id = None;
+        }
+        self.load_auth(false)
     }
 
     fn send(
@@ -201,12 +288,15 @@ impl CodexSubscriptionTransport {
         &mut self,
         request: &TranscriptionRequest<'_>,
     ) -> Result<String, CodexSubscriptionError> {
-        let audio = std::fs::read(request.audio_path).map_err(CodexSubscriptionError::AudioRead)?;
         let request_started_at = Instant::now();
+        let audio = std::fs::read(request.audio_path).map_err(CodexSubscriptionError::AudioRead)?;
+        let audio_read_millis = request_started_at.elapsed().as_millis();
         let boundary = format!("----codex-transcribe-{}", Uuid::new_v4());
         let body = multipart_body(&boundary, &audio, request.language);
 
-        let mut auth = self.auth_provider.load(false)?;
+        let auth_started = Instant::now();
+        let mut auth = self.recording_auth(request.audio_path)?;
+        let auth_wait_millis = auth_started.elapsed().as_millis();
         let mut response = self.send(&auth, body, &boundary).inspect_err(|error| {
             tracing::warn!(
                 attempt = "initial",
@@ -224,7 +314,7 @@ impl CodexSubscriptionTransport {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ) {
             auth_refreshed = true;
-            auth = self.auth_provider.load(true)?;
+            auth = self.load_auth(true)?;
             response = self
                 .send(
                     &auth,
@@ -263,6 +353,8 @@ impl CodexSubscriptionTransport {
             final_http_status = status.as_u16(),
             http_success = status.is_success(),
             auth_refreshed,
+            audio_read_millis,
+            auth_wait_millis,
             audio_bytes = audio.len(),
             recording_duration_seconds = request.duration_seconds,
             elapsed_millis = request_started_at.elapsed().as_millis(),
@@ -304,6 +396,21 @@ impl Default for CodexSubscriptionTransport {
 }
 
 impl SpeechTransport for CodexSubscriptionTransport {
+    fn begin_recording(&mut self, job: &RecordingJob, options: &DictationOptions) {
+        if !options.language.contains(',') {
+            self.prepare_auth(job.id, job.audio_path.clone());
+        }
+    }
+
+    fn cancel_recording(&mut self, id: JobId) {
+        if let Some(pending) = &mut self.prepared_auth
+            && pending.job_id == Some(id)
+        {
+            // Let the bounded auth call finish without blocking the shortcut.
+            pending.job_id = None;
+        }
+    }
+
     fn transcribe_audio(
         &mut self,
         request: TranscriptionRequest<'_>,
@@ -720,6 +827,161 @@ mod tests {
         }
     }
 
+    struct CallbackAuth<F>(F);
+
+    impl<F> ChatGptAuthProvider for CallbackAuth<F>
+    where
+        F: FnMut(bool) -> Result<ChatGptAuth, CodexSubscriptionError> + Send,
+    {
+        fn load(&mut self, refresh: bool) -> Result<ChatGptAuth, CodexSubscriptionError> {
+            (self.0)(refresh)
+        }
+    }
+
+    #[test]
+    fn authentication_overlaps_recording_and_is_consumed_only_once() {
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let mut calls = 0;
+        let provider = CallbackAuth(move |refresh: bool| {
+            assert!(!refresh);
+            calls += 1;
+            if calls == 1 {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                Ok(auth("prepared"))
+            } else {
+                Ok(auth("fresh"))
+            }
+        });
+        let mut transport =
+            CodexSubscriptionTransport::with_endpoint_and_auth("http://unused", provider);
+        let path = PathBuf::from("recording.wav");
+        transport.prepare_auth(JobId::new(), path.clone());
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        // The caller has control while the auth provider is still blocked.
+        release.send(()).unwrap();
+        assert_eq!(
+            transport
+                .recording_auth(&path)
+                .unwrap()
+                .access_token
+                .expose(),
+            "prepared"
+        );
+        assert_eq!(
+            transport
+                .recording_auth(&path)
+                .unwrap()
+                .access_token
+                .expose(),
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn rapid_discards_bound_workers_and_never_reuse_cancelled_credentials() {
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let mut calls = 0;
+        let provider = CallbackAuth(move |_| {
+            calls += 1;
+            if calls == 1 {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                Ok(auth("cancelled"))
+            } else {
+                Ok(auth("fresh"))
+            }
+        });
+        let mut transport =
+            CodexSubscriptionTransport::with_endpoint_and_auth("http://unused", provider);
+        let path = PathBuf::from("recording.wav");
+        let first = JobId::new();
+        transport.prepare_auth(first, path.clone());
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        transport.cancel_recording(JobId::new());
+        assert_eq!(
+            transport.prepared_auth.as_ref().unwrap().job_id,
+            Some(first)
+        );
+        transport.cancel_recording(first);
+        for _ in 0..100 {
+            transport.prepare_auth(JobId::new(), path.clone());
+        }
+        assert!(transport.prepared_auth.as_ref().unwrap().job_id.is_none());
+        release.send(()).unwrap();
+        assert_eq!(
+            transport
+                .recording_auth(&path)
+                .unwrap()
+                .access_token
+                .expose(),
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn failed_preparation_and_unrelated_recovery_check_auth_again() {
+        for path_matches in [true, false] {
+            let (entered, started) = mpsc::channel();
+            let mut calls = 0;
+            let provider = CallbackAuth(move |_| {
+                calls += 1;
+                if calls == 1 {
+                    entered.send(()).unwrap();
+                }
+                if calls == 1 && path_matches {
+                    Err(CodexSubscriptionError::AppServerUnavailable)
+                } else {
+                    Ok(auth(if calls == 1 { "unrelated" } else { "fresh" }))
+                }
+            });
+            let mut transport =
+                CodexSubscriptionTransport::with_endpoint_and_auth("http://unused", provider);
+            transport.prepare_auth(JobId::new(), "recording.wav".into());
+            started.recv_timeout(Duration::from_secs(3)).unwrap();
+            let path = if path_matches {
+                "recording.wav"
+            } else {
+                "recovery.wav"
+            };
+            assert_eq!(
+                transport
+                    .recording_auth(std::path::Path::new(path))
+                    .unwrap()
+                    .access_token
+                    .expose(),
+                "fresh"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_recording_refreshes_prepared_credentials_near_expiry() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1}"#);
+        let provider = FixedAuthProvider {
+            calls: calls.clone(),
+            responses: VecDeque::from([
+                auth(&format!("header.{payload}.signature")),
+                auth("refreshed"),
+            ]),
+        };
+        let mut transport =
+            CodexSubscriptionTransport::with_endpoint_and_auth("http://unused", provider);
+        transport.prepare_auth(JobId::new(), "recording.wav".into());
+        assert_eq!(
+            transport
+                .recording_auth(std::path::Path::new("recording.wav"))
+                .unwrap()
+                .access_token
+                .expose(),
+            "refreshed"
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+    }
+
     fn auth(token: &str) -> ChatGptAuth {
         ChatGptAuth {
             access_token: ChatGptAccessToken(token.to_owned()),
@@ -788,6 +1050,8 @@ mod tests {
             provider,
         );
 
+        transport.prepare_auth(JobId::new(), audio_path.clone());
+
         let text = transport
             .transcribe_audio(TranscriptionRequest {
                 keywords: &[],
@@ -847,6 +1111,8 @@ mod tests {
             format!("http://{address}/backend-api/transcribe"),
             provider,
         );
+
+        transport.prepare_auth(JobId::new(), audio_path.clone());
 
         let text = transport
             .transcribe_audio(TranscriptionRequest {

@@ -148,12 +148,16 @@ impl<A: SpeechTransport, C: SpeechTransport> SpeechTransport for SpeechRouter<A,
         job: &RecordingJob,
         options: &agentdictate_core::DictationOptions,
     ) {
-        if job.transcription_provider == TranscriptionProvider::OpenAiApi {
-            self.openai.begin_recording(job, options);
+        match job.transcription_provider {
+            TranscriptionProvider::OpenAiApi => self.openai.begin_recording(job, options),
+            TranscriptionProvider::ChatGptSubscription => {
+                self.chatgpt.begin_recording(job, options)
+            }
         }
     }
     fn cancel_recording(&mut self, id: JobId) {
         self.openai.cancel_recording(id);
+        self.chatgpt.cancel_recording(id);
     }
     fn actual_model(&self) -> Option<&str> {
         self.openai.actual_model()

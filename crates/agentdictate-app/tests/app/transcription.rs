@@ -12,8 +12,6 @@ struct FixedOpenAi;
 
 struct FailingCleanupOpenAi;
 
-struct SubscriptionSpeech;
-
 struct PaidApiMustNotRun;
 
 #[test]
@@ -115,15 +113,6 @@ impl CleanupTransport for FailingCleanupOpenAi {
     }
 }
 
-impl SpeechTransport for SubscriptionSpeech {
-    fn transcribe_audio(
-        &mut self,
-        _request: TranscriptionRequest<'_>,
-    ) -> Result<String, ExternalError> {
-        Ok("subscription transcript".into())
-    }
-}
-
 impl SpeechTransport for PaidApiMustNotRun {
     fn transcribe_audio(
         &mut self,
@@ -209,15 +198,36 @@ fn cleanup_failure_returns_the_successful_raw_transcript() {
 
 #[test]
 fn subscription_jobs_never_fall_back_to_the_paid_api_transport() {
+    use std::sync::{Arc, Mutex};
+    struct RecordingSubscription(Arc<Mutex<Vec<&'static str>>>);
+    impl SpeechTransport for RecordingSubscription {
+        fn begin_recording(&mut self, _: &RecordingJob, _: &agentdictate_core::DictationOptions) {
+            self.0.lock().unwrap().push("prepare");
+        }
+        fn cancel_recording(&mut self, _: JobId) {
+            self.0.lock().unwrap().push("cancel");
+        }
+        fn transcribe_audio(
+            &mut self,
+            _: TranscriptionRequest<'_>,
+        ) -> Result<String, ExternalError> {
+            self.0.lock().unwrap().push("transcribe");
+            Ok("subscription transcript".into())
+        }
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
     let settings = Settings {
         cleanup_enabled: false,
         ..Settings::default()
     };
-    let speech = SpeechRouter::new(PaidApiMustNotRun, SubscriptionSpeech);
+    let speech = SpeechRouter::new(PaidApiMustNotRun, RecordingSubscription(calls.clone()));
     let mut transcriber = TranscriptionPipeline::new(settings, speech, FixedOpenAi);
     let now = Utc::now();
     let job = RecordingJob {
-        options: None,
+        options: Some(agentdictate_core::DictationOptions::from_settings(
+            &Settings::default(),
+            vec![],
+        )),
         id: JobId::new(),
         legacy_id: 1,
         started_at: now,
@@ -236,10 +246,13 @@ fn subscription_jobs_never_fall_back_to_the_paid_api_transport() {
         cleanup_error: None,
     };
 
+    transcriber.begin_recording(&job);
     let result = transcriber.transcribe(&job).unwrap();
+    transcriber.cancel_recording(job.id);
 
     assert_eq!(result.raw, "subscription transcript");
     assert_eq!(result.final_text, "subscription transcript");
+    assert_eq!(*calls.lock().unwrap(), ["prepare", "transcribe", "cancel"]);
 }
 
 #[test]
