@@ -139,10 +139,15 @@ production reader without opening the copilot, capturing audio/screens, sending
 a model request, or printing private source text.
 
 For Leadlord, enter the installed `packages/hq-cli/src/hq-brain-index.ts` path in
-settings and save. Node and that checkout's CLI dependencies and authentication
-must be available to the desktop process. The copilot invokes only the CLI's
-bounded `search` and `read` commands, without a shell. It does not enroll company
-accounts or retrieve their secrets. A changed revision requires a fresh read.
+settings. Enter a Bitwarden Secrets Manager access token for an existing
+appropriately scoped company machine account in **Bitwarden access token**, then
+save. The masked token is stored with the owner-protected copilot settings and
+redacted from settings logs. It is passed to the child CLI through
+`BWS_ACCESS_TOKEN`, never command arguments or model prompts. Node, `bws`, and
+the checkout's CLI dependencies must be available to the desktop process. The
+copilot invokes only bounded `search` and `read` commands, without a shell;
+the HQ CLI's underlying shared credential can still have broader permissions.
+A changed revision requires a fresh read.
 
 Answers about you and your business come from your own material first, so the
 copilot quotes your real prices, offer, and results instead of guessing.

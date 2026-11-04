@@ -455,6 +455,8 @@ pub struct CopilotSettings {
     pub personal_hq_profile: String,
     /// Leadlord's installed hq-brain-index.ts entry point (launched with Node).
     pub leadlord_brain_cli: String,
+    /// Bitwarden machine-account access token, stored with the protected settings.
+    pub leadlord_bws_access_token: String,
     pub provider: CopilotProvider,
     /// Answer model per provider; missing entries use the provider default.
     pub answer_models: BTreeMap<CopilotProvider, String>,
@@ -498,6 +500,7 @@ impl Default for CopilotSettings {
             brain_source: BrainSource::None,
             personal_hq_profile: "agentdictate".into(),
             leadlord_brain_cli: String::new(),
+            leadlord_bws_access_token: String::new(),
             provider: CopilotProvider::default(),
             answer_models: BTreeMap::new(),
             fast_models: BTreeMap::new(),
@@ -558,6 +561,9 @@ impl CopilotSettings {
     #[must_use]
     pub fn redacted(&self) -> Self {
         let mut copy = self.clone();
+        if !copy.leadlord_bws_access_token.is_empty() {
+            copy.leadlord_bws_access_token = "<set>".into();
+        }
         if !copy.anthropic_api_key.is_empty() {
             copy.anthropic_api_key = "<set>".into();
         }
@@ -1928,10 +1934,12 @@ mod tests {
     fn redaction_hides_keys() {
         let settings = CopilotSettings {
             anthropic_api_key: "sk-ant-secret".into(),
+            leadlord_bws_access_token: "synthetic-bws-secret".into(),
             ..CopilotSettings::default()
         };
         let redacted = settings.redacted();
         assert_eq!(redacted.anthropic_api_key, "<set>");
+        assert_eq!(redacted.leadlord_bws_access_token, "<set>");
         assert!(redacted.openai_api_key.is_empty());
     }
 

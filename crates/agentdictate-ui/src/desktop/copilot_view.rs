@@ -266,6 +266,7 @@ pub struct CopilotWindow {
     profile: Entity<InputState>,
     instructions: Entity<InputState>,
     leadlord_cli: Entity<InputState>,
+    leadlord_token: Entity<InputState>,
     anthropic_key: Entity<InputState>,
     openai_key: Entity<InputState>,
     body_scroll: ScrollHandle,
@@ -392,6 +393,11 @@ impl CopilotWindow {
         let leadlord_cli = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Path to Leadlord's hq-brain-index.ts")
         });
+        let leadlord_token = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Bitwarden Secrets Manager access token")
+                .masked(true)
+        });
         let mut subscriptions = vec![cx.subscribe_in(
             &ask,
             window,
@@ -445,6 +451,7 @@ impl CopilotWindow {
             profile,
             instructions,
             leadlord_cli,
+            leadlord_token,
             anthropic_key,
             openai_key,
             body_scroll: ScrollHandle::new(),
@@ -506,6 +513,9 @@ impl CopilotWindow {
         });
         self.leadlord_cli.update(cx, |input, cx| {
             input.set_value(settings.leadlord_brain_cli.clone(), window, cx)
+        });
+        self.leadlord_token.update(cx, |input, cx| {
+            input.set_value(settings.leadlord_bws_access_token.clone(), window, cx)
         });
         self.anthropic_key.update(cx, |input, cx| {
             input.set_value(settings.anthropic_api_key.clone(), window, cx)
@@ -606,12 +616,14 @@ impl CopilotWindow {
         let profile = self.profile.read(cx).value().to_string();
         let instructions = self.instructions.read(cx).value().to_string();
         let leadlord_cli = self.leadlord_cli.read(cx).value().trim().to_owned();
+        let leadlord_token = self.leadlord_token.read(cx).value().trim().to_owned();
         let anthropic = self.anthropic_key.read(cx).value().trim().to_owned();
         let openai = self.openai_key.read(cx).value().trim().to_owned();
         self.update_settings(|settings| {
             settings.profile = profile;
             settings.custom_instructions = instructions;
             settings.leadlord_brain_cli = leadlord_cli;
+            settings.leadlord_bws_access_token = leadlord_token;
             settings.anthropic_api_key = anthropic;
             settings.openai_api_key = openai;
         });
@@ -2756,6 +2768,8 @@ impl CopilotWindow {
                     ))
                     .when(settings.brain_source == BrainSource::Leadlord, |column| {
                         column.child(text_area("copilot-leadlord-cli", &self.leadlord_cli, cx))
+                            .child(section_label("Bitwarden access token"))
+                            .child(text_area("copilot-leadlord-token", &self.leadlord_token, cx))
                     })
                     .when(settings.brain_source == BrainSource::None, |column| {
                         column

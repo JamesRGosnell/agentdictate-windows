@@ -348,6 +348,7 @@ fn the_brain_selector_saves_each_source_and_only_requests_leadlord_setup_when_se
         matches!(harness.actions().last(), Some(CopilotAction::UpdateSettings(settings)) if settings.brain_source == agentdictate_core::BrainSource::PersonalHq)
     );
     assert!(!harness.has("copilot-leadlord-cli"));
+    assert!(!harness.has("copilot-leadlord-token"));
     harness.reveal_setting("copilot-brain-2");
     harness.click("copilot-brain-2");
     assert!(
@@ -355,6 +356,14 @@ fn the_brain_selector_saves_each_source_and_only_requests_leadlord_setup_when_se
     );
     harness.reveal_setting("copilot-leadlord-cli");
     assert!(harness.has("copilot-leadlord-cli"));
+    harness.reveal_setting("copilot-leadlord-token");
+    harness.click("copilot-leadlord-token");
+    harness.cx.simulate_input("synthetic-company-token");
+    harness.reveal_setting("copilot-save-settings");
+    harness.click("copilot-save-settings");
+    assert!(
+        matches!(harness.actions().last(), Some(CopilotAction::UpdateSettings(settings)) if settings.leadlord_bws_access_token == "synthetic-company-token")
+    );
 }
 
 #[gpui::test]

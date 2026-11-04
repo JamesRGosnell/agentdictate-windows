@@ -22,7 +22,15 @@ pub(crate) fn context(settings: &CopilotSettings, query: &str) -> anyhow::Result
     match settings.brain_source {
         BrainSource::None => Ok(String::new()),
         BrainSource::PersonalHq => personal(&settings.personal_hq_profile, &query),
-        BrainSource::Leadlord => leadlord(&settings.leadlord_brain_cli, &query),
+        BrainSource::Leadlord => leadlord(
+            &settings.leadlord_brain_cli,
+            &settings.leadlord_bws_access_token,
+            if query.trim().is_empty() {
+                "Leadlord"
+            } else {
+                &query
+            },
+        ),
     }
 }
 
@@ -123,11 +131,11 @@ fn decode(reader: impl Read) -> anyhow::Result<Value> {
     serde_json::from_slice(&bytes).context("Brain returned an unreadable response.")
 }
 
-fn leadlord(entry: &str, query: &str) -> anyhow::Result<String> {
+fn leadlord(entry: &str, token: &str, query: &str) -> anyhow::Result<String> {
     if entry.trim().is_empty() {
         bail!("Choose the Leadlord Brain CLI in settings.");
     }
-    let read = |args: &[&str]| command(entry, args);
+    let read = |args: &[&str]| command(entry, token, args);
     collect(
         BrainSource::Leadlord,
         read(&["search", "--query", query, "--limit", "2"])?,
@@ -144,18 +152,29 @@ fn leadlord(entry: &str, query: &str) -> anyhow::Result<String> {
     )
 }
 
-fn command(entry: &str, args: &[&str]) -> anyhow::Result<Value> {
-    use std::{
-        process::{Command, Stdio},
-        time::Instant,
-    };
+fn configured_command(entry: &str, token: &str, args: &[&str]) -> std::process::Command {
+    use std::process::{Command, Stdio};
     let mut command = Command::new("node");
     command
         .arg(entry)
         .args(args)
+        .args(["--env", "prod"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if !token.is_empty() {
+        command.env("BWS_ACCESS_TOKEN", token);
+    }
+    // Keep a selected company brain separate from another tool's HQ session.
+    for key in [
+        "HQ_CONVEX_URL",
+        "LEADLORD_HQ_CONVEX_WRITE_SECRET",
+        "LEADLORD_HQ_CLI_ISOLATED_ENV",
+        "LEADLORD_BOTLORD_RUNNER_SECRET",
+        "LEADLORD_BOTLORD_WORK_ATTEMPT",
+    ] {
+        command.env_remove(key);
+    }
     if let Some(parent) = std::path::Path::new(entry).parent() {
         command.current_dir(parent);
     }
@@ -164,7 +183,12 @@ fn command(entry: &str, args: &[&str]) -> anyhow::Result<Value> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    let mut child = command
+    command
+}
+
+fn command(entry: &str, token: &str, args: &[&str]) -> anyhow::Result<Value> {
+    use std::time::Instant;
+    let mut child = configured_command(entry, token, args)
         .spawn()
         .context("Leadlord Brain CLI could not start.")?;
     let stdout = child
@@ -226,6 +250,53 @@ fn collect(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn company_authentication_is_passed_in_the_child_environment_only() {
+        let command = configured_command(
+            "brain.ts",
+            "synthetic-company-token",
+            &["search", "--query", "fees", "--limit", "2"],
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "BWS_ACCESS_TOKEN"
+                    && value == Some(std::ffi::OsStr::new("synthetic-company-token")))
+        );
+        assert!(
+            !command
+                .get_args()
+                .any(|arg| arg.to_string_lossy().contains("synthetic-company-token"))
+        );
+    }
+
+    #[test]
+    fn company_brain_is_bound_to_production_without_inherited_hq_overrides() {
+        let command = configured_command(
+            "brain.ts",
+            "",
+            &["search", "--query", "fees", "--limit", "2"],
+        );
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args[args.len() - 2..],
+            [std::ffi::OsStr::new("--env"), std::ffi::OsStr::new("prod")]
+        );
+        for name in [
+            "HQ_CONVEX_URL",
+            "LEADLORD_HQ_CONVEX_WRITE_SECRET",
+            "LEADLORD_HQ_CLI_ISOLATED_ENV",
+            "LEADLORD_BOTLORD_RUNNER_SECRET",
+            "LEADLORD_BOTLORD_WORK_ATTEMPT",
+        ] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == name && value.is_none())
+            );
+        }
+    }
 
     #[test]
     fn live_pages_are_read_bounded_and_keep_source_identity() {
