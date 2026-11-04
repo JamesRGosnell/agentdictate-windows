@@ -8,6 +8,7 @@
 // The session runtime is Windows-only; shared logic stays testable elsewhere.
 #![cfg_attr(not(all(windows, feature = "desktop")), allow(dead_code))]
 
+mod brain;
 #[cfg(windows)]
 mod check;
 mod engine;
@@ -24,6 +25,25 @@ mod voices;
 mod win;
 
 pub const COPILOT_ARGUMENT: &str = "--copilot";
+
+/// Verify the configured brain through the production reader, without audio,
+/// screenshots, a model request, or printing private source text.
+#[cfg(windows)]
+pub fn check_copilot_brain() -> anyhow::Result<()> {
+    let paths = crate::AppPaths::from_environment()?;
+    let settings = store::load(&store::settings_path(&paths.config_file));
+    anyhow::ensure!(
+        settings.brain_source != agentdictate_core::BrainSource::None,
+        "Select a brain in copilot settings first."
+    );
+    let context = brain::context(&settings, "")?;
+    println!(
+        "{} brain read succeeded ({} context characters; source text withheld).",
+        settings.brain_source.label(),
+        context.chars().count()
+    );
+    Ok(())
+}
 
 #[must_use]
 pub fn is_copilot_argument(argument: Option<&str>) -> bool {
@@ -297,6 +317,9 @@ pub fn run_copilot() -> anyhow::Result<()> {
     let services = Services {
         platform: Arc::new(win::WindowsPlatform),
         providers: provider_factory,
+        brain: Arc::new(|settings, query| {
+            brain::context(settings, query).map_err(|error| error.to_string())
+        }),
         transcriber,
         models: model_loader,
         settings_path,

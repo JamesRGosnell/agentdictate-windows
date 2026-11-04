@@ -337,12 +337,32 @@ fn settings_show_the_knowledge_and_what_cannot_be_read(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn an_untaught_copilot_invites_the_user_to_add_their_context(cx: &mut TestAppContext) {
+fn the_brain_selector_saves_each_source_and_only_requests_leadlord_setup_when_selected(
+    cx: &mut TestAppContext,
+) {
+    let mut harness = Harness::open(cx);
+    harness.click("copilot-settings");
+    harness.reveal_setting("copilot-brain-1");
+    harness.click("copilot-brain-1");
+    assert!(
+        matches!(harness.actions().last(), Some(CopilotAction::UpdateSettings(settings)) if settings.brain_source == agentdictate_core::BrainSource::PersonalHq)
+    );
+    assert!(!harness.has("copilot-leadlord-cli"));
+    harness.reveal_setting("copilot-brain-2");
+    harness.click("copilot-brain-2");
+    assert!(
+        matches!(harness.actions().last(), Some(CopilotAction::UpdateSettings(settings)) if settings.brain_source == agentdictate_core::BrainSource::Leadlord)
+    );
+    harness.reveal_setting("copilot-leadlord-cli");
+    assert!(harness.has("copilot-leadlord-cli"));
+}
+
+#[gpui::test]
+fn an_empty_copilot_leaves_context_setup_in_settings(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);
     harness.click("copilot-panel");
-    assert!(harness.has("copilot-teach"));
-    harness.click("copilot-teach");
-    assert!(harness.has("copilot-settings-body"));
+    assert!(harness.has("copilot-live-body"));
+    assert!(!harness.has("copilot-teach"));
 }
 
 #[gpui::test]
@@ -467,18 +487,33 @@ fn the_line_to_say_is_rewritten_in_one_click_and_versions_compared(cx: &mut Test
 }
 
 #[gpui::test]
-fn the_first_run_welcome_explains_the_copilot_and_is_dismissed_once(cx: &mut TestAppContext) {
+fn the_first_run_hint_is_dismissible_without_context_setup(cx: &mut TestAppContext) {
     let mut harness = Harness::open_with(cx, CopilotSettings::default());
     harness.click("copilot-panel");
     assert!(harness.has("copilot-welcome"));
-    harness.click("copilot-welcome-knowledge");
+    assert_eq!(harness.host_calls().last().unwrap(), "resize 720x304");
+    assert!(!harness.has("copilot-welcome-knowledge"));
+    assert!(!harness.has("copilot-welcome-about"));
     harness.click("copilot-welcome-done");
     let actions = harness.actions();
-    assert_eq!(actions[0], CopilotAction::OpenKnowledgeFolder);
+    assert_eq!(actions.len(), 1);
     assert!(matches!(
-        &actions[1],
+        &actions[0],
         CopilotAction::UpdateSettings(settings) if settings.onboarded
     ));
+}
+
+#[gpui::test]
+fn the_small_first_run_panel_grows_when_live_content_arrives(cx: &mut TestAppContext) {
+    let mut harness = Harness::open_with(cx, CopilotSettings::default());
+    harness.click("copilot-panel");
+    assert_eq!(harness.host_calls().last().unwrap(), "resize 720x304");
+    harness.send(CopilotEvent::Insights(CopilotInsights {
+        topic: "Trial options".into(),
+        ..CopilotInsights::default()
+    }));
+    assert_eq!(harness.host_calls().last().unwrap(), "resize 720x564");
+    assert!(!harness.has("copilot-welcome"));
 }
 
 fn them(id: u64, voice: u8, text: &str, at_ms: u64) -> TranscriptLine {

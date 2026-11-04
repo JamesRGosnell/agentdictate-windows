@@ -119,6 +119,31 @@ the chevron. While collapsed, new answers reopen it.
 
 ## Your knowledge
 
+Choose **Brain** in copilot settings: **Personal HQ**, **Leadlord**, or **None**.
+With a brain selected, each answer reads up to two relevant live pages, retaining
+their source and revision. Both the instant and researched answers receive those
+excerpts. Local documents are used only with **None**; the separate **Remember past
+meetings** preference still controls retrieval from earlier meetings. A failed
+brain connection is reported and never treated as an empty brain.
+
+Personal HQ uses a separately approved, read-only HQ CLI profile named
+`agentdictate`. Enroll it with `hq auth login --local --profile agentdictate
+--label "AgentDictate Copilot" --scopes read`, and approve the code in HQ's
+**Assistant access**. The profile retains the origin and credential; AgentDictate
+does not copy the owner login or store the token in its settings. HQ must provide
+the `/api/v1/brain/search` and `/api/v1/brain/pages/:id` read routes, which enforce
+HQ's existing evidence and privacy eligibility rules.
+
+`agentdictate copilot --brain-check` verifies the selected brain through the
+production reader without opening the copilot, capturing audio/screens, sending
+a model request, or printing private source text.
+
+For Leadlord, enter the installed `packages/hq-cli/src/hq-brain-index.ts` path in
+settings and save. Node and that checkout's CLI dependencies and authentication
+must be available to the desktop process. The copilot invokes only the CLI's
+bounded `search` and `read` commands, without a shell. It does not enroll company
+accounts or retrieve their secrets. A changed revision requires a fresh read.
+
 Answers about you and your business come from your own material first, so the
 copilot quotes your real prices, offer, and results instead of guessing.
 

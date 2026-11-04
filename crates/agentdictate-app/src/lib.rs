@@ -28,6 +28,8 @@ mod workspace;
 pub use codex_subscription::CodexSubscriptionTransport;
 #[cfg(windows)]
 pub use codex_subscription::sign_in_with_chatgpt;
+#[cfg(windows)]
+pub use copilot::check_copilot_brain;
 #[cfg(all(windows, feature = "desktop"))]
 pub use copilot::run_copilot;
 pub use copilot::{COPILOT_ARGUMENT, is_copilot_argument};

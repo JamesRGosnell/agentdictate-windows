@@ -17,15 +17,15 @@ use std::{
 };
 
 use agentdictate_core::{
-    AnswerStatus, CallView, CopilotAction, CopilotEffort, CopilotEvent, CopilotInsights,
-    CopilotProvider, CopilotSettings, EmailDraft, INSTANT_GUIDANCE, ListenState, ModelChoice,
-    QuickAction, RewriteEngine, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, TurnContext,
-    answer_system_prompt, answer_user_prompt, call_view_system_prompt, call_view_user_prompt,
-    combined_answer, detected_question_instruction, insights_system_prompt, insights_user_prompt,
-    is_echo_of, looks_like_question, meeting_notes_markdown, notes_system_prompt, parse_call_view,
-    parse_insights, parse_turn_verdict, render_transcript, researched_guidance,
-    rewrite_instruction, split_follow_up, turn_judge_system_prompt, turn_judge_user_prompt,
-    typed_question_instruction, utterance_similarity, worth_judging,
+    AnswerStatus, BrainSource, CallView, CopilotAction, CopilotEffort, CopilotEvent,
+    CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft, INSTANT_GUIDANCE, ListenState,
+    ModelChoice, QuickAction, RewriteEngine, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine,
+    TurnContext, answer_system_prompt, answer_user_prompt, call_view_system_prompt,
+    call_view_user_prompt, combined_answer, detected_question_instruction, insights_system_prompt,
+    insights_user_prompt, is_echo_of, looks_like_question, meeting_notes_markdown,
+    notes_system_prompt, parse_call_view, parse_insights, parse_turn_verdict, render_transcript,
+    researched_guidance, rewrite_instruction, split_follow_up, turn_judge_system_prompt,
+    turn_judge_user_prompt, typed_question_instruction, utterance_similarity, worth_judging,
 };
 
 use super::{
@@ -208,10 +208,13 @@ pub(crate) type ProviderFactory =
 pub(crate) type Transcriber = Arc<dyn Fn(Vec<u8>, &str) -> Result<String, String> + Send + Sync>;
 pub(crate) type ModelLoader = Arc<dyn Fn(CopilotProvider) -> Vec<ModelChoice> + Send + Sync>;
 pub(crate) type UiSink = Arc<dyn Fn(CopilotEvent) + Send + Sync>;
+pub(crate) type BrainReader =
+    Arc<dyn Fn(&CopilotSettings, &str) -> Result<String, String> + Send + Sync>;
 
 pub(crate) struct Services {
     pub platform: Arc<dyn Platform>,
     pub providers: ProviderFactory,
+    pub brain: BrainReader,
     pub transcriber: Transcriber,
     pub models: ModelLoader,
     pub settings_path: PathBuf,
@@ -636,6 +639,7 @@ impl Engine {
     /// keeps them read, so the first question is as quick as later ones.
     fn prime_answer_lanes(&mut self) {
         if self.primed
+            || self.settings.brain_source != BrainSource::None
             || self.knowledge.primer().len() < PRIME_MIN_CHARS
             || self.settings.provider == CopilotProvider::ClaudeCode
         {
@@ -1606,7 +1610,19 @@ impl Engine {
             ANSWER_TRANSCRIPT_CHARS,
         );
         let knowledge = self.knowledge_for(&kind);
+        let brain_query = match &kind {
+            AnswerKind::Typed(question) | AnswerKind::Detected { question, .. } => question.clone(),
+            AnswerKind::Quick(_) => self
+                .transcript
+                .iter()
+                .rev()
+                .take(2)
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
         let known = Arc::clone(&self.knowledge);
+        let brain = Arc::clone(&self.services.brain);
         let settings = self.settings.clone();
         let fast_model = settings.fast_model();
         // The instant draft also helps when it uses the answer model: without
@@ -1641,7 +1657,20 @@ impl Engine {
                 } else {
                     None
                 };
-                let system = answer_system_prompt(&settings, known.primer());
+                let knowledge = if settings.brain_source == BrainSource::None {
+                    knowledge
+                } else {
+                    match brain(&settings, &brain_query) {
+                        Ok(context) => format!("{context}\n{knowledge}"),
+                        Err(error) => {
+                            gate.send(CopilotEvent::Notice(error.to_string()));
+                            format!("The selected {} brain is unavailable. State that you could not check it; do not invent its contents.", settings.brain_source.label())
+                        }
+                    }
+                };
+                if cancel.load(Ordering::Relaxed) { return; }
+                let primer = if settings.brain_source == BrainSource::None { known.primer() } else { "" };
+                let system = answer_system_prompt(&settings, primer);
                 let user =
                     answer_user_prompt(&transcript, &instruction, image.is_some(), &knowledge);
                 let instant_text = Arc::new(Mutex::new(String::new()));
@@ -1860,12 +1889,23 @@ impl Engine {
             RewriteEngine::Quickest => (fallback, None),
         };
         let mut request = AnswerRequest {
-            system: answer_system_prompt(&self.settings, self.knowledge.primer()),
+            system: answer_system_prompt(
+                &self.settings,
+                if self.settings.brain_source == BrainSource::None {
+                    self.knowledge.primer()
+                } else {
+                    ""
+                },
+            ),
             user: answer_user_prompt(
                 &transcript,
                 &rewrite_instruction(style, line, details),
                 false,
-                &knowledge,
+                if self.settings.brain_source == BrainSource::None {
+                    &knowledge
+                } else {
+                    ""
+                },
             ),
             image_jpeg: None,
             model: settings.answer_model(),
@@ -1877,9 +1917,28 @@ impl Engine {
         let providers = Arc::clone(&self.services.providers);
         let ui = Arc::clone(&self.ui);
         let messages = self.messages.clone();
+        let brain = Arc::clone(&self.services.brain);
+        let brain_settings = self.settings.clone();
+        let brain_query = line.to_owned();
         let spawned = std::thread::Builder::new()
             .name("copilot-rewrite".into())
             .spawn(move || {
+                if style == RewriteStyle::Specific
+                    && brain_settings.brain_source != BrainSource::None
+                {
+                    match brain(&brain_settings, &brain_query) {
+                        Ok(context) => request
+                            .user
+                            .push_str(&format!("\n<knowledge>\n{context}\n</knowledge>")),
+                        Err(error) => {
+                            ui(CopilotEvent::RewriteFinished {
+                                id,
+                                error: Some(error),
+                            });
+                            return;
+                        }
+                    }
+                }
                 let mut text = String::new();
                 let attempt =
                     |settings: &CopilotSettings, request: &AnswerRequest, text: &mut String| {
@@ -1961,7 +2020,11 @@ impl Engine {
             AnswerKind::Typed(question) | AnswerKind::Detected { question, .. } => question.clone(),
             AnswerKind::Quick(_) => recent(2),
         };
-        self.knowledge.excerpts(&focus, &recent(6))
+        self.knowledge.excerpts_with_documents(
+            &focus,
+            &recent(6),
+            self.settings.brain_source == BrainSource::None,
+        )
     }
 
     /// Runs periodic work; returns true when the session should end.
@@ -2604,6 +2667,7 @@ mod tests {
                     requests: Arc::clone(&provider_requests),
                 }) as Box<dyn AnswerProvider>)
             }),
+            brain: Arc::new(|_, _| panic!("Brain reads must be mocked explicitly")),
             transcriber: Arc::new(|wav, _| Ok(format!("{} bytes", wav.len()))),
             models: Arc::new(|provider| provider.suggested_models()),
             settings_path: directory.path().join("copilot.json"),
@@ -3130,6 +3194,54 @@ mod tests {
             event,
             CopilotEvent::Insights(insights) if insights.question.is_some()
         )));
+    }
+
+    #[test]
+    fn selected_brains_reach_both_answer_lanes_without_local_document_context() {
+        let (mut engine, incoming, _events, requests, directory) = harness(CopilotSettings {
+            brain_source: BrainSource::PersonalHq,
+            ..CopilotSettings::default()
+        });
+        let folder = directory.path().join("knowledge");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("old.md"), "LEGACY_DOCUMENT_MARKER").unwrap();
+        engine.knowledge = Arc::new(Knowledge::load(&folder, None));
+        engine.services.brain = Arc::new(|settings, query| {
+            assert_eq!(settings.brain_source, BrainSource::PersonalHq);
+            assert_eq!(query, "What is the offer?");
+            Ok("LIVE_HQ_OFFER_MARKER".into())
+        });
+        engine.handle_action(CopilotAction::Ask("What is the offer?".into()));
+        drain(&mut engine, &incoming);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.user.contains("LIVE_HQ_OFFER_MARKER")
+                    && !request.system.contains("LEGACY_DOCUMENT_MARKER"))
+        );
+    }
+
+    #[test]
+    fn unavailable_brain_is_reported_and_never_presented_as_an_empty_brain() {
+        let (mut engine, incoming, events, requests, _directory) = harness(CopilotSettings {
+            brain_source: BrainSource::PersonalHq,
+            ..CopilotSettings::default()
+        });
+        engine.services.brain = Arc::new(|_, _| Err("Personal HQ is offline".into()));
+        engine.handle_action(CopilotAction::Ask("What do we charge?".into()));
+        drain(&mut engine, &incoming);
+        assert!(events.lock().unwrap().iter().any(
+            |event| matches!(event, CopilotEvent::Notice(message) if message.contains("offline"))
+        ));
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.user.contains("brain is unavailable"))
+        );
     }
 
     #[test]

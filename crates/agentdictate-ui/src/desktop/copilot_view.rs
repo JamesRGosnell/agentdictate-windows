@@ -9,10 +9,11 @@ use std::{
 };
 
 use agentdictate_core::{
-    AnswerStatus, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode, CopilotProvider,
-    CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction, RewriteEngine, RewriteStyle,
-    Situation, Speaker, SpeakerLabels, TranscriptLine, VoiceNames, combined_answer, format_offset,
-    given_name, has_several_voices, model_pace, researched_follow_up,
+    AnswerStatus, BrainSource, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode,
+    CopilotProvider, CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction,
+    RewriteEngine, RewriteStyle, Situation, Speaker, SpeakerLabels, TranscriptLine, VoiceNames,
+    combined_answer, format_offset, given_name, has_several_voices, model_pace,
+    researched_follow_up,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
@@ -264,6 +265,7 @@ pub struct CopilotWindow {
     name_input: Entity<InputState>,
     profile: Entity<InputState>,
     instructions: Entity<InputState>,
+    leadlord_cli: Entity<InputState>,
     anthropic_key: Entity<InputState>,
     openai_key: Entity<InputState>,
     body_scroll: ScrollHandle,
@@ -387,6 +389,9 @@ impl CopilotWindow {
                 .placeholder("sk-\u{2026}")
                 .masked(true)
         });
+        let leadlord_cli = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Path to Leadlord's hq-brain-index.ts")
+        });
         let mut subscriptions = vec![cx.subscribe_in(
             &ask,
             window,
@@ -439,6 +444,7 @@ impl CopilotWindow {
             name_input,
             profile,
             instructions,
+            leadlord_cli,
             anthropic_key,
             openai_key,
             body_scroll: ScrollHandle::new(),
@@ -497,6 +503,9 @@ impl CopilotWindow {
         });
         self.instructions.update(cx, |input, cx| {
             input.set_value(settings.custom_instructions.clone(), window, cx)
+        });
+        self.leadlord_cli.update(cx, |input, cx| {
+            input.set_value(settings.leadlord_brain_cli.clone(), window, cx)
         });
         self.anthropic_key.update(cx, |input, cx| {
             input.set_value(settings.anthropic_api_key.clone(), window, cx)
@@ -596,11 +605,13 @@ impl CopilotWindow {
     fn save_text_settings(&mut self, cx: &mut Context<Self>) {
         let profile = self.profile.read(cx).value().to_string();
         let instructions = self.instructions.read(cx).value().to_string();
+        let leadlord_cli = self.leadlord_cli.read(cx).value().trim().to_owned();
         let anthropic = self.anthropic_key.read(cx).value().trim().to_owned();
         let openai = self.openai_key.read(cx).value().trim().to_owned();
         self.update_settings(|settings| {
             settings.profile = profile;
             settings.custom_instructions = instructions;
+            settings.leadlord_brain_cli = leadlord_cli;
             settings.anthropic_api_key = anthropic;
             settings.openai_api_key = openai;
         });
@@ -608,11 +619,30 @@ impl CopilotWindow {
         self.notice_at = Some(Instant::now());
     }
 
+    fn panel_height(&self) -> f32 {
+        let insights = &self.model.insights;
+        let first_run = !self.model.settings.onboarded
+            && !self.settings_open
+            && self.tab == Tab::Live
+            && !self.model.ending
+            && self.model.notes_path.is_none()
+            && self.model.answers.is_empty()
+            && insights.topic.is_empty()
+            && insights.summary.is_empty()
+            && insights.question.is_none()
+            && insights.suggestions.is_empty();
+        if first_run {
+            220.0
+        } else {
+            COPILOT_PANEL_HEIGHT
+        }
+    }
+
     fn desired_size(&self) -> (f32, f32) {
         let height = COPILOT_TOP_MARGIN
             + COPILOT_BAR_HEIGHT
             + if self.panel_open {
-                COPILOT_PANEL_GAP + COPILOT_PANEL_HEIGHT
+                COPILOT_PANEL_GAP + self.panel_height()
             } else {
                 0.0
             }
@@ -992,7 +1022,7 @@ impl CopilotWindow {
                 v_flex()
                     .relative()
                     .w_full()
-                    .h(px(COPILOT_PANEL_HEIGHT))
+                    .h(px(self.panel_height()))
                     .rounded(px(PANEL_RADIUS))
                     .bg(color(GLASS))
                     .border_1()
@@ -1256,7 +1286,7 @@ impl CopilotWindow {
                     }),
             );
         }
-        if !self.model.settings.onboarded {
+        if !self.model.settings.onboarded && self.model.answers.is_empty() && !has_insights {
             content = content.child(self.render_welcome(cx));
         } else if self.model.answers.is_empty() && !has_insights {
             content = content.child(self.render_empty_state(cx));
@@ -1326,114 +1356,34 @@ impl CopilotWindow {
             .child(content)
     }
 
-    /// The first-run welcome: how the copilot works and how to make it yours.
-    /// It never blocks; the copilot is already listening.
+    /// A dismissible first-run hint that leaves room for the conversation.
     fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let shortcuts = self.model.shortcuts.clone();
-        let row = |name: &'static str, text: &'static str| {
-            h_flex()
-                .items_start()
-                .gap(px(10.))
-                .child(div().mt(px(2.)).child(icon(name, 14., ACCENT)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(px(13.))
-                        .text_color(color(TEXT))
-                        .child(text),
-                )
-        };
-        let shortcut_row = |keys: &[String], text: &'static str| {
-            h_flex().gap(px(8.)).child(keycaps(keys)).child(
-                div()
-                    .text_size(px(12.5))
-                    .text_color(color(MUTED))
-                    .child(text),
-            )
-        };
-        v_flex()
+        h_flex()
             .debug_selector(|| "copilot-welcome".to_owned())
             .w_full()
-            .gap(px(12.))
-            .p(px(16.))
-            .rounded(px(14.))
-            .bg(color(GLASS_RAISED))
-            .border_1()
-            .border_color(color(0xe6a48a40))
+            .items_center()
+            .gap(px(8.))
+            .px(px(10.))
+            .py(px(6.))
+            .child(icon("sparkles", 14., ACCENT))
             .child(
-                v_flex()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Welcome to Meeting Copilot"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .text_color(color(MUTED))
-                            .child("It's already listening. There's nothing to set up before a call."),
-                    ),
-            )
-            .child(row(
-                "message-question",
-                "When someone asks you something, an answer appears on its own. The large line is what to say; details follow underneath.",
-            ))
-            .child(row(
-                "eye-off",
-                "It's invisible in screen shares, recordings, and screenshots, and never takes focus from your call.",
-            ))
-            .child(
-                v_flex()
-                    .gap(px(6.))
-                    .child(shortcut_row(&shortcuts.assist, "What should I say right now?"))
-                    .child(shortcut_row(&shortcuts.toggle, "Show or hide"))
-                    .child(shortcut_row(&shortcuts.ask, "Type a question")),
+                div()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .text_color(color(MUTED))
+                    .child("Meeting Copilot"),
             )
             .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap(px(6.))
-                    .pt(px(4.))
-                    .child(
-                        chip("copilot-welcome-about", false)
-                            .debug_selector(|| "copilot-welcome-about".to_owned())
-                            .child(icon("book", 12., ACCENT))
-                            .child("Tell it about you")
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.settings_open = true;
-                                this.panel_open = true;
-                                this.load_text_settings(window, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        chip("copilot-welcome-knowledge", false)
-                            .debug_selector(|| "copilot-welcome-knowledge".to_owned())
-                            .child(icon("folder", 12., ACCENT))
-                            .child("Add your documents")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
-                                this.act(CopilotAction::OpenKnowledgeFolder);
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        chip("copilot-welcome-done", true)
-                            .debug_selector(|| "copilot-welcome-done".to_owned())
-                            .child("Got it")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.update_settings(|settings| settings.onboarded = true);
-                                cx.notify();
-                            })),
-                    ),
+                icon_button("copilot-welcome-done", "x", MUTED).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.update_settings(|settings| settings.onboarded = true);
+                        cx.notify();
+                    },
+                )),
             )
     }
 
-    fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let untaught =
-            self.model.knowledge.documents == 0 && self.model.settings.profile.trim().is_empty();
+    fn render_empty_state(&self, _cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let shortcut = self
             .model
             .shortcuts
@@ -1490,21 +1440,6 @@ impl CopilotWindow {
                     .text_color(color(MUTED))
                     .child(detail),
             )
-            .when(untaught, |column| {
-                column.child(
-                    chip("copilot-teach", false)
-                        .debug_selector(|| "copilot-teach".to_owned())
-                        .mt(px(6.))
-                        .child(icon("book", 12., ACCENT))
-                        .child("Teach it about you and your business")
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.settings_open = true;
-                            this.panel_open = true;
-                            this.load_text_settings(window, cx);
-                            cx.notify();
-                        })),
-                )
-            })
     }
 
     fn render_answer(
@@ -2807,7 +2742,23 @@ impl CopilotWindow {
             .child(
                 v_flex()
                     .gap(px(8.))
-                    .child(section_label("Your knowledge"))
+                    .child(section_label("Brain"))
+                    .child(h_flex().flex_wrap().gap(px(6.)).children(
+                        BrainSource::ALL.into_iter().enumerate().map(|(index, source)| {
+                            chip(("copilot-brain", index), source == settings.brain_source)
+                                .debug_selector(move || format!("copilot-brain-{index}"))
+                                .child(source.label())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.update_settings(|settings| settings.brain_source = source);
+                                    cx.notify();
+                                }))
+                        }),
+                    ))
+                    .when(settings.brain_source == BrainSource::Leadlord, |column| {
+                        column.child(text_area("copilot-leadlord-cli", &self.leadlord_cli, cx))
+                    })
+                    .when(settings.brain_source == BrainSource::None, |column| {
+                        column
                     .child(
                         div()
                             .debug_selector(|| "copilot-knowledge-status".to_owned())
@@ -2838,6 +2789,7 @@ impl CopilotWindow {
                                 })),
                         ),
                     )
+                    })
                     .child(toggle(
                         "copilot-past-meetings",
                         "Remember past meetings",

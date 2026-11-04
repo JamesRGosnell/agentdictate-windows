@@ -195,7 +195,17 @@ impl Knowledge {
     /// (the surrounding conversation) weighing in less, from what the primer
     /// left out. Each excerpt is labeled with its source; empty when nothing
     /// applies.
+    #[cfg(test)]
     pub(crate) fn excerpts(&self, focus: &str, context: &str) -> String {
+        self.excerpts_with_documents(focus, context, true)
+    }
+
+    pub(crate) fn excerpts_with_documents(
+        &self,
+        focus: &str,
+        context: &str,
+        documents: bool,
+    ) -> String {
         let mut query: HashMap<String, f32> = HashMap::new();
         for token in tokens(context) {
             *query.entry(token).or_insert(0.0) += 0.4;
@@ -203,7 +213,11 @@ impl Knowledge {
         for token in tokens(focus) {
             *query.entry(token).or_insert(0.0) += 1.0;
         }
-        let mut picked: Vec<&Chunk> = self.best(&query, Origin::Document, DOCUMENT_BUDGET_CHARS, 1);
+        let mut picked: Vec<&Chunk> = if documents {
+            self.best(&query, Origin::Document, DOCUMENT_BUDGET_CHARS, 1)
+        } else {
+            Vec::new()
+        };
         picked.extend(self.best(
             &query,
             Origin::Meeting,

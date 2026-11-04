@@ -61,6 +61,7 @@ fn run() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("copilot") {
         return match args.get(1).map(String::as_str) {
             None => agentdictate_app::launch_copilot().map_err(Into::into),
+            Some("--brain-check") => agentdictate_app::check_copilot_brain(),
             Some("--check") => {
                 let latency = args.iter().any(|arg| arg == "--latency");
                 let speech = args
