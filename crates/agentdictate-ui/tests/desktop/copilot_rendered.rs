@@ -521,8 +521,44 @@ fn the_small_first_run_panel_grows_when_live_content_arrives(cx: &mut TestAppCon
         topic: "Trial options".into(),
         ..CopilotInsights::default()
     }));
-    assert_eq!(harness.host_calls().last().unwrap(), "resize 720x564");
-    assert!(!harness.has("copilot-welcome"));
+    let height = last_resize_height(&harness);
+    assert!(height > 304.0 && height < FULL_HEIGHT, "{height}");
+    // The panel resizes over several frames, and headless debug bounds can
+    // outlive the frame that drew them, so check what replaced the welcome.
+    assert!(harness.has("copilot-insights"));
+}
+
+/// The window height with the panel at its full size.
+const FULL_HEIGHT: f32 = 564.0;
+
+fn last_resize_height(harness: &Harness) -> f32 {
+    harness
+        .host_calls()
+        .iter()
+        .rev()
+        .find_map(|call| call.strip_prefix("resize 720x"))
+        .and_then(|height| height.parse().ok())
+        .expect("the window was resized")
+}
+
+#[gpui::test]
+fn the_live_panel_fits_its_content_up_to_full_height(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Insights(CopilotInsights {
+        topic: "Designing effective agent loops".into(),
+        summary: vec!["Agent loops need fast, accurate feedback.".into()],
+        ..CopilotInsights::default()
+    }));
+    let brief = last_resize_height(&harness);
+    assert!(brief < FULL_HEIGHT - 100.0, "{brief}");
+    harness.send(CopilotEvent::Insights(CopilotInsights {
+        topic: "Designing effective agent loops".into(),
+        summary: (0..40)
+            .map(|index| format!("Point {index} about the loop."))
+            .collect(),
+        ..CopilotInsights::default()
+    }));
+    assert_eq!(last_resize_height(&harness), FULL_HEIGHT);
 }
 
 fn them(id: u64, voice: u8, text: &str, at_ms: u64) -> TranscriptLine {

@@ -1,7 +1,7 @@
 //! The meeting copilot: a floating control bar with a live assistance panel.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashSet,
     rc::Rc,
     sync::Arc,
@@ -18,7 +18,8 @@ use agentdictate_core::{
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render, ScrollHandle, SharedString,
-    Stateful, Subscription, Window, WindowControlArea, canvas, div, prelude::*, px, rems, svg,
+    Stateful, Subscription, WeakEntity, Window, WindowControlArea, canvas, div, prelude::*, px,
+    rems, svg,
 };
 use gpui_component::{
     h_flex,
@@ -59,6 +60,8 @@ const DANGER: u32 = 0xf87171ff;
 const SHADOW_MARGIN: f32 = 14.0;
 const PILL_HEIGHT: f32 = 38.0;
 const PANEL_RADIUS: f32 = 18.0;
+/// The shortest the live panel shrinks to around little content.
+const LIVE_PANEL_MIN_HEIGHT: f32 = 160.0;
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
 fn color(hex: u32) -> Hsla {
@@ -276,7 +279,83 @@ pub struct CopilotWindow {
     capture_excluded: bool,
     notice_at: Option<Instant>,
     shape: Rc<RefCell<ShapeTracker>>,
+    live_fit: Rc<Cell<LiveFit>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Measured heights that let the live panel shrink to its content, so it
+/// covers no more of the meeting than it needs to.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct LiveFit {
+    /// Header, footer, and border: the panel height minus the body viewport.
+    chrome: Option<f32>,
+    content: Option<f32>,
+}
+
+impl LiveFit {
+    fn height(self) -> Option<f32> {
+        Some(
+            (self.chrome? + self.content?)
+                .ceil()
+                .clamp(LIVE_PANEL_MIN_HEIGHT, COPILOT_PANEL_HEIGHT),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FitProbe {
+    /// The body viewport, laid out inside a panel of this height.
+    Viewport {
+        panel_height: f32,
+    },
+    Content,
+}
+
+/// An invisible element that reports its parent's height for [`LiveFit`],
+/// re-rendering the copilot on a later turn when a height changes.
+fn fit_probe(
+    fit: &Rc<Cell<LiveFit>>,
+    view: WeakEntity<CopilotWindow>,
+    probe: FitProbe,
+) -> impl IntoElement + use<> {
+    let fit = Rc::clone(fit);
+    canvas(
+        move |bounds, _, cx| {
+            let height = f32::from(bounds.size.height);
+            let mut next = fit.get();
+            let slot = match probe {
+                FitProbe::Viewport { panel_height } => {
+                    next.chrome = Some(panel_height - height);
+                    next.chrome
+                }
+                FitProbe::Content => {
+                    next.content = Some(height);
+                    next.content
+                }
+            };
+            let previous = match probe {
+                FitProbe::Viewport { .. } => fit.get().chrome,
+                FitProbe::Content => fit.get().content,
+            };
+            if previous.zip(slot).is_some_and(|(a, b)| (a - b).abs() < 0.5) {
+                return;
+            }
+            let resized = next.height() != fit.get().height();
+            fit.set(next);
+            if resized {
+                let view = view.clone();
+                cx.spawn(async move |cx| {
+                    let _ = view.update(cx, |_, cx| cx.notify());
+                })
+                .detach();
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 /// Measured bounds of the bar and panel, applied to the host as the window's
@@ -461,6 +540,7 @@ impl CopilotWindow {
             capture_excluded,
             notice_at: None,
             shape: Rc::default(),
+            live_fit: Rc::default(),
             _subscriptions: subscriptions,
         };
         view.load_text_settings(window, cx);
@@ -645,9 +725,20 @@ impl CopilotWindow {
             && insights.suggestions.is_empty();
         if first_run {
             220.0
+        } else if self.live_body_shown() {
+            self.live_fit.get().height().unwrap_or(COPILOT_PANEL_HEIGHT)
         } else {
             COPILOT_PANEL_HEIGHT
         }
+    }
+
+    /// Whether the panel shows live insights and answers, which fit their
+    /// content; settings, the transcript, and the wrap-up keep full height.
+    fn live_body_shown(&self) -> bool {
+        !self.settings_open
+            && self.tab == Tab::Live
+            && !self.model.ending
+            && self.model.notes_path.is_none()
     }
 
     fn desired_size(&self) -> (f32, f32) {
@@ -1026,6 +1117,10 @@ impl CopilotWindow {
         };
         let show_footer =
             !self.settings_open && !self.model.ending && self.model.notes_path.is_none();
+        let panel_height = self.panel_height();
+        let fits = self.live_body_shown();
+        let fit = Rc::clone(&self.live_fit);
+        let view = cx.entity().downgrade();
         div()
             .w_full()
             .px(px(SHADOW_MARGIN))
@@ -1034,7 +1129,7 @@ impl CopilotWindow {
                 v_flex()
                     .relative()
                     .w_full()
-                    .h(px(self.panel_height()))
+                    .h(px(panel_height))
                     .rounded(px(PANEL_RADIUS))
                     .bg(color(GLASS))
                     .border_1()
@@ -1048,7 +1143,21 @@ impl CopilotWindow {
                     }])
                     .child(shape_probe(&self.shape, &self.host, true))
                     .child(self.render_header(cx))
-                    .child(div().flex_1().min_h_0().w_full().child(body))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .when(fits, |body| {
+                                body.child(fit_probe(
+                                    &fit,
+                                    view,
+                                    FitProbe::Viewport { panel_height },
+                                ))
+                            })
+                            .child(body),
+                    )
                     .when(show_footer, |panel| panel.child(self.render_footer(cx))),
             )
     }
@@ -1187,7 +1296,16 @@ impl CopilotWindow {
         let earlier: Vec<AnswerCardModel> = answers.iter().rev().skip(1).cloned().collect();
         let insights = self.model.insights.clone();
         let has_insights = !insights.topic.is_empty() || !insights.summary.is_empty();
-        let mut content = v_flex().w_full().gap(px(14.)).p(px(14.));
+        let mut content = v_flex()
+            .relative()
+            .w_full()
+            .gap(px(14.))
+            .p(px(14.))
+            .child(fit_probe(
+                &self.live_fit,
+                cx.entity().downgrade(),
+                FitProbe::Content,
+            ));
         if let Some(answer) = latest {
             content = content.child(self.render_answer(&answer, true, window, cx));
         }
@@ -1236,6 +1354,7 @@ impl CopilotWindow {
             let situation = situation_label(insights.situation, self.model.settings.auto_answer);
             content = content.child(
                 v_flex()
+                    .debug_selector(|| "copilot-insights".to_owned())
                     .w_full()
                     .gap(px(8.))
                     .child(
