@@ -561,6 +561,24 @@ fn the_live_panel_fits_its_content_up_to_full_height(cx: &mut TestAppContext) {
     assert_eq!(last_resize_height(&harness), FULL_HEIGHT);
 }
 
+#[gpui::test]
+fn an_answer_takes_the_full_panel_from_its_first_word(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Insights(CopilotInsights {
+        topic: "Pricing".into(),
+        ..CopilotInsights::default()
+    }));
+    assert!(last_resize_height(&harness) < FULL_HEIGHT);
+    harness.send(CopilotEvent::AnswerStarted {
+        id: 1,
+        title: "What does it cost?".into(),
+        used_screen: false,
+        model: "gpt-6-luna".into(),
+        automatic: true,
+    });
+    assert_eq!(last_resize_height(&harness), FULL_HEIGHT);
+}
+
 fn them(id: u64, voice: u8, text: &str, at_ms: u64) -> TranscriptLine {
     TranscriptLine {
         id,

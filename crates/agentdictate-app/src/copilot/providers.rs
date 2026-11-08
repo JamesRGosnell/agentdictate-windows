@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -162,6 +162,27 @@ fn responses_body(request: &AnswerRequest, model: &str) -> Value {
     })
 }
 
+/// Models the service rejected during this process, tried last afterwards
+/// so every later request does not pay a failed round trip first.
+static REJECTED_MODELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Moves models the service already rejected to the end of `models`.
+fn prefer_accepted(models: &mut [String]) {
+    let rejected = REJECTED_MODELS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    models.sort_by_key(|model| rejected.contains(model));
+}
+
+fn remember_rejected(model: &str) {
+    let mut rejected = REJECTED_MODELS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !rejected.iter().any(|known| known == model) {
+        rejected.push(model.to_owned());
+    }
+}
+
 fn is_model_rejection(status: StatusCode, body: &str) -> bool {
     matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND)
         && body.to_lowercase().contains("model")
@@ -250,6 +271,7 @@ impl AnswerProvider for ResponsesProvider {
         {
             models.push("gpt-5.5".to_owned());
         }
+        prefer_accepted(&mut models);
         let service = match self.auth {
             ResponsesAuth::ChatGpt(_) => "ChatGPT",
             ResponsesAuth::ApiKey(_) => "OpenAI",
@@ -297,6 +319,7 @@ impl AnswerProvider for ResponsesProvider {
                 continue;
             }
             if is_model_rejection(status, &body) && index + 1 < models.len() {
+                remember_rejected(model);
                 tracing::warn!(
                     model,
                     status = status.as_u16(),
@@ -667,6 +690,21 @@ pub(crate) fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_models_are_tried_last() {
+        remember_rejected("test-rejected-model");
+        let mut models = vec![
+            "test-rejected-model".to_owned(),
+            "test-fallback-a".to_owned(),
+            "test-fallback-b".to_owned(),
+        ];
+        prefer_accepted(&mut models);
+        assert_eq!(
+            models,
+            ["test-fallback-a", "test-fallback-b", "test-rejected-model"]
+        );
+    }
 
     /// Runs the signed-in claude CLI: `cargo test -p agentdictate-app --lib
     /// long_system_prompts_reach_claude_code -- --ignored`.

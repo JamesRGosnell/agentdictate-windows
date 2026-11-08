@@ -251,6 +251,13 @@ enum Tab {
 
 pub type CopilotActionSink = Arc<dyn Fn(CopilotAction) + Send + Sync>;
 
+/// Whether an answer already covers the question insights detected. Insights
+/// reword the question to stand alone, so the texts rarely match exactly.
+fn covers_question(title: &str, question: &str) -> bool {
+    title.eq_ignore_ascii_case(question)
+        || agentdictate_core::utterance_similarity(title, question) >= 0.4
+}
+
 pub struct CopilotWindow {
     model: CopilotViewModel,
     actions: CopilotActionSink,
@@ -732,13 +739,16 @@ impl CopilotWindow {
         }
     }
 
-    /// Whether the panel shows live insights and answers, which fit their
-    /// content; settings, the transcript, and the wrap-up keep full height.
+    /// Whether the panel shows only live insights, which fit their content.
+    /// Answers get the full height from their first word, so the ask box does
+    /// not move while one streams in; settings, the transcript, and the
+    /// wrap-up keep full height too.
     fn live_body_shown(&self) -> bool {
         !self.settings_open
             && self.tab == Tab::Live
             && !self.model.ending
             && self.model.notes_path.is_none()
+            && self.model.answers.is_empty()
     }
 
     fn desired_size(&self) -> (f32, f32) {
@@ -1314,7 +1324,7 @@ impl CopilotWindow {
                 .model
                 .answers
                 .iter()
-                .any(|answer| answer.title.eq_ignore_ascii_case(&question))
+                .any(|answer| covers_question(&answer.title, &question))
         {
             content = content.child(
                 h_flex()
@@ -2993,5 +3003,22 @@ impl Render for CopilotWindow {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(bar)
             .children(panel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::covers_question;
+
+    #[test]
+    fn a_reworded_question_is_covered_by_its_answer() {
+        assert!(covers_question(
+            "James, how long do you keep deleted records around?",
+            "How long do you keep deleted records?"
+        ));
+        assert!(!covers_question(
+            "What does pricing look like for forty seats?",
+            "Do you support single sign-on?"
+        ));
     }
 }
