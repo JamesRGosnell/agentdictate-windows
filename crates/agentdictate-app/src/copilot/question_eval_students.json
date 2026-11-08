@@ -1,0 +1,202 @@
+[
+  {
+    "meeting": "calculus office hours",
+    "notes": "One-on-one video office hours. The professor checks understanding, asks what the student tried, and quizzes a step. Setups run long before short questions.",
+    "lines": [
+      {"t_s": 0, "end_s": 3, "speaker": "Prof. Okafor", "text": "Hi, come on in, can you hear me okay?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "audio check"}},
+      {"t_s": 3.5, "end_s": 5, "speaker": "Me", "text": "Yeah I can hear you."},
+      {"t_s": 5.5, "end_s": 9, "speaker": "Prof. Okafor", "text": "Great. So what are we looking at today, the problem set?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "logistics about the student's own plan"}},
+      {"t_s": 9.5, "end_s": 15, "speaker": "Me", "text": "Yeah problem four, the related rates one with the ladder sliding down the wall. I keep getting a positive answer."},
+      {"t_s": 15.5, "end_s": 18, "speaker": "Prof. Okafor", "text": "Okay. And what have you tried so far?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "asks for the student's own attempt; only the student knows"}},
+      {"t_s": 18.5, "end_s": 26, "speaker": "Me", "text": "So I wrote x squared plus y squared equals 100 and took the derivative, but then I'm not sure what sign dx dt should be."},
+      {"t_s": 26.5, "end_s": 27.2, "speaker": "Prof. Okafor", "text": "Mm-hm.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "backchannel"}},
+      {"t_s": 27.5, "end_s": 30, "speaker": "Me", "text": "Because the bottom is moving away."},
+      {"t_s": 30.5, "end_s": 42, "speaker": "Prof. Okafor", "text": "Right, good, so you've got the setup. Here's the thing a lot of people miss, the top of the ladder is going down, so think about what that means for the sign. Before we plug numbers in, when you differentiate x squared plus y squared equals 100 with respect to time, what do you get?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "direct calculus quiz the student is stuck on"}},
+      {"t_s": 45, "end_s": 50, "speaker": "Me", "text": "Two x dx dt plus two y dy dt equals zero?"},
+      {"t_s": 50.5, "end_s": 58, "speaker": "Prof. Okafor", "text": "Exactly. And so if x is six and dx dt is two, y is what, eight, right? So dy dt comes out to?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "quiz on the next computation; the self-answered y is embedded but the final ask is open"}},
+      {"t_s": 61, "end_s": 65, "speaker": "Me", "text": "Negative one point five. Oh, so that's why it's negative."},
+      {"t_s": 65.5, "end_s": 75, "speaker": "Prof. Okafor", "text": "That's why it's negative, it's going down. Why would it be positive? It wouldn't, the ladder's not climbing the wall. That's the sanity check I want you doing on the exam.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "rhetorical question answered by the speaker"}},
+      {"t_s": 75.5, "end_s": 77, "speaker": "Me", "text": "Okay that makes sense."},
+      {"t_s": 77.5, "end_s": 86, "speaker": "Prof. Okafor", "text": "Good. Does that track with what we did in lecture on Tuesday? I know I went fast.", "label": {"worth_answering": false, "aimed_at_user": true, "why": "comprehension check"}},
+      {"t_s": 86.5, "end_s": 89, "speaker": "Me", "text": "Yeah, mostly. Can I ask about the midterm?"},
+      {"t_s": 89.5, "end_s": 91, "speaker": "Prof. Okafor", "text": "Sure, go ahead.", "label": {"worth_answering": false, "aimed_at_user": true, "why": "acknowledgment"}},
+      {"t_s": 91.5, "end_s": 96, "speaker": "Me", "text": "Is the chain rule section going to be on it, or just through implicit differentiation?"},
+      {"t_s": 96.5, "end_s": 108, "speaker": "Prof. Okafor", "text": "Everything through section three point nine, so related rates included. Oh, and one thing, quick check for you, what's the derivative of sine of x squared? People always forget the inside.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "direct derivative quiz"}},
+      {"t_s": 111, "end_s": 115, "speaker": "Me", "text": "Two x cosine of x squared."},
+      {"t_s": 115.5, "end_s": 121, "speaker": "Prof. Okafor", "text": "Perfect. Can you come back Thursday if you get stuck on five?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "scheduling"}},
+      {"t_s": 121.5, "end_s": 123, "speaker": "Me", "text": "Yeah, Thursday works. Thanks!"}
+    ]
+  },
+  {
+    "meeting": "study group three friends",
+    "notes": "Discord study group for a linear algebra exam. Friends talk over each other, ask each other by name, joke, and coordinate. Few questions go to Me.",
+    "lines": [
+      {"t_s": 0, "end_s": 4, "speaker": "Maya", "text": "Okay is everyone here? Leo, you there?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "roll call to someone else"}},
+      {"t_s": 4.5, "end_s": 6, "speaker": "Leo", "text": "Yeah yeah, I'm here, sorry, eating.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "statement"}},
+      {"t_s": 6.5, "end_s": 12, "speaker": "Maya", "text": "Did anyone actually finish the practice exam? Because I got through like half.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "group status question; personal fact"}},
+      {"t_s": 12.5, "end_s": 14, "speaker": "Me", "text": "I did most of it."},
+      {"t_s": 14.5, "end_s": 21, "speaker": "Leo", "text": "Same, I skipped the proof one. Maya, did you get number three, the one with the basis?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "addressed to Maya by name"}},
+      {"t_s": 21.5, "end_s": 30, "speaker": "Maya", "text": "Kind of? I said it's a basis because the vectors are independent, but I think you also need them to span, right?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "thinking aloud to Leo; Leo answers", "ambiguous": true}},
+      {"t_s": 30.2, "end_s": 33, "speaker": "Leo", "text": "Yeah, in R three, three independent vectors automatically span though.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "answer"}},
+      {"t_s": 33.5, "end_s": 35, "speaker": "Maya", "text": "Oh wait, that's true.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "acknowledgment"}},
+      {"t_s": 35.5, "end_s": 44, "speaker": "Leo", "text": "Okay so the one I'm actually confused about is five. I don't get how you find the eigenvalues when the matrix is three by three. James, how did you do five?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "asks Me by name how to find 3x3 eigenvalues"}},
+      {"t_s": 47, "end_s": 55, "speaker": "Me", "text": "Um, so you do the determinant of A minus lambda I and set it to zero, you get a cubic."},
+      {"t_s": 55.5, "end_s": 63, "speaker": "Leo", "text": "Right but how do you solve a cubic, that's the part, like do we just guess?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "follow-up to Me on solving the characteristic cubic"}},
+      {"t_s": 66, "end_s": 72, "speaker": "Me", "text": "Kind of, you try small integers that divide the constant term."},
+      {"t_s": 72.5, "end_s": 76, "speaker": "Maya", "text": "Wait, is that the rational root thing from high school?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "light confirmation aimed at the group; Me just explained it", "ambiguous": true}},
+      {"t_s": 76.5, "end_s": 78, "speaker": "Me", "text": "Yeah exactly."},
+      {"t_s": 78.5, "end_s": 85, "speaker": "Leo", "text": "Bro I have not thought about high school math in so long. Who even remembers that? Nobody.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "rhetorical joke"}},
+      {"t_s": 85.5, "end_s": 92, "speaker": "Maya", "text": "Okay, should we do the proof one together? Or does someone want to take the next ten minutes on the diagonalization stuff?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "group logistics"}},
+      {"t_s": 92.5, "end_s": 94, "speaker": "Me", "text": "Let's do the proof."},
+      {"t_s": 94.5, "end_s": 104, "speaker": "Maya", "text": "Okay so it's prove that if A is invertible then zero is not an eigenvalue. James, you're good at these, where would you even start?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "asks Me by name how to start the proof"}},
+      {"t_s": 107, "end_s": 115, "speaker": "Me", "text": "I'd do it by contradiction, like suppose zero is an eigenvalue, then A v equals zero for some nonzero v."},
+      {"t_s": 115.5, "end_s": 119, "speaker": "Leo", "text": "And then that means it has a null space, so it's not invertible.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "statement continuing the proof"}},
+      {"t_s": 119.5, "end_s": 121, "speaker": "Maya", "text": "Oh nice, that's it?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "reaction"}},
+      {"t_s": 121.5, "end_s": 123, "speaker": "Me", "text": "Yeah, that's basically it."},
+      {"t_s": 123.5, "end_s": 129, "speaker": "Leo", "text": "Cool. Are we meeting again Sunday or are people going home for the weekend?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "scheduling"}}
+    ]
+  },
+  {
+    "meeting": "lecture with a cold call",
+    "notes": "Online lecture in an intro economics course. The professor asks the whole class rhetorical and open questions, takes an answer from another student, then cold-calls Me by name.",
+    "lines": [
+      {"t_s": 0, "end_s": 14, "speaker": "Prof. Lindqvist", "text": "Alright everybody, let's get going. Last time we ended on price ceilings. So today I want to ask, what actually happens when the government caps rent below the market price? Think about it for a second.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "question posed to the whole class; the speaker keeps going"}},
+      {"t_s": 15, "end_s": 29, "speaker": "Prof. Lindqvist", "text": "Some of you are thinking, great, cheaper rent, who could be against that? And that's a fair instinct. But economists get nervous, and the reason is shortages. Quantity demanded goes up, quantity supplied goes down.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "rhetorical question in lecture"}},
+      {"t_s": 29.5, "end_s": 40, "speaker": "Prof. Lindqvist", "text": "Does anyone want to take a stab at what else happens besides the shortage? Anyone? Yes, Priya, go ahead.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "open question to the class, then gives the floor to someone else"}},
+      {"t_s": 41, "end_s": 48, "speaker": "Priya", "text": "Um, like landlords stop maintaining the buildings because they can't charge more?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "another student answering, not a question to Me"}},
+      {"t_s": 48.5, "end_s": 60, "speaker": "Prof. Lindqvist", "text": "Exactly, quality falls. That's the non-price rationing we talked about. You get waiting lists, you get bribes, key money. Okay. Let's do a quick one. James, you're on my list today. What's the difference between a binding and a non-binding price ceiling?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "cold-call to Me by name with a factual question"}},
+      {"t_s": 63, "end_s": 70, "speaker": "Me", "text": "Um, a binding one is set below the equilibrium price so it actually changes the outcome?"},
+      {"t_s": 70.5, "end_s": 78, "speaker": "Prof. Lindqvist", "text": "Good, and a non-binding one?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "short follow-up to Me"}},
+      {"t_s": 80, "end_s": 84, "speaker": "Me", "text": "It's above equilibrium, so nothing happens."},
+      {"t_s": 84.5, "end_s": 100, "speaker": "Prof. Lindqvist", "text": "Nothing happens, right. Market just clears where it would anyway. So why would a government ever pass a non-binding ceiling? Well, sometimes as insurance against a spike. Okay, let me share my screen, can everyone see the graph?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "self-answered rhetorical question, then a screen-share check"}},
+      {"t_s": 100.5, "end_s": 112, "speaker": "Prof. Lindqvist", "text": "Here's the supply and demand diagram. The shaded triangle here is the deadweight loss. I'll post these slides on the course page after class, so don't worry about copying everything down.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "statement"}}
+    ]
+  },
+  {
+    "meeting": "biology oral exam",
+    "notes": "Oral exam over video; two examiners. Mostly conceptual questions to the student, one aside between examiners, one personal opener.",
+    "lines": [
+      {"t_s": 0, "end_s": 8, "speaker": "Dr. Haddad", "text": "Good afternoon. Before we start, how are you feeling? Nervous?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "small talk"}},
+      {"t_s": 8.5, "end_s": 11, "speaker": "Me", "text": "A little, but okay."},
+      {"t_s": 11.5, "end_s": 24, "speaker": "Dr. Haddad", "text": "That's normal. So we'll start broad and then go deeper. To begin, can you explain the difference between mitosis and meiosis, and why meiosis matters for genetic diversity?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "core exam question to Me"}},
+      {"t_s": 27, "end_s": 48, "speaker": "Me", "text": "So mitosis makes two identical diploid cells for growth and repair, and meiosis makes four haploid gametes. And diversity comes from crossing over and independent assortment."},
+      {"t_s": 48.5, "end_s": 50, "speaker": "Dr. Haddad", "text": "Mm-hm. Good.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "backchannel"}},
+      {"t_s": 50.5, "end_s": 60, "speaker": "Dr. Chen", "text": "Can I jump in? You said crossing over. At what stage of meiosis does that happen, and what structure makes it possible?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "stacked follow-up exam question to Me"}},
+      {"t_s": 63, "end_s": 72, "speaker": "Me", "text": "Prophase one, and it's the synaptonemal complex holding the homologs together."},
+      {"t_s": 72.5, "end_s": 78, "speaker": "Dr. Chen", "text": "Right. Samira, did you want to get to the gel question or should I keep going on meiosis?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "aside between examiners by name"}},
+      {"t_s": 78.5, "end_s": 81, "speaker": "Dr. Haddad", "text": "Go ahead, I'll do the gel after.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "logistics between examiners"}},
+      {"t_s": 81.5, "end_s": 95, "speaker": "Dr. Chen", "text": "Okay. So imagine nondisjunction happens in meiosis one versus meiosis two. I'm curious whether you can tell me how the resulting gametes would differ.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "exam question phrased as a statement"}},
+      {"t_s": 98, "end_s": 110, "speaker": "Me", "text": "In meiosis one all four gametes are abnormal, two with an extra and two missing. In meiosis two only two of them are."},
+      {"t_s": 110.5, "end_s": 124, "speaker": "Dr. Haddad", "text": "Very nice. Okay, the gel. You ran a PCR and you see a band at about 500 base pairs in every lane including your negative control. What's the most likely explanation, and what would you do next?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "lab troubleshooting exam question"}},
+      {"t_s": 127, "end_s": 136, "speaker": "Me", "text": "Contamination, probably of the reagents, so I'd remake the master mix and rerun with fresh water."},
+      {"t_s": 136.5, "end_s": 142, "speaker": "Dr. Haddad", "text": "Good. We're just about at time. Is there anything you wanted to add?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "open invitation; only Me knows what to add"}}
+    ]
+  },
+  {
+    "meeting": "campus internship interview",
+    "mode": "interview",
+    "notes": "Video interview for a data analyst internship. Long setups, a behavioral question, a technical SQL question, and a stacked question. The recruiter sometimes keeps talking after a question.",
+    "lines": [
+      {"t_s": 0, "end_s": 12, "speaker": "Rachel", "text": "Hi James, thanks for making time, I know it's midterm season. I'm Rachel, I'm on the analytics team. Did you find the link okay?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "small talk"}},
+      {"t_s": 12.5, "end_s": 15, "speaker": "Me", "text": "Yeah no problem, thanks for having me."},
+      {"t_s": 15.5, "end_s": 34, "speaker": "Rachel", "text": "Great. So the way this will go, I'll ask a couple of background questions, then a short technical piece, then you can ask me anything. To start, tell me a bit about yourself and why this internship.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "standard interview opener; a structure helps"}},
+      {"t_s": 37, "end_s": 60, "speaker": "Me", "text": "Sure, I'm a third-year stats major, I've done a couple of projects in Python and SQL, and I really want to work on real business data."},
+      {"t_s": 60.5, "end_s": 62, "speaker": "Rachel", "text": "Nice.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "backchannel"}},
+      {"t_s": 62.5, "end_s": 80, "speaker": "Rachel", "text": "So we work a lot with messy data from different teams and people don't always agree on definitions. Can you tell me about a time you worked in a group where there was conflict, and how you handled it?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "behavioral question"}},
+      {"t_s": 83, "end_s": 110, "speaker": "Me", "text": "Yeah, in my stats project last semester two of us disagreed on whether to drop outliers, so we ran it both ways and showed the professor."},
+      {"t_s": 110.5, "end_s": 113, "speaker": "Rachel", "text": "Mm-hm, and how did that turn out?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "asks a personal fact only Me knows"}},
+      {"t_s": 113.5, "end_s": 120, "speaker": "Me", "text": "We ended up keeping them and adding a robustness check, so it worked out."},
+      {"t_s": 120.5, "end_s": 140, "speaker": "Rachel", "text": "Great. Okay, technical piece. Say you have an orders table with customer ID, order date and amount. How would you find each customer's most recent order? And then, how would you handle ties if two orders have the same date?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "stacked SQL question"}},
+      {"t_s": 143, "end_s": 160, "speaker": "Me", "text": "I'd use a window function, row number partitioned by customer ordered by date descending, and take row one."},
+      {"t_s": 160.5, "end_s": 168, "speaker": "Rachel", "text": "Okay, and the ties?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "follow-up on the part Me did not answer"}},
+      {"t_s": 170, "end_s": 178, "speaker": "Me", "text": "Oh, I'd add a tiebreaker like order ID, or use rank if they want both."},
+      {"t_s": 178.5, "end_s": 194, "speaker": "Rachel", "text": "Perfect, that's exactly what we look for. We're close to time, so what questions do you have for me? And don't worry, there's no wrong question here.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "candidate needs good questions to ask"}}
+    ]
+  },
+  {
+    "meeting": "group project meeting",
+    "notes": "Four students planning a psychology research project. Mostly logistics and task splitting; one methods question goes to Me as the stats person.",
+    "lines": [
+      {"t_s": 0, "end_s": 6, "speaker": "Aisha", "text": "Okay so the proposal's due Friday. Can everyone see the doc I shared?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "logistics check to the group"}},
+      {"t_s": 6.5, "end_s": 8, "speaker": "Ben", "text": "Yep.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "backchannel"}},
+      {"t_s": 8.5, "end_s": 18, "speaker": "Aisha", "text": "I was thinking Ben does the lit review, Carla does the survey questions, and James does the methods and analysis part. Does that work for everyone?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "agreement check on task split"}},
+      {"t_s": 18.5, "end_s": 20, "speaker": "Me", "text": "Works for me."},
+      {"t_s": 20.5, "end_s": 28, "speaker": "Carla", "text": "Wait, are we doing the survey on Qualtrics or Google Forms? Because the school has Qualtrics for free.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "group logistics"}},
+      {"t_s": 28.5, "end_s": 31, "speaker": "Aisha", "text": "Qualtrics, definitely.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "answer"}},
+      {"t_s": 31.5, "end_s": 46, "speaker": "Ben", "text": "Okay so for the methods, we're comparing sleep hours between people who use their phone in bed and people who don't. James, how many people do we actually need for that to be, like, statistically meaningful?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "sample-size question to the stats person by name"}},
+      {"t_s": 49, "end_s": 56, "speaker": "Me", "text": "It depends on the effect size, but for a medium effect with a t-test it's around sixty per group."},
+      {"t_s": 56.5, "end_s": 62, "speaker": "Carla", "text": "Sixty per group? There's no way we get a hundred and twenty people by next week.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "statement, a concern"}},
+      {"t_s": 62.5, "end_s": 70, "speaker": "Ben", "text": "So what do we do then, just say it's a pilot study?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "follows Me's sample-size answer; a methods suggestion helps", "ambiguous": true}},
+      {"t_s": 72, "end_s": 80, "speaker": "Me", "text": "Yeah, we can call it a pilot and report the effect size with a confidence interval instead of just a p-value."},
+      {"t_s": 80.5, "end_s": 86, "speaker": "Aisha", "text": "Love that. Can you write that up by Wednesday so I can merge it?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "action request with a deadline"}},
+      {"t_s": 86.5, "end_s": 88, "speaker": "Me", "text": "Yeah, Wednesday's fine."},
+      {"t_s": 88.5, "end_s": 94, "speaker": "Carla", "text": "Does anyone know if we need ethics approval for a class project?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "question to the group about a course rule the AI cannot know", "ambiguous": true}},
+      {"t_s": 94.5, "end_s": 100, "speaker": "Aisha", "text": "I think the prof said class projects are exempt, but I'll email her to make sure.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "answer"}}
+    ]
+  },
+  {
+    "meeting": "two-guest podcast while studying",
+    "notes": "Me has a science podcast playing through the speakers while studying; the host interviews two guests. Nothing is addressed to Me, so nothing should be answered.",
+    "lines": [
+      {"t_s": 0, "end_s": 22, "speaker": "Host", "text": "Welcome back to the show. Today I've got two people who've spent most of their careers thinking about sleep, which, if you're a student listening to this at two a.m., hi, this one's for you. So let's start simple. Why do we sleep at all?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "host question to guests on a recording"}},
+      {"t_s": 23, "end_s": 55, "speaker": "Guest A", "text": "Yeah, it's a great question, and honestly the field doesn't fully agree. The leading idea is that sleep clears metabolic waste from the brain, and it consolidates memory. But I guess the honest answer is we're still figuring it out.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "guest answering on a recording"}},
+      {"t_s": 55.5, "end_s": 57, "speaker": "Guest B", "text": "Right.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "backchannel"}},
+      {"t_s": 57.5, "end_s": 70, "speaker": "Host", "text": "And maybe contrast that with the older view, because when I was in school we were told it was just about rest. Is that wrong?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "host to guests on a recording"}},
+      {"t_s": 71, "end_s": 98, "speaker": "Guest B", "text": "It's not wrong, it's incomplete. So think about it, why would evolution keep something that leaves you totally defenseless for eight hours a day? It has to be doing something big. And it is.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "rhetorical, self-answered"}},
+      {"t_s": 98.5, "end_s": 112, "speaker": "Host", "text": "Okay, so for the students listening, is pulling an all-nighter before an exam actually as bad as people say? I want a straight answer.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "addressed to guests and the audience on a recording"}},
+      {"t_s": 113, "end_s": 140, "speaker": "Guest A", "text": "Short answer, yes. You lose a big chunk of your ability to form new memories the next day. Does that mean one all-nighter ruins you? No. But you're trading recall for cramming time, and the math rarely works out.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "guest answering, self-answered question"}},
+      {"t_s": 140.5, "end_s": 152, "speaker": "Host", "text": "Fair enough. We're gonna take a quick break, and when we come back, I want to ask both of you about naps, because I nap a lot. Stick around.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "announced question, break"}},
+      {"t_s": 153, "end_s": 170, "speaker": "Host", "text": "And we're back. So naps. What's the ideal length, twenty minutes, ninety minutes? Guest B, you've studied this.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "host question to a named guest on a recording"}},
+      {"t_s": 171, "end_s": 196, "speaker": "Guest B", "text": "Either about twenty minutes or a full cycle, around ninety. The thing to avoid is waking up in the middle, around forty-five minutes, because then you feel worse.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "guest answering"}}
+    ]
+  },
+  {
+    "meeting": "student radio guest",
+    "notes": "Me is the guest on a campus radio show about a robotics club. The host asks about Me's personal story (not worth answering) and occasionally asks Me to explain technical ideas for listeners (worth answering).",
+    "lines": [
+      {"t_s": 0, "end_s": 16, "speaker": "Host", "text": "You're listening to Campus Hour. I'm here with James from the robotics club, which just placed second at regionals. James, congratulations. How does it feel?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "personal feelings"}},
+      {"t_s": 16.5, "end_s": 24, "speaker": "Me", "text": "Thanks, honestly it's been a crazy few weeks, but it feels great."},
+      {"t_s": 24.5, "end_s": 32, "speaker": "Host", "text": "So how did you get into robotics in the first place?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "personal story only Me knows"}},
+      {"t_s": 32.5, "end_s": 50, "speaker": "Me", "text": "I built a little line-following robot in high school and just never stopped. Then I joined the club my first week here."},
+      {"t_s": 50.5, "end_s": 66, "speaker": "Host", "text": "I love that. Now our listeners might not know this, your robot used something called a PID controller, which I definitely can't explain. Can you break down what a PID controller does, like for a five year old?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "asks Me to explain a technical concept simply"}},
+      {"t_s": 69, "end_s": 88, "speaker": "Me", "text": "Sure, it's like steering a car, it looks at how far off you are, how long you've been off, and how fast you're drifting, and corrects for all three."},
+      {"t_s": 88.5, "end_s": 98, "speaker": "Host", "text": "Oh, that's a great way to put it. And the competition, what was the hardest part? Was it the build or the programming?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "personal experience only Me knows"}},
+      {"t_s": 98.5, "end_s": 112, "speaker": "Me", "text": "Definitely the programming, our sensor kept giving noisy readings near the walls."},
+      {"t_s": 112.5, "end_s": 122, "speaker": "Host", "text": "Noisy readings, so how do you even fix something like that? Is that just a software thing?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "technical question about filtering sensor noise"}},
+      {"t_s": 125, "end_s": 136, "speaker": "Me", "text": "Mostly software, we used a moving average filter and some calibration."},
+      {"t_s": 136.5, "end_s": 150, "speaker": "Host", "text": "Very cool. We have to go to a song now, but before we do, where can people find the club if they want to join?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "club logistics only Me knows"}}
+    ]
+  },
+  {
+    "meeting": "french conversation class",
+    "notes": "Small online French conversation class in Montreal. The teacher asks personal practice questions in French (not worth answering) and occasional vocabulary or grammar questions (worth answering).",
+    "lines": [
+      {"t_s": 0, "end_s": 8, "speaker": "Madame Tremblay", "text": "Bonjour tout le monde! On commence. James, qu'est-ce que tu as fait en fin de semaine?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "personal practice question"}},
+      {"t_s": 8.5, "end_s": 18, "speaker": "Me", "text": "Euh, en fin de semaine, j'ai étudié pour un examen et j'ai vu des amis."},
+      {"t_s": 18.5, "end_s": 28, "speaker": "Madame Tremblay", "text": "Très bien! Petite correction, on dit j'ai rencontré des amis ou j'ai vu mes amis. Et Sophie, toi?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "turns to another student"}},
+      {"t_s": 29, "end_s": 38, "speaker": "Sophie", "text": "Moi, je suis allée au marché Jean-Talon avec ma sœur.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "another student answering"}},
+      {"t_s": 38.5, "end_s": 52, "speaker": "Madame Tremblay", "text": "Ah, super. Bon, vocabulaire. James, comment est-ce qu'on dit deadline en français? Pas le mot anglais, hein.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "vocabulary question to Me"}},
+      {"t_s": 55, "end_s": 58, "speaker": "Me", "text": "Euh, une échéance?"},
+      {"t_s": 58.5, "end_s": 72, "speaker": "Madame Tremblay", "text": "Oui, ou une date limite. Parfait. Maintenant la grammaire. Pourquoi est-ce qu'on dit je suis allée avec un e à la fin, mais j'ai mangé sans e?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "grammar explanation question to the class, Me included", "ambiguous": true}},
+      {"t_s": 75, "end_s": 84, "speaker": "Me", "text": "Parce que aller utilise être, et avec être on accorde avec le sujet?"},
+      {"t_s": 84.5, "end_s": 94, "speaker": "Madame Tremblay", "text": "Exactement! Avec être, on accorde. Ça va? Tout le monde comprend?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "comprehension check"}},
+      {"t_s": 94.5, "end_s": 108, "speaker": "Madame Tremblay", "text": "Bon, dernière chose pour toi, James. Quelle est la différence entre connaître et savoir? On les mélange tout le temps.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "grammar question to Me by name"}}
+    ]
+  },
+  {
+    "meeting": "academic advisor call",
+    "mode": "general",
+    "notes": "Call with an academic advisor about course planning. Mostly personal facts and logistics; the advisor answers their own questions.",
+    "lines": [
+      {"t_s": 0, "end_s": 8, "speaker": "Advisor", "text": "Hi James, can you confirm your student number for me before we start?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "personal fact"}},
+      {"t_s": 8.5, "end_s": 12, "speaker": "Me", "text": "Sure, it's two six oh four one one eight."},
+      {"t_s": 12.5, "end_s": 26, "speaker": "Advisor", "text": "Perfect, I've got your file up. So you're a computer science major, third year, and you mentioned in your email you're thinking about adding a minor. Which one were you thinking?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "personal plan only Me knows"}},
+      {"t_s": 26.5, "end_s": 32, "speaker": "Me", "text": "Statistics, I think, or maybe math."},
+      {"t_s": 32.5, "end_s": 50, "speaker": "Advisor", "text": "Okay. Stats is popular with CS students. The question is, do you have room? You've got about thirty credits left, and the minor is eighteen, so it's tight but doable. Have you taken intro probability yet?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "self-answered question then a personal fact"}},
+      {"t_s": 50.5, "end_s": 53, "speaker": "Me", "text": "Yeah, last fall."},
+      {"t_s": 53.5, "end_s": 70, "speaker": "Advisor", "text": "Good. Then I'd suggest regression next term. Would you rather take it in the winter or wait until fall, when there's a smaller section?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "personal preference"}},
+      {"t_s": 70.5, "end_s": 80, "speaker": "Me", "text": "Winter, probably. Is regression useful for machine learning stuff, or is it more of a pure stats course?"},
+      {"t_s": 80.5, "end_s": 98, "speaker": "Advisor", "text": "Very useful, it's the foundation for a lot of it. Okay, I'll note that. Anything else on your mind? Internships, grad school, anything?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "open invitation"}}
+    ]
+  }
+]

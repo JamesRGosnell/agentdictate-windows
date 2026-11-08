@@ -30,6 +30,9 @@ use super::{
 use crate::codex_subscription::ChatGptCredentials;
 
 pub(super) const SCRIPTED: &str = include_str!("question_eval.json");
+/// Student situations: office hours, study groups, lectures, exams, and a
+/// podcast playing in the background.
+pub(super) const STUDENTS: &str = include_str!("question_eval_students.json");
 /// Matches the engine: verdicts slower than this fall back to the wording.
 const VERDICT_WAIT_MS: u64 = 3_000;
 /// Matches the engine: automatic answers this close together are suppressed.
@@ -266,7 +269,10 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
     };
     let cache = Mutex::new(cache);
 
-    let mut sets: Vec<(String, Vec<EvalCall>)> = vec![("scripted".into(), load_calls(SCRIPTED)?)];
+    let mut sets: Vec<(String, Vec<EvalCall>)> = vec![
+        ("scripted".into(), load_calls(SCRIPTED)?),
+        ("students".into(), load_calls(STUDENTS)?),
+    ];
     for file in files {
         let text = std::fs::read_to_string(file)
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
@@ -502,8 +508,9 @@ mod tests {
 
     #[test]
     fn scripted_calls_parse_with_labels_on_the_other_side() {
-        let calls = load_calls(SCRIPTED).expect("scripted calls parse");
-        assert!(calls.len() >= 8);
+        let mut calls = load_calls(SCRIPTED).expect("scripted calls parse");
+        calls.extend(load_calls(STUDENTS).expect("student calls parse"));
+        assert!(calls.len() >= 18);
         for call in &calls {
             let (lines, _) = prepare(call);
             assert!(lines.iter().all(|line| line.end_ms > line.start_ms));
@@ -525,6 +532,6 @@ mod tests {
                     .is_some_and(|label| label.worth_answering)
             })
             .count();
-        assert!(positives >= 20, "{positives}");
+        assert!(positives >= 40, "{positives}");
     }
 }

@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     providers::{self, AnswerRequest},
     question_eval::{
-        Line, PARALLEL_JUDGES, RETRY_PAUSES_MS, SCRIPTED, cache_key, clip, label_for, load_calls,
-        prepare,
+        Line, PARALLEL_JUDGES, RETRY_PAUSES_MS, SCRIPTED, STUDENTS, cache_key, clip, label_for,
+        load_calls, prepare,
     },
     store,
 };
@@ -205,7 +205,10 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
     };
     let cache = Mutex::new(cache);
 
-    let mut sets = vec![("scripted".to_owned(), load_calls(SCRIPTED)?)];
+    let mut sets = vec![
+        ("scripted".to_owned(), load_calls(SCRIPTED)?),
+        ("students".to_owned(), load_calls(STUDENTS)?),
+    ];
     for file in files {
         let text = std::fs::read_to_string(file)
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
