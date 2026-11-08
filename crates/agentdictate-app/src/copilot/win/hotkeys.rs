@@ -96,6 +96,22 @@ fn resolve(
     }
 }
 
+/// Labels for the shortcut actually registered: its modifiers, which can
+/// include Shift for the backslash key on Canadian French or Alt after a
+/// conflict, and the key's glyph.
+fn key_labels(modifiers: HOT_KEY_MODIFIERS, glyph: &str) -> Vec<String> {
+    [
+        (MOD_CONTROL, "Ctrl"),
+        (MOD_ALT, "Alt"),
+        (MOD_SHIFT, "Shift"),
+    ]
+    .iter()
+    .filter(|(flag, _)| modifiers & flag != 0)
+    .map(|(_, name)| (*name).to_owned())
+    .chain(std::iter::once(glyph.to_owned()))
+    .collect()
+}
+
 fn register(id: i32, (modifiers, key): (HOT_KEY_MODIFIERS, VIRTUAL_KEY)) -> bool {
     unsafe {
         RegisterHotKey(
@@ -140,12 +156,10 @@ pub(crate) fn start(
             let mut toggle_modifiers = None;
             for (id, candidates) in [(1, &ASSIST[..]), (TOGGLE_ID, &TOGGLE[..]), (3, &ASK[..])] {
                 for candidate in candidates {
-                    if register(id, resolve(candidate.modifiers, candidate.key, layout)) {
-                        let labels = candidate
-                            .labels
-                            .iter()
-                            .map(|label| (*label).to_owned())
-                            .collect();
+                    let resolved = resolve(candidate.modifiers, candidate.key, layout);
+                    if register(id, resolved) {
+                        let glyph = candidate.labels.last().copied().unwrap_or_default();
+                        let labels = key_labels(resolved.0, glyph);
                         match id {
                             1 => shortcuts.assist = labels,
                             TOGGLE_ID => {
@@ -213,6 +227,18 @@ pub(crate) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_name_the_registered_modifiers() {
+        assert_eq!(
+            key_labels(MOD_CONTROL | MOD_SHIFT, "\\"),
+            ["Ctrl", "Shift", "\\"]
+        );
+        assert_eq!(
+            key_labels(MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, "\u{21b5}"),
+            ["Ctrl", "Alt", "\u{21b5}"]
+        );
+    }
 
     #[test]
     fn backslash_follows_the_layout_key_and_its_shift() {

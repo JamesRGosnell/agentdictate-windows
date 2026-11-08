@@ -1042,6 +1042,9 @@ pub enum CopilotEvent {
     Models(Vec<ModelChoice>),
     Shortcuts(CopilotShortcuts),
     Notice(String),
+    /// A lasting problem, such as transcription failing, shown until the
+    /// engine clears it with `None`.
+    Problem(Option<String>),
     /// Toggle requested by the global shortcut or a second launch.
     ToggleVisibility,
     Show,

@@ -436,6 +436,8 @@ pub(crate) struct Engine {
     insights: CopilotInsights,
     chatgpt_models: Vec<String>,
     ending: bool,
+    /// The transcription error shown on the bar, until one succeeds.
+    transcription_problem: Option<String>,
 }
 
 impl Engine {
@@ -493,6 +495,7 @@ impl Engine {
             insights: CopilotInsights::default(),
             chatgpt_models: Vec::new(),
             ending: false,
+            transcription_problem: None,
         }
     }
 
@@ -501,27 +504,29 @@ impl Engine {
     }
 
     /// Runs the session until the user ends it.
-    pub(crate) fn run(mut self, incoming: Receiver<EngineMsg>) {
+    /// Runs until the session ends; true when the user ended it.
+    pub(crate) fn run(mut self, incoming: Receiver<EngineMsg>) -> bool {
         self.start_transcription_workers();
         self.load_models(self.settings.provider);
         self.load_knowledge();
         self.warm_up();
         self.start_audio();
-        loop {
+        let user_ended = loop {
             match incoming.recv_timeout(self.next_wait()) {
                 Ok(message) => {
                     if self.handle(message) {
-                        break;
+                        break true;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => break false,
             }
             if self.tick() {
-                break;
+                break false;
             }
-        }
+        };
         self.finish(&incoming);
+        user_ended
     }
 
     fn start_transcription_workers(&mut self) {
@@ -1144,13 +1149,21 @@ impl Engine {
             Ok(text) => text,
             Err(error) => {
                 tracing::warn!(%error, ?speaker, "copilot transcription failed");
-                (self.ui)(CopilotEvent::Notice(error));
+                // Shown on the bar until a transcription succeeds again, so
+                // the user knows speech is being missed.
+                if self.transcription_problem.as_deref() != Some(error.as_str()) {
+                    self.transcription_problem = Some(error.clone());
+                    (self.ui)(CopilotEvent::Problem(Some(error)));
+                }
                 if speaker == Speaker::Them {
                     self.forget_them_span(start_ms, end_ms);
                 }
                 return;
             }
         };
+        if self.transcription_problem.take().is_some() {
+            (self.ui)(CopilotEvent::Problem(None));
+        }
         let text = text.trim().to_owned();
         if is_noise_transcript(&text, end_ms.saturating_sub(start_ms)) {
             if speaker == Speaker::Them {
@@ -1510,7 +1523,8 @@ impl Engine {
     }
 
     /// Whether an automatic answer may start now: not a repeat of the last
-    /// one, and never over an answer the user asked for.
+    /// one, never over an answer the user asked for, and never over an
+    /// answer still streaming in front of the user.
     fn may_auto_answer(&self, question: &str) -> bool {
         if let Some((previous, at)) = &self.last_auto_question
             && (at.elapsed() < AUTO_ANSWER_COOLDOWN
@@ -1520,7 +1534,7 @@ impl Engine {
         }
         self.active_answer
             .as_ref()
-            .is_none_or(|active| active.automatic)
+            .is_none_or(|active| active.automatic && active.gate.is_hidden())
     }
 
     fn maybe_auto_answer(&mut self, question: String) {
@@ -2684,6 +2698,45 @@ mod tests {
             messages,
         );
         (engine, incoming, events, requests, directory)
+    }
+
+    #[test]
+    fn a_new_automatic_answer_never_replaces_one_on_screen() {
+        let (mut engine, _incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        let ui = Arc::clone(&engine.ui);
+        let active = |gate: RevealGate| ActiveAnswer {
+            id: 7,
+            automatic: true,
+            cancel: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(gate),
+        };
+        engine.active_answer = Some(active(RevealGate::shown(Arc::clone(&ui))));
+        assert!(!engine.may_auto_answer("What does onboarding include?"));
+        engine.active_answer = Some(active(RevealGate::hidden(ui)));
+        assert!(engine.may_auto_answer("What does onboarding include?"));
+    }
+
+    #[test]
+    fn a_transcription_failure_stays_shown_until_one_succeeds() {
+        let (mut engine, _incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        let limit = "ChatGPT transcription limit reached. Try again later.";
+        for _ in 0..3 {
+            engine.handle_transcribed(Speaker::Me, 0, 500, Err(limit.into()));
+        }
+        engine.handle_transcribed(Speaker::Me, 1_000, 2_000, Ok("Back again.".into()));
+        engine.handle_transcribed(Speaker::Me, 3_000, 4_000, Ok("Still here.".into()));
+        let problems: Vec<Option<String>> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                CopilotEvent::Problem(problem) => Some(problem.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(problems, vec![Some(limit.to_owned()), None]);
     }
 
     fn drain(engine: &mut Engine, incoming: &Receiver<EngineMsg>) {

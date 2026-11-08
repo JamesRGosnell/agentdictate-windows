@@ -57,15 +57,29 @@ const VOICES: [u32; 6] = [
     ACCENT, 0xc4b5fdff, 0x86efacff, 0xfcd34dff, 0xf9a8d4ff, 0x67e8f9ff,
 ];
 const DANGER: u32 = 0xf87171ff;
+const WARNING: u32 = 0xfbbf24ff;
 const SHADOW_MARGIN: f32 = 14.0;
 const PILL_HEIGHT: f32 = 38.0;
 const PANEL_RADIUS: f32 = 18.0;
 /// The shortest the live panel shrinks to around little content.
 const LIVE_PANEL_MIN_HEIGHT: f32 = 160.0;
+/// How long the end button waits for its confirming second click.
+const END_CONFIRM: Duration = Duration::from_secs(4);
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
 fn color(hex: u32) -> Hsla {
     gpui::rgba(hex).into()
+}
+
+/// A few words for the bar about a lasting problem; the panel shows the
+/// full message.
+fn problem_label(problem: &str) -> &'static str {
+    let lower = problem.to_lowercase();
+    if lower.contains("limit") {
+        "Transcription limit reached"
+    } else {
+        "Not transcribing"
+    }
 }
 
 fn icon(name: &str, size: f32, tint: u32) -> impl IntoElement + use<> {
@@ -287,6 +301,8 @@ pub struct CopilotWindow {
     notice_at: Option<Instant>,
     shape: Rc<RefCell<ShapeTracker>>,
     live_fit: Rc<Cell<LiveFit>>,
+    /// The end button was clicked once; a second click ends the meeting.
+    end_armed_at: Option<Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -548,6 +564,7 @@ impl CopilotWindow {
             notice_at: None,
             shape: Rc::default(),
             live_fit: Rc::default(),
+            end_armed_at: None,
             _subscriptions: subscriptions,
         };
         view.load_text_settings(window, cx);
@@ -566,6 +583,13 @@ impl CopilotWindow {
                     if this.notice_at.is_some_and(|at| at.elapsed() >= NOTICE_TTL) {
                         this.notice_at = None;
                         this.model.notice = None;
+                    }
+                    if this
+                        .end_armed_at
+                        .is_some_and(|at| at.elapsed() >= END_CONFIRM)
+                    {
+                        this.end_armed_at = None;
+                        cx.notify();
                     }
                     let animating = this.visible
                         && (matches!(
@@ -900,8 +924,21 @@ impl CopilotWindow {
             .zip(&self.model.levels_them)
             .map(|(me, them)| me.max(*them))
             .collect();
+        let problem = self.model.problem.clone();
         let listen_content: AnyElement =
             match &self.model.listen {
+                ListenState::Listening if problem.is_some() => h_flex()
+                    .debug_selector(|| "copilot-problem".to_owned())
+                    .gap(px(7.))
+                    .child(icon("alert", 13., WARNING))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(color(WARNING))
+                            .child(problem_label(problem.as_deref().unwrap_or_default())),
+                    )
+                    .into_any_element(),
                 ListenState::Listening => h_flex()
                     .gap(px(8.))
                     .child(
@@ -1094,13 +1131,29 @@ impl CopilotWindow {
                     cx.notify();
                 })),
             )
-            .child(icon_button("copilot-end", "x", MUTED).on_click(cx.listener(
-                |this, _: &ClickEvent, _, cx| {
-                    this.act(CopilotAction::End);
-                    this.stop_typing(true, cx);
-                    cx.notify();
-                },
-            )))
+            .child(if self.end_armed_at.is_some() {
+                // A second click within END_CONFIRM ends the meeting, so a
+                // stray click on the X never throws a meeting away.
+                bar_button("copilot-end")
+                    .text_size(px(12.))
+                    .text_color(color(DANGER))
+                    .bg(color(0xf8717122))
+                    .child(icon("x", 12., DANGER))
+                    .child("End meeting?")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.end_armed_at = None;
+                        this.act(CopilotAction::End);
+                        this.stop_typing(true, cx);
+                        cx.notify();
+                    }))
+            } else {
+                icon_button("copilot-end", "x", MUTED).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.end_armed_at = Some(Instant::now());
+                        cx.notify();
+                    },
+                ))
+            })
             .child(shape_probe(&self.shape, &self.host, false));
         h_flex()
             .w_full()
@@ -1265,6 +1318,20 @@ impl CopilotWindow {
                     .gap(px(10.))
                     .text_size(px(11.5))
                     .text_color(color(DIM))
+                    .when_some(self.model.problem.clone(), |row, problem| {
+                        row.child(
+                            h_flex()
+                                .max_w(px(320.))
+                                .gap(px(5.))
+                                .px(px(8.))
+                                .py(px(2.))
+                                .rounded(px(10.))
+                                .bg(color(0xfbbf241f))
+                                .text_color(color(WARNING))
+                                .child(icon("alert", 11., WARNING))
+                                .child(div().overflow_hidden().whitespace_nowrap().child(problem)),
+                        )
+                    })
                     .when_some(self.model.notice.clone(), |row, notice| {
                         row.child(
                             div()

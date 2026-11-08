@@ -16,6 +16,7 @@ macro_rules! icons {
 }
 
 icons!(
+    "alert.svg",
     "activity.svg",
     "arrow-up.svg",
     "book.svg",

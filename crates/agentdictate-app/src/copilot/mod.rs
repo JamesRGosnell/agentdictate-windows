@@ -197,7 +197,8 @@ pub fn run_copilot_echo_test(speech: &std::path::Path) -> anyhow::Result<usize> 
 /// When the dictation shortcut should open the copilot instead, returns why.
 #[cfg(windows)]
 pub fn copilot_launch_reason(config_file: &std::path::Path) -> Option<String> {
-    let settings = store::load(&store::settings_path(config_file));
+    let settings_path = store::settings_path(config_file);
+    let settings = store::load(&settings_path);
     if !settings.launch_from_dictation_hotkey || win::instance::is_running() {
         return None;
     }
@@ -205,7 +206,45 @@ pub fn copilot_launch_reason(config_file: &std::path::Path) -> Option<String> {
         &win::signals::active_microphone_apps(),
         &win::signals::window_titles(),
     );
-    signal.in_meeting.then_some(signal.reason)
+    let marker = dismissed_marker(&settings_path);
+    let dismissed_at = std::fs::metadata(&marker)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let (launch, clear) = launch_decision(
+        signal.in_meeting,
+        dismissed_at,
+        std::time::SystemTime::now(),
+    );
+    if clear {
+        let _ = std::fs::remove_file(&marker);
+    }
+    launch.then_some(signal.reason)
+}
+
+/// After the user ends the copilot, the dictation shortcut dictates for the
+/// rest of that meeting; this long bounds a meeting.
+const DISMISSED_FOR: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
+
+/// Marks that the user ended the copilot during a meeting.
+fn dismissed_marker(settings_path: &std::path::Path) -> std::path::PathBuf {
+    settings_path.with_file_name("copilot-dismissed")
+}
+
+/// Whether the dictation shortcut opens the copilot, and whether the
+/// "ended during this meeting" mark is spent: it lasts until the shortcut
+/// is pressed outside a meeting, or for at most [`DISMISSED_FOR`].
+fn launch_decision(
+    in_meeting: bool,
+    dismissed_at: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> (bool, bool) {
+    let fresh =
+        dismissed_at.is_some_and(|at| now.duration_since(at).is_ok_and(|age| age < DISMISSED_FOR));
+    match (in_meeting, fresh) {
+        (false, _) => (false, dismissed_at.is_some()),
+        (true, true) => (false, false),
+        (true, false) => (true, dismissed_at.is_some()),
+    }
 }
 
 /// Runs the copilot process until the user ends the session.
@@ -231,6 +270,7 @@ pub fn run_copilot() -> anyhow::Result<()> {
     paths.ensure_directories()?;
     let settings_path = store::settings_path(&paths.config_file);
     let settings = store::load(&settings_path);
+    let marker = dismissed_marker(&settings_path);
     let dictation = agentdictate_runtime::load_settings(&paths.config_file).ok();
     let language = if settings.language.trim().is_empty() {
         dictation
@@ -420,7 +460,11 @@ pub fn run_copilot() -> anyhow::Result<()> {
     tracing::info!("meeting copilot window closed");
     let _ = engine_sender.send(EngineMsg::Action(CopilotAction::End));
     drop(engine_sender);
-    let _ = engine_thread.join();
+    // Ended by the user rather than by the meeting ending: the dictation
+    // shortcut dictates for the rest of this meeting.
+    if engine_thread.join().unwrap_or(false) {
+        let _ = std::fs::write(&marker, b"");
+    }
     drop(tray);
     drop(hotkeys);
     drop(instance);
@@ -430,6 +474,18 @@ pub fn run_copilot() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ending_the_copilot_lets_the_shortcut_dictate_until_the_meeting_ends() {
+        let now = std::time::SystemTime::now();
+        let ended = Some(now - std::time::Duration::from_secs(60));
+        assert_eq!(launch_decision(true, None, now), (true, false));
+        assert_eq!(launch_decision(true, ended, now), (false, false));
+        // Pressed outside a meeting: the mark is spent.
+        assert_eq!(launch_decision(false, ended, now), (false, true));
+        let long_ago = Some(now - DISMISSED_FOR - std::time::Duration::from_secs(1));
+        assert_eq!(launch_decision(true, long_ago, now), (true, true));
+    }
 
     #[test]
     fn model_ids_become_readable_labels() {

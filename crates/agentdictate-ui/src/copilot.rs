@@ -143,6 +143,8 @@ pub struct CopilotViewModel {
     pub models: Vec<ModelChoice>,
     pub shortcuts: CopilotShortcuts,
     pub notice: Option<String>,
+    /// A lasting problem shown on the bar until it clears.
+    pub problem: Option<String>,
     pub ending: bool,
     pub notes_path: Option<String>,
     /// The meeting summary shown when the session ends.
@@ -173,6 +175,7 @@ impl CopilotViewModel {
             models,
             shortcuts: CopilotShortcuts::default(),
             notice: None,
+            problem: None,
             ending: false,
             notes_path: None,
             wrap_up: None,
@@ -425,6 +428,7 @@ impl CopilotViewModel {
             }
             CopilotEvent::Shortcuts(shortcuts) => self.shortcuts = shortcuts,
             CopilotEvent::Notice(notice) => self.notice = Some(notice),
+            CopilotEvent::Problem(problem) => self.problem = problem,
             CopilotEvent::ToggleVisibility => return CopilotEffect::ToggleVisibility,
             CopilotEvent::Show => return CopilotEffect::Show,
             CopilotEvent::FocusAsk => return CopilotEffect::FocusAsk,

@@ -732,8 +732,20 @@ fn rewrites_can_go_through_claude(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn ending_the_session_is_one_click(cx: &mut TestAppContext) {
+fn a_transcription_problem_shows_on_the_bar(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);
+    assert!(!harness.has("copilot-problem"));
+    harness.send(CopilotEvent::Problem(Some(
+        "ChatGPT transcription limit reached. Try again later.".into(),
+    )));
+    assert!(harness.has("copilot-problem"));
+}
+
+#[gpui::test]
+fn ending_the_session_takes_a_confirming_second_click(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.click("copilot-end");
+    assert!(harness.actions().is_empty());
     harness.click("copilot-end");
     assert_eq!(harness.actions(), vec![CopilotAction::End]);
 }
