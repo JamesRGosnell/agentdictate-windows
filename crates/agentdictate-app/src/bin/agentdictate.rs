@@ -113,7 +113,7 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(failures == 0, "{failures} bake-off check(s) failed");
                 Ok(())
             }
-            Some("--questions") => {
+            Some(flag @ ("--questions" | "--answers")) => {
                 let fresh = args.iter().any(|arg| arg == "--fresh");
                 let samples = args
                     .iter()
@@ -126,8 +126,12 @@ fn run() -> anyhow::Result<()> {
                     .filter(|arg| !arg.starts_with("--"))
                     .map(std::path::PathBuf::from)
                     .collect();
-                let failures = agentdictate_app::run_copilot_questions(&files, fresh, samples)?;
-                anyhow::ensure!(failures == 0, "{failures} judge call(s) failed");
+                let failures = if flag == "--answers" {
+                    agentdictate_app::run_copilot_answers(&files, fresh, samples)?
+                } else {
+                    agentdictate_app::run_copilot_questions(&files, fresh, samples)?
+                };
+                anyhow::ensure!(failures == 0, "{failures} model call(s) failed");
                 Ok(())
             }
             Some("--bakeoff-notes") => {

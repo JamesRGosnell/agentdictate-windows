@@ -8,6 +8,8 @@
 // The session runtime is Windows-only; shared logic stays testable elsewhere.
 #![cfg_attr(not(all(windows, feature = "desktop")), allow(dead_code))]
 
+#[cfg(windows)]
+mod answer_eval;
 mod brain;
 #[cfg(windows)]
 mod check;
@@ -171,6 +173,17 @@ pub fn run_copilot_questions(
     samples: usize,
 ) -> anyhow::Result<usize> {
     question_eval::run(files, fresh, samples)
+}
+
+/// Drafts and grades answers to the questions in labelled calls. Returns
+/// the number of failed calls.
+#[cfg(windows)]
+pub fn run_copilot_answers(
+    files: &[std::path::PathBuf],
+    fresh: bool,
+    samples: usize,
+) -> anyhow::Result<usize> {
+    answer_eval::run(files, fresh, samples)
 }
 
 /// Times the wrap-up summary of a long call for each model. Returns the

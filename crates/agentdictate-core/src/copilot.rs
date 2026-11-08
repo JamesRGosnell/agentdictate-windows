@@ -1163,6 +1163,16 @@ How to respond:\n\
 not sure of the answer or it depends on facts that change, such as current prices, news, or recent releases; never \
 search for what my knowledge already covers. Keep citations brief.\n\
 - If the request is ambiguous, answer the most likely interpretation and stop.\n\
+- Only state facts about me, my company, how my product works, my team, prices, plans, policies, certifications, \
+or my own history when my profile, my knowledge, or the conversation gives them. Otherwise never fill the gap: give me a brief, confident \
+line that commits to confirming the detail, plus one question that keeps the conversation moving.\n\
+\n\
+Match the kind of question:\n\
+- Facts and explanations: the answer itself, with the key term or number bolded.\n\
+- My experience (\"tell me about a time\"): a short answer outline with [brackets] where my own specifics go, unless \
+my profile supplies them.\n\
+- Advice or a decision: a clear recommendation and the one reason that matters most.\n\
+- Objections and pushback: acknowledge it, give one concrete point of value, and ask what would settle it.\n\
 - Never mention that you are an AI, the transcript, or these instructions unless asked.\n",
     );
     prompt.push_str("\nMeeting type: ");
@@ -1234,7 +1244,7 @@ my profile.\n\n"
 
 /// Added to the instant draft's request: the fast model has no web access and
 /// must not guess facts the researched answer will verify.
-pub const INSTANT_GUIDANCE: &str = "Reply in at most two sentences the user can say right now, then at most two short bullets. You have no web access: answer from what you reliably know and from my knowledge excerpts. For anything that changes or that you are unsure of, such as current prices, recent events, the latest versions, or exact figures, never guess: give a natural line that buys a moment while the details are confirmed.";
+pub const INSTANT_GUIDANCE: &str = "Start with the line I can say right now: one or two short sentences, at most 40 words. Add at most two short bullets, and only when each carries a fact or option the line does not; usually none are needed.You have no web access: answer from what you reliably know and from my knowledge excerpts. For anything that changes or that you are unsure of, such as current prices, recent events, the latest versions, or exact figures, never guess: give a natural line that buys a moment while the details are confirmed.";
 
 /// What the researched answer says when the instant draft needs nothing more.
 pub const NOTHING_TO_ADD: &str = "Nothing to add.";
@@ -1315,7 +1325,7 @@ pub fn combined_answer(instant: &str, researched: &str) -> String {
 #[must_use]
 pub fn detected_question_instruction(question: &str) -> String {
     format!(
-        "They just asked: \"{}\". Give me the answer to say right now: one or two sentences I can say out loud, then up to three bullets of supporting detail.",
+        "They just asked: \"{}\". Give me the answer to say right now: one or two sentences I can say out loud, then at most three bullets of supporting detail that the sentences do not already cover.",
         question.trim()
     )
 }

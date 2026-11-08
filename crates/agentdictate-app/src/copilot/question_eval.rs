@@ -15,10 +15,10 @@ use std::{
 };
 
 use agentdictate_core::{
-    CopilotEffort, HeardSpan, JUDGE_TRANSCRIPT_CHARS, QUESTION_PAUSE_MS, Situation, Speaker,
-    TranscriptLine, TurnContext, VoiceNames, judge_transcript, kept_talking, parse_turn_verdict,
-    render_transcript, since_user_spoke_ms, turn_candidate, turn_judge_system_prompt,
-    turn_judge_user_prompt, turn_likely_question, utterance_similarity,
+    CopilotEffort, CopilotMode, HeardSpan, JUDGE_TRANSCRIPT_CHARS, QUESTION_PAUSE_MS, Situation,
+    Speaker, TranscriptLine, TurnContext, VoiceNames, judge_transcript, kept_talking,
+    parse_turn_verdict, render_transcript, since_user_spoke_ms, turn_candidate,
+    turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question, utterance_similarity,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,18 +29,21 @@ use super::{
 };
 use crate::codex_subscription::ChatGptCredentials;
 
-const SCRIPTED: &str = include_str!("question_eval.json");
+pub(super) const SCRIPTED: &str = include_str!("question_eval.json");
 /// Matches the engine: verdicts slower than this fall back to the wording.
 const VERDICT_WAIT_MS: u64 = 3_000;
 /// Matches the engine: automatic answers this close together are suppressed.
 const AUTO_ANSWER_COOLDOWN_MS: u64 = 6_000;
-const PARALLEL_JUDGES: usize = 3;
+pub(super) const PARALLEL_JUDGES: usize = 3;
 /// Rate-limited judge calls are retried after these pauses.
-const RETRY_PAUSES_MS: [u64; 4] = [2_000, 5_000, 10_000, 20_000];
+pub(super) const RETRY_PAUSES_MS: [u64; 4] = [2_000, 5_000, 10_000, 20_000];
 
 #[derive(Deserialize)]
-struct EvalCall {
-    meeting: String,
+pub(super) struct EvalCall {
+    pub(super) meeting: String,
+    /// The meeting type the user would pick; answers follow its guidance.
+    #[serde(default)]
+    pub(super) mode: CopilotMode,
     lines: Vec<EvalLine>,
 }
 
@@ -56,24 +59,24 @@ struct EvalLine {
 }
 
 #[derive(Deserialize, Clone, Default)]
-struct EvalLabel {
+pub(super) struct EvalLabel {
     #[serde(default)]
-    worth_answering: bool,
+    pub(super) worth_answering: bool,
     #[serde(default)]
     aimed_at_user: bool,
     #[serde(default)]
-    ambiguous: bool,
+    pub(super) ambiguous: bool,
     #[serde(default)]
     why: String,
 }
 
-struct Line {
-    speaker: Speaker,
-    voice: Option<u8>,
-    text: String,
-    start_ms: u64,
-    end_ms: u64,
-    label: Option<EvalLabel>,
+pub(super) struct Line {
+    pub(super) speaker: Speaker,
+    pub(super) voice: Option<u8>,
+    pub(super) text: String,
+    pub(super) start_ms: u64,
+    pub(super) end_ms: u64,
+    pub(super) label: Option<EvalLabel>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,7 +161,7 @@ fn ratio(part: usize, whole: usize) -> f64 {
     }
 }
 
-fn load_calls(text: &str) -> anyhow::Result<Vec<EvalCall>> {
+pub(super) fn load_calls(text: &str) -> anyhow::Result<Vec<EvalCall>> {
     if text.trim_start().starts_with('[') {
         Ok(serde_json::from_str(text)?)
     } else {
@@ -166,7 +169,7 @@ fn load_calls(text: &str) -> anyhow::Result<Vec<EvalCall>> {
     }
 }
 
-fn prepare(call: &EvalCall) -> (Vec<Line>, VoiceNames) {
+pub(super) fn prepare(call: &EvalCall) -> (Vec<Line>, VoiceNames) {
     let mut voices: BTreeMap<String, u8> = BTreeMap::new();
     let mut names = VoiceNames::new();
     let mut lines: Vec<Line> = call
@@ -237,7 +240,7 @@ fn judge_prompt(lines: &[Line], names: &VoiceNames, index: usize) -> String {
     )
 }
 
-fn cache_key(model: &str, system: &str, user: &str) -> String {
+pub(super) fn cache_key(model: &str, system: &str, user: &str) -> String {
     let digest = Sha256::digest(format!("{model}\0{system}\0{user}").as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -479,12 +482,12 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
     Ok(failures)
 }
 
-fn label_for(file: &Path) -> String {
+pub(super) fn label_for(file: &Path) -> String {
     file.file_stem()
         .map_or_else(|| "file".into(), |stem| stem.to_string_lossy().into_owned())
 }
 
-fn clip(text: &str) -> String {
+pub(super) fn clip(text: &str) -> String {
     let clipped: String = text.chars().take(90).collect();
     if clipped.len() < text.len() {
         format!("\"{clipped}…\"")

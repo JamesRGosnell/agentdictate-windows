@@ -1,6 +1,6 @@
 [
   {
-    "meeting": "sales discovery",
+    "meeting": "sales discovery", "mode": "sales",
     "notes": "The user (James) sells Northwind, an analytics platform. Positives need facts, numbers or an explanation the user may not have ready.",
     "lines": [
       {"t_s": 0, "end_s": 2, "speaker": "Dana", "text": "Hey James, can you hear me okay?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "connection check"}},
@@ -40,7 +40,7 @@
     ]
   },
   {
-    "meeting": "job interview",
+    "meeting": "job interview", "mode": "interview",
     "notes": "The user is the candidate in a software engineering interview.",
     "lines": [
       {"t_s": 0, "end_s": 9, "speaker": "Priya", "text": "So I'm Priya, I lead the platform team here, we mostly work on billing and internal tooling.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "intro"}},
@@ -100,7 +100,7 @@
     ]
   },
   {
-    "meeting": "french sales call",
+    "meeting": "french sales call", "mode": "sales",
     "notes": "Canadian French prospect; questions in French need answers too.",
     "lines": [
       {"t_s": 0, "end_s": 3, "speaker": "Julie", "text": "Bonjour James, merci d'être là.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "greeting"}},
