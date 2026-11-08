@@ -233,10 +233,38 @@ fn http_failure(service: &str, status: StatusCode, body: &str) -> String {
         status if status.is_server_error() => format!("{service} is temporarily unavailable."),
         status => format!("{service} returned HTTP {}.", status.as_u16()),
     };
+    let resets = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/resets_in_seconds")
+                .and_then(Value::as_u64)
+        })
+        .map(|seconds| format!(" It resets in about {}.", wait_label(seconds)))
+        .unwrap_or_default();
+    let mut detail: String = detail.chars().take(240).collect();
+    if !resets.is_empty() && !detail.is_empty() && !detail.ends_with(['.', '!', '?']) {
+        detail.push('.');
+    }
     if detail.is_empty() {
-        summary
+        format!("{summary}{resets}")
     } else {
-        format!("{summary} {}", detail.chars().take(240).collect::<String>())
+        format!("{summary} {detail}{resets}")
+    }
+}
+
+/// "45 min", "3 h 20 min", or "29 days" for a usage-limit reset.
+fn wait_label(seconds: u64) -> String {
+    let minutes = seconds.div_ceil(60).max(1);
+    if minutes < 60 {
+        format!("{minutes} min")
+    } else if minutes < 48 * 60 {
+        match minutes % 60 {
+            0 => format!("{} h", minutes / 60),
+            rest => format!("{} h {rest} min", minutes / 60),
+        }
+    } else {
+        format!("{} days", minutes.div_ceil(24 * 60))
     }
 }
 
@@ -870,6 +898,15 @@ mod tests {
         assert_eq!(
             message,
             "ChatGPT rate limit reached. Try again shortly. slow down"
+        );
+        let exhausted = http_failure(
+            "ChatGPT",
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"The usage limit has been reached","resets_in_seconds":12000}}"#,
+        );
+        assert!(
+            exhausted.ends_with("It resets in about 3 h 20 min."),
+            "{exhausted}"
         );
     }
 }

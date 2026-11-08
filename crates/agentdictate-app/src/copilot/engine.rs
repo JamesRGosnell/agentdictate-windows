@@ -24,8 +24,8 @@ use agentdictate_core::{
     answer_system_prompt, answer_user_prompt, call_view_system_prompt, call_view_user_prompt,
     combined_answer, detected_question_instruction, insights_system_prompt, insights_user_prompt,
     is_echo_of, judge_transcript, kept_talking, meeting_notes_markdown, notes_system_prompt,
-    parse_call_view, parse_insights, parse_turn_verdict, render_transcript, researched_guidance,
-    rewrite_instruction, since_user_spoke_ms, split_follow_up, turn_candidate,
+    only_listening, parse_call_view, parse_insights, parse_turn_verdict, render_transcript,
+    researched_guidance, rewrite_instruction, since_user_spoke_ms, split_follow_up, turn_candidate,
     turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question,
     typed_question_instruction, utterance_similarity,
 };
@@ -1350,6 +1350,7 @@ impl Engine {
             || self.ending
             || !self.insights.situation.user_takes_part()
             || !turn_candidate(&text)
+            || only_listening(&self.transcript, self.elapsed_ms())
         {
             return;
         }

@@ -131,6 +131,34 @@ pub fn since_user_spoke_ms(lines: &[TranscriptLine], now_ms: u64) -> Option<u64>
         .map(|index| now_ms.saturating_sub(lines[index].at_ms))
 }
 
+/// How far back [`only_listening`] looks.
+const LISTENING_WINDOW_MS: u64 = 5 * 60_000;
+/// Microphone lines that echo the other side, at least this many...
+const LISTENING_ECHO_LINES: usize = 3;
+/// ...while the user said no more than this many words of their own, mean
+/// the user is only listening, such as to a video playing on speakers.
+const LISTENING_OWN_WORDS: usize = 12;
+
+/// Whether the microphone has recently heard mostly the other side's audio
+/// echoing back and hardly a word from the user, so nothing is said to them.
+#[must_use]
+pub fn only_listening(lines: &[TranscriptLine], now_ms: u64) -> bool {
+    let since = now_ms.saturating_sub(LISTENING_WINDOW_MS);
+    let mut echoes = 0;
+    let mut own_words = 0;
+    for index in 0..lines.len() {
+        if lines[index].speaker != Speaker::Me || lines[index].at_ms < since {
+            continue;
+        }
+        if is_echo_line(lines, index) {
+            echoes += 1;
+        } else {
+            own_words += spoken_words(&lines[index].text.to_lowercase()).len();
+        }
+    }
+    echoes >= LISTENING_ECHO_LINES && own_words <= LISTENING_OWN_WORDS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +234,49 @@ mod tests {
         assert!(turn_likely_question(
             "Do you have SOC 2? Our security team will ask."
         ));
+    }
+
+    fn heard(speaker: Speaker, text: &str, at_s: u64) -> TranscriptLine {
+        TranscriptLine {
+            id: at_s,
+            speaker,
+            text: text.into(),
+            at_ms: at_s * 1_000,
+            voice: None,
+        }
+    }
+
+    #[test]
+    fn a_microphone_hearing_only_echo_means_the_user_is_listening() {
+        let mut lines = vec![
+            heard(
+                Speaker::Them,
+                "Deal size for event planning was thirty four thousand",
+                0,
+            ),
+            heard(Speaker::Me, "event planning was thirty four thousand", 1),
+            heard(
+                Speaker::Them,
+                "What's holding you back right now in the business",
+                10,
+            ),
+            heard(Speaker::Me, "holding you back right now", 11),
+            heard(Speaker::Me, "Average.", 15),
+            heard(
+                Speaker::Them,
+                "So why do you think this can scale to the next level",
+                20,
+            ),
+            heard(Speaker::Me, "you think this can scale", 21),
+        ];
+        assert!(only_listening(&lines, 25_000));
+        lines.push(heard(
+            Speaker::Me,
+            "Honestly I think the margins are the real problem we have to fix first",
+            24,
+        ));
+        assert!(!only_listening(&lines, 25_000));
+        // Echo long ago no longer counts.
+        assert!(!only_listening(&lines[..4], 20 * 60_000));
     }
 }

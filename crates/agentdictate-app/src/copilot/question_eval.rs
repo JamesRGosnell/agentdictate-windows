@@ -10,14 +10,17 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
 use agentdictate_core::{
     CopilotEffort, CopilotMode, HeardSpan, JUDGE_TRANSCRIPT_CHARS, QUESTION_PAUSE_MS, Situation,
     Speaker, TranscriptLine, TurnContext, VoiceNames, judge_transcript, kept_talking,
-    parse_turn_verdict, render_transcript, since_user_spoke_ms, turn_candidate,
+    only_listening, parse_turn_verdict, render_transcript, since_user_spoke_ms, turn_candidate,
     turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question, utterance_similarity,
 };
 use serde::{Deserialize, Serialize};
@@ -214,9 +217,9 @@ pub(super) fn prepare(call: &EvalCall) -> (Vec<Line>, VoiceNames) {
     (lines, names)
 }
 
-fn judge_prompt(lines: &[Line], names: &VoiceNames, index: usize) -> String {
-    let now_ms = lines[index].end_ms;
-    let transcript: Vec<TranscriptLine> = lines[..=index]
+/// The transcript as the engine holds it when line `index` ends.
+fn transcript_until(lines: &[Line], index: usize) -> Vec<TranscriptLine> {
+    lines[..=index]
         .iter()
         .enumerate()
         .map(|(id, line)| TranscriptLine {
@@ -226,7 +229,12 @@ fn judge_prompt(lines: &[Line], names: &VoiceNames, index: usize) -> String {
             at_ms: line.start_ms,
             voice: line.voice,
         })
-        .collect();
+        .collect()
+}
+
+fn judge_prompt(lines: &[Line], names: &VoiceNames, index: usize) -> String {
+    let now_ms = lines[index].end_ms;
+    let transcript = transcript_until(lines, index);
     let me_last_spoke_secs =
         since_user_spoke_ms(&transcript[..index], now_ms).map(|since| since / 1_000);
     turn_judge_user_prompt(
@@ -285,6 +293,12 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
     );
 
     let system = turn_judge_system_prompt();
+    let exhausted = AtomicBool::new(false);
+    let save = |cache: &Mutex<HashMap<String, Verdict>>| {
+        if let Ok(text) = serde_json::to_string(&*cache.lock().unwrap()) {
+            let _ = std::fs::write(&cache_path, text);
+        }
+    };
     let mut failures = 0;
     let mut calls = 0;
     let mut latencies = Vec::new();
@@ -295,7 +309,9 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
             let (lines, names) = prepare(call);
             let candidates: Vec<usize> = (0..lines.len())
                 .filter(|&index| {
-                    lines[index].speaker == Speaker::Them && turn_candidate(&lines[index].text)
+                    lines[index].speaker == Speaker::Them
+                        && turn_candidate(&lines[index].text)
+                        && !only_listening(&transcript_until(&lines, index), lines[index].end_ms)
                 })
                 .collect();
             for sample in 0..samples {
@@ -325,6 +341,9 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
                                     job
                                 };
                                 let Some((index, key, user)) = job else { break };
+                                if exhausted.load(Ordering::Relaxed) {
+                                    break;
+                                }
                                 if let Some(verdict) = cache.lock().unwrap().get(key).copied() {
                                     verdicts.lock().unwrap().insert(*index, verdict);
                                     continue;
@@ -371,12 +390,20 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
                                     cache.lock().unwrap().insert(key.clone(), verdict);
                                 } else if let Err(error) = &respond {
                                     eprintln!("judge failed: {error}");
+                                    if error.contains("usage limit") {
+                                        exhausted.store(true, Ordering::Relaxed);
+                                    }
                                 }
                                 verdicts.lock().unwrap().insert(*index, verdict);
                             }
                         });
                     }
                 });
+                save(&cache);
+                anyhow::ensure!(
+                    !exhausted.load(Ordering::Relaxed),
+                    "the plan's usage limit was reached; verdicts so far are saved, run again later"
+                );
                 let verdicts = verdicts.into_inner().unwrap();
                 calls += verdicts.len();
                 failures += verdicts.values().filter(|v| v.respond.is_none()).count();
@@ -481,10 +508,7 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
     if let Some(median) = latencies.get(latencies.len() / 2) {
         println!("judge calls {calls}, failed {failures}, median {median} ms");
     }
-    let cache = cache.into_inner().unwrap();
-    if let Ok(text) = serde_json::to_string(&cache) {
-        let _ = std::fs::write(&cache_path, text);
-    }
+    save(&cache);
     Ok(failures)
 }
 
