@@ -19,20 +19,21 @@ use std::{
 use agentdictate_core::{
     AnswerStatus, BrainSource, CallView, CopilotAction, CopilotEffort, CopilotEvent,
     CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft, HeardSpan, INSTANT_GUIDANCE,
-    ListenState, ModelChoice, QUESTION_PAUSE_MS, QuickAction, RewriteEngine, RewriteStyle, Speaker,
-    SpeakerLabels, TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt,
-    call_view_system_prompt, call_view_user_prompt, combined_answer, detected_question_instruction,
-    insights_system_prompt, insights_user_prompt, is_echo_of, judge_transcript, kept_talking,
-    meeting_notes_markdown, notes_system_prompt, parse_call_view, parse_insights,
-    parse_turn_verdict, render_transcript, researched_guidance, rewrite_instruction,
-    since_user_spoke_ms, split_follow_up, turn_candidate, turn_judge_system_prompt,
-    turn_judge_user_prompt, turn_likely_question, typed_question_instruction, utterance_similarity,
+    JUDGE_TRANSCRIPT_CHARS, ListenState, ModelChoice, QUESTION_PAUSE_MS, QuickAction,
+    RewriteEngine, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, TurnContext,
+    answer_system_prompt, answer_user_prompt, call_view_system_prompt, call_view_user_prompt,
+    combined_answer, detected_question_instruction, insights_system_prompt, insights_user_prompt,
+    is_echo_of, judge_transcript, kept_talking, meeting_notes_markdown, notes_system_prompt,
+    parse_call_view, parse_insights, parse_turn_verdict, render_transcript, researched_guidance,
+    rewrite_instruction, since_user_spoke_ms, split_follow_up, turn_candidate,
+    turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question,
+    typed_question_instruction, utterance_similarity,
 };
 
 use super::{
     knowledge::{Knowledge, fingerprint},
     names::{Clue, Roster},
-    providers::{AnswerProvider, AnswerRequest, complete},
+    providers::{AnswerProvider, AnswerRequest, complete, replacement_for},
     reveal::RevealGate,
     stream::StreamEvent,
     vad::{SegmentEvent, Utterance, wav_bytes},
@@ -59,7 +60,7 @@ const INSTANT_WAIT: Duration = Duration::from_secs(8);
 const CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 const IDLE_TICK: Duration = Duration::from_millis(250);
 /// How long the wrap-up stays open when the user leaves it alone.
-const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(180);
+const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ECHO_WAIT: Duration = Duration::from_secs(4);
 /// Longest a microphone line waits for the other side to finish speaking;
 /// covers the longest system-audio utterance (18 s) plus its transcription.
@@ -1288,7 +1289,35 @@ impl Engine {
         (self.ui)(CopilotEvent::Transcript(line));
     }
 
+    /// Switches the saved answer and draft models to the ones that actually
+    /// answered when the service rejected the chosen ones, so the header
+    /// names the real model and later sessions skip the failed request.
+    fn adopt_working_models(&mut self) {
+        let answer = replacement_for(&self.settings.answer_model());
+        let fast = replacement_for(&self.settings.fast_model());
+        if answer.is_none() && fast.is_none() {
+            return;
+        }
+        let mut settings = self.settings.clone();
+        let mut switched = Vec::new();
+        if let Some(model) = answer {
+            switched.push(format!("{} \u{2192} {model}", settings.answer_model()));
+            settings.set_answer_model(model);
+        }
+        if let Some(model) = fast {
+            switched.push(format!("{} \u{2192} {model}", settings.fast_model()));
+            settings.set_fast_model(model);
+        }
+        tracing::info!(?switched, "switched to the models the service accepts");
+        self.update_settings(settings);
+        (self.ui)(CopilotEvent::Notice(format!(
+            "Your plan doesn't offer that model; using {}",
+            switched.join(", ")
+        )));
+    }
+
     fn handle_answer_finished(&mut self, id: u64, title: String, text: String) {
+        self.adopt_working_models();
         if self
             .active_answer
             .as_ref()
@@ -1371,7 +1400,7 @@ impl Engine {
                 &render_transcript(
                     &judge_transcript(&self.transcript),
                     &self.roster.names(),
-                    INSIGHTS_TRANSCRIPT_CHARS,
+                    JUDGE_TRANSCRIPT_CHARS,
                 ),
                 latest,
                 context,
@@ -2428,7 +2457,7 @@ impl Engine {
     /// Keeps the wrap-up open for copying the follow-up and opening the
     /// notes, until the user is done with it.
     fn wrap_up(&mut self, incoming: &Receiver<EngineMsg>) {
-        let deadline = Instant::now() + WRAP_UP_TIMEOUT;
+        let mut deadline = Instant::now() + WRAP_UP_TIMEOUT;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match incoming.recv_timeout(left) {
                 Ok(EngineMsg::Action(CopilotAction::End)) => return,
@@ -2439,9 +2468,11 @@ impl Engine {
                     | CopilotAction::OpenNotesFolder
                     | CopilotAction::OpenUrl(_)),
                 )) => {
+                    deadline = Instant::now() + WRAP_UP_TIMEOUT;
                     self.handle_action(action);
                 }
                 Ok(EngineMsg::ShowRequested | EngineMsg::Hotkey(_)) => {
+                    deadline = Instant::now() + WRAP_UP_TIMEOUT;
                     (self.ui)(CopilotEvent::Show);
                 }
                 Ok(_) => {}
@@ -2698,6 +2729,23 @@ mod tests {
             messages,
         );
         (engine, incoming, events, requests, directory)
+    }
+
+    #[test]
+    fn a_rejected_answer_model_is_replaced_by_the_one_that_worked() {
+        let mut settings = CopilotSettings::default();
+        settings.set_answer_model("test-adopt-rejected");
+        let (mut engine, _incoming, events, _requests, _directory) = harness(settings);
+        super::super::providers::remember_replacements(
+            &["test-adopt-rejected".to_owned()],
+            "test-adopt-working",
+        );
+        engine.adopt_working_models();
+        assert_eq!(engine.settings.answer_model(), "test-adopt-working");
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::Notice(notice) if notice.contains("test-adopt-working")
+        )));
     }
 
     #[test]

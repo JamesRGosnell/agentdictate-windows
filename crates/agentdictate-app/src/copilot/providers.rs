@@ -174,6 +174,30 @@ fn prefer_accepted(models: &mut [String]) {
     models.sort_by_key(|model| rejected.contains(model));
 }
 
+/// Rejected models and the model that answered in their place.
+static REPLACEMENTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// The model that answered when `model` was rejected in this process.
+pub(crate) fn replacement_for(model: &str) -> Option<String> {
+    REPLACEMENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(rejected, _)| rejected == model)
+        .map(|(_, working)| working.clone())
+}
+
+pub(crate) fn remember_replacements(rejected: &[String], working: &str) {
+    let mut replacements = REPLACEMENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for model in rejected {
+        if !replacements.iter().any(|(known, _)| known == model) {
+            replacements.push((model.clone(), working.to_owned()));
+        }
+    }
+}
+
 fn remember_rejected(model: &str) {
     let mut rejected = REJECTED_MODELS
         .lock()
@@ -278,6 +302,7 @@ impl AnswerProvider for ResponsesProvider {
         };
         let mut refreshed = false;
         let mut index = 0;
+        let mut rejected_here: Vec<String> = Vec::new();
         while index < models.len() {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
@@ -308,6 +333,7 @@ impl AnswerProvider for ResponsesProvider {
                 .map_err(|error| format!("Could not reach {service}: {error}"))?;
             let status = response.status();
             if status.is_success() {
+                remember_replacements(&rejected_here, model);
                 return pump_sse(response, cancel, sink, parse_responses_event);
             }
             let body = response.text().unwrap_or_default();
@@ -320,6 +346,7 @@ impl AnswerProvider for ResponsesProvider {
             }
             if is_model_rejection(status, &body) && index + 1 < models.len() {
                 remember_rejected(model);
+                rejected_here.push(model.clone());
                 tracing::warn!(
                     model,
                     status = status.as_u16(),
@@ -690,6 +717,16 @@ pub(crate) fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_model_maps_to_the_one_that_answered() {
+        remember_replacements(&["test-gone-model".to_owned()], "test-working-model");
+        assert_eq!(
+            replacement_for("test-gone-model").as_deref(),
+            Some("test-working-model")
+        );
+        assert_eq!(replacement_for("test-other-model"), None);
+    }
 
     #[test]
     fn rejected_models_are_tried_last() {
