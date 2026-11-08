@@ -1473,7 +1473,7 @@ pub fn parse_call_view(response: &str) -> Option<CallView> {
     Some(view)
 }
 
-const QUESTION_OPENERS: [&str; 24] = [
+pub(crate) const QUESTION_OPENERS: [&str; 24] = [
     "what", "why", "how", "when", "where", "who", "which", "can", "could", "would", "will",
     "should", "do", "does", "did", "is", "are", "was", "were", "have", "has", "tell", "explain",
     "walk",
@@ -1490,7 +1490,7 @@ const SMALL_TALK: [&str; 8] = [
     "how have you been",
 ];
 
-fn spoken_words(normalized: &str) -> Vec<&str> {
+pub(crate) fn spoken_words(normalized: &str) -> Vec<&str> {
     normalized
         .split(|character: char| !character.is_alphanumeric() && character != '\'')
         .filter(|word| !word.is_empty())
@@ -1582,13 +1582,7 @@ pub fn is_echo_of(mine: &str, theirs: &str) -> bool {
 /// user to respond now, with help.
 #[must_use]
 pub const fn turn_judge_system_prompt() -> &'static str {
-    "You decide, during a live call, whether the user (\"Me\") should respond now to the latest line from \"Them\". \
-Answer true when that line asks Me a question, asks Me to do or explain something, or raises a concern or objection \
-Me needs to address, even without a question mark. Answer false for rhetorical questions, questions the speaker answers \
-or moves past, questions or remarks to someone else or to an audience, small talk, acknowledgments, and statements \
-that need no reply. When Me has not been speaking, Them may be talking to each other or to a camera, as in a video, \
-webinar, or podcast: answer true only if the line clearly addresses Me. \
-Respond with ONLY {\"answer\": true} or {\"answer\": false}."
+    "During a live call, you decide whether to show the user (\"Me\") an AI answer to the latest line from \"Them\". Showing one interrupts Me, so answer true only when ALL of these hold: (1) the line is addressed to Me: not to someone else by name, not to an audience, not a host asking a guest, and not part of a recording, podcast, or webinar Me is only watching. Me's microphone can also carry another person in the room with Me; when Them talks to or about that person (by another name, as \"she\" or \"he\", or about their life), it is not addressed to Me. (2) it asks Me for something Me must reply to now: a question (a question mark anywhere in the line counts, and short follow-ups like \"And the timeline?\" count), a request to explain or describe, a problem Me is expected to solve, or an objection or concern Me must address, even when phrased as a statement (\"I'm curious how refunds work\"). (3) an answer on screen would actually help: Me would benefit from facts, numbers, definitions, product or technical knowledge, advice, or help phrasing a hard reply. Answer false for small talk and greetings, questions about Me's personal life or facts Me knows instantly (\"did you get my text\", \"how was your trip\"), checks like \"can you hear me\" or \"do you see the chart?\", requests to do something rather than say something (\"send me the link\", \"click on that\"), sentence fragments, rhetorical questions, questions Them answers or moves past, and acknowledgments. Lines from Me that repeat Them's words are Them's audio echoing into Me's microphone, not Me speaking; when Me's lines are only such echoes, Me is just listening. In a casual or personal conversation between friends, answer true only for a direct factual or technical question to Me that Me is unlikely to know offhand, never for questions about what Me's side just said or about their life. Respond with ONLY {\"answer\": true} or {\"answer\": false}."
 }
 
 /// What the turn judge knows beyond the transcript.

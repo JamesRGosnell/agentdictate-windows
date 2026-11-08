@@ -113,6 +113,23 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(failures == 0, "{failures} bake-off check(s) failed");
                 Ok(())
             }
+            Some("--questions") => {
+                let fresh = args.iter().any(|arg| arg == "--fresh");
+                let samples = args
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("--samples="))
+                    .and_then(|count| count.parse().ok())
+                    .unwrap_or(1);
+                let files: Vec<std::path::PathBuf> = args
+                    .iter()
+                    .skip(2)
+                    .filter(|arg| !arg.starts_with("--"))
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                let failures = agentdictate_app::run_copilot_questions(&files, fresh, samples)?;
+                anyhow::ensure!(failures == 0, "{failures} judge call(s) failed");
+                Ok(())
+            }
             Some("--bakeoff-notes") => {
                 let failures =
                     agentdictate_app::run_copilot_notes_bakeoff(args.get(2..).unwrap_or_default())?;

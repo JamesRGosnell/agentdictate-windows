@@ -18,14 +18,15 @@ use std::{
 
 use agentdictate_core::{
     AnswerStatus, BrainSource, CallView, CopilotAction, CopilotEffort, CopilotEvent,
-    CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft, INSTANT_GUIDANCE, ListenState,
-    ModelChoice, QuickAction, RewriteEngine, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine,
-    TurnContext, answer_system_prompt, answer_user_prompt, call_view_system_prompt,
-    call_view_user_prompt, combined_answer, detected_question_instruction, insights_system_prompt,
-    insights_user_prompt, is_echo_of, looks_like_question, meeting_notes_markdown,
-    notes_system_prompt, parse_call_view, parse_insights, parse_turn_verdict, render_transcript,
-    researched_guidance, rewrite_instruction, split_follow_up, turn_judge_system_prompt,
-    turn_judge_user_prompt, typed_question_instruction, utterance_similarity, worth_judging,
+    CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft, HeardSpan, INSTANT_GUIDANCE,
+    ListenState, ModelChoice, QUESTION_PAUSE_MS, QuickAction, RewriteEngine, RewriteStyle, Speaker,
+    SpeakerLabels, TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt,
+    call_view_system_prompt, call_view_user_prompt, combined_answer, detected_question_instruction,
+    insights_system_prompt, insights_user_prompt, is_echo_of, judge_transcript, kept_talking,
+    meeting_notes_markdown, notes_system_prompt, parse_call_view, parse_insights,
+    parse_turn_verdict, render_transcript, researched_guidance, rewrite_instruction,
+    since_user_spoke_ms, split_follow_up, turn_candidate, turn_judge_system_prompt,
+    turn_judge_user_prompt, turn_likely_question, typed_question_instruction, utterance_similarity,
 };
 
 use super::{
@@ -67,9 +68,6 @@ const ECHO_WAIT_WHILE_SPEAKING: Duration = Duration::from_secs(30);
 /// source. Echo is heard while they speak, so this only absorbs timing drift
 /// between the two captures; a reply that starts after they finish is kept.
 const ECHO_WINDOW_MS: u64 = 500;
-/// Silence after the other side's question before answering it: someone
-/// asking you something waits; a rhetorical question runs straight on.
-const QUESTION_PAUSE_MS: u64 = 1_000;
 /// Turns still waiting this long, for example while sound keeps playing, are
 /// dropped as stale.
 const TURN_EXPIRY: Duration = Duration::from_secs(8);
@@ -82,10 +80,6 @@ const TURN_VERDICT_WAIT: Duration = Duration::from_secs(3);
 const ONE_ON_ONE_VERDICT_WAIT: Duration = Duration::from_millis(1_500);
 /// The user spoke this recently, so they are in the conversation.
 const ONE_ON_ONE_RECENT_MS: u64 = 120_000;
-/// System-audio speech starting this long after a question ended is new
-/// speech. The segmenter needs over half a second of silence to end an
-/// utterance, while another device's copy of the question starts with it.
-const RESUMED_SPEECH_MS: u64 = 300;
 /// How long the other side must have been speaking before the meeting
 /// window is read for who it shows speaking: apps highlight the speaker
 /// after a moment.
@@ -336,6 +330,8 @@ struct PendingTurn {
     id: u64,
     text: String,
     end_ms: u64,
+    /// The other side's voice that spoke the line, when told apart.
+    voice: Option<u8>,
     verdict: Option<bool>,
     /// Worded like a question, so an answer is drafted before the verdict.
     likely: bool,
@@ -1192,9 +1188,10 @@ impl Engine {
                     return;
                 }
                 let text = line.text.clone();
+                let voice = line.voice;
                 self.publish(line);
                 self.resolve_pending_mine(false);
-                self.consider_turn(text, end_ms);
+                self.consider_turn(text, end_ms, voice);
             }
             Speaker::Me => {
                 let nearby = self.nearby_them(start_ms, end_ms);
@@ -1306,11 +1303,11 @@ impl Engine {
     /// respond. A line worded like a question gets its answer drafted at once,
     /// hidden until the judgment and a pause confirm it, so confirming adds no
     /// delay; other lines are answered once the judge asks for it.
-    fn consider_turn(&mut self, text: String, end_ms: u64) {
+    fn consider_turn(&mut self, text: String, end_ms: u64, voice: Option<u8>) {
         if !self.settings.auto_answer
             || self.ending
             || !self.insights.situation.user_takes_part()
-            || !worth_judging(&text)
+            || !turn_candidate(&text)
         {
             return;
         }
@@ -1318,7 +1315,7 @@ impl Engine {
         let id = self.next_turn;
         self.next_turn += 1;
         self.request_turn_verdict(id, &text);
-        let likely = looks_like_question(&text);
+        let likely = turn_likely_question(&text);
         let draft = if likely && self.active_answer.is_none() && self.may_auto_answer(&text) {
             self.answer_with(
                 AnswerKind::Detected {
@@ -1339,6 +1336,7 @@ impl Engine {
             id,
             text,
             end_ms,
+            voice,
             verdict: None,
             likely,
             draft,
@@ -1358,7 +1356,7 @@ impl Engine {
             system: turn_judge_system_prompt().to_owned(),
             user: turn_judge_user_prompt(
                 &render_transcript(
-                    &self.transcript,
+                    &judge_transcript(&self.transcript),
                     &self.roster.names(),
                     INSIGHTS_TRANSCRIPT_CHARS,
                 ),
@@ -1425,10 +1423,18 @@ impl Engine {
         let Some(turn) = self.pending_turn.as_ref() else {
             return;
         };
-        let resumed = self
-            .them_spans
-            .iter()
-            .any(|span| span.start_ms >= turn.end_ms + RESUMED_SPEECH_MS);
+        let resumed = self.them_spans.iter().any(|span| {
+            kept_talking(
+                turn.end_ms,
+                turn.voice,
+                &HeardSpan {
+                    start_ms: span.start_ms,
+                    end_ms: span.end_ms,
+                    voice: span.voice,
+                    text: span.text.as_deref(),
+                },
+            )
+        });
         if resumed {
             tracing::info!("the other side kept talking; not answering");
             self.drop_turn();
@@ -1475,14 +1481,10 @@ impl Engine {
         self.maybe_auto_answer(turn.text);
     }
 
-    /// How long ago the user last spoke, if they have.
+    /// How long ago the user last spoke, if they have, ignoring the other
+    /// side's audio echoing into the microphone.
     fn since_me_spoke_ms(&self) -> Option<u64> {
-        let now_ms = self.elapsed_ms();
-        self.transcript
-            .iter()
-            .rev()
-            .find(|line| line.speaker == Speaker::Me)
-            .map(|line| now_ms.saturating_sub(line.at_ms))
+        since_user_spoke_ms(&self.transcript, self.elapsed_ms())
     }
 
     /// Whether the user is talking with one person: a single voice on the
@@ -2753,6 +2755,7 @@ mod tests {
             id: 1,
             text: "What is the price?".into(),
             end_ms: 0,
+            voice: None,
             verdict: Some(true),
             likely: true,
             draft: None,
@@ -2978,6 +2981,7 @@ mod tests {
                 id: 1,
                 text: "What does pricing look like for a team of ten?".into(),
                 end_ms: 3_000,
+                voice: None,
                 verdict: None,
                 likely: true,
                 draft: None,

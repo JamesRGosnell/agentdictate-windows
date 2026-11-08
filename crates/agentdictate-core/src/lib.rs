@@ -8,6 +8,7 @@ mod replacements;
 mod settings;
 mod snapshots;
 mod textfmt;
+mod turns;
 mod workflow;
 
 pub use copilot::*;
@@ -18,4 +19,5 @@ pub use replacements::*;
 pub use settings::*;
 pub use snapshots::*;
 pub use textfmt::*;
+pub use turns::*;
 pub use workflow::*;

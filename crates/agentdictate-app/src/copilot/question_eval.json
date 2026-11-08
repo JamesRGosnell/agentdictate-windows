@@ -1,0 +1,145 @@
+[
+  {
+    "meeting": "sales discovery",
+    "notes": "The user (James) sells Northwind, an analytics platform. Positives need facts, numbers or an explanation the user may not have ready.",
+    "lines": [
+      {"t_s": 0, "end_s": 2, "speaker": "Dana", "text": "Hey James, can you hear me okay?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "connection check"}},
+      {"t_s": 3, "end_s": 4, "speaker": "me", "text": "Loud and clear, thanks for making the time."},
+      {"t_s": 5, "end_s": 11, "speaker": "Dana", "text": "Of course. So we're a team of about forty analysts and we've outgrown our spreadsheets, honestly.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "context, no request"}},
+      {"t_s": 12, "end_s": 13, "speaker": "me", "text": "That's a common story."},
+      {"t_s": 14, "end_s": 18, "speaker": "Dana", "text": "I was wondering what pricing looks like for a team our size.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "statement-form pricing question"}},
+      {"t_s": 19, "end_s": 27, "speaker": "me", "text": "For forty seats on the Growth plan it's about twenty thousand a year, and annual billing saves a fair bit."},
+      {"t_s": 28, "end_s": 29, "speaker": "Dana", "text": "Okay.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "acknowledgment"}},
+      {"t_s": 30, "end_s": 34, "speaker": "Dana", "text": "Do you have SOC 2? Our security team will ask for it in the audit.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "question mark mid-line, compliance fact"}},
+      {"t_s": 35, "end_s": 40, "speaker": "me", "text": "Yes, we have SOC 2 Type II and I can send the report under NDA."},
+      {"t_s": 41, "end_s": 43, "speaker": "Dana", "text": "How would you handle", "label": {"worth_answering": false, "aimed_at_user": true, "why": "first half of a split question"}},
+      {"t_s": 43.6, "end_s": 47, "speaker": "Dana", "text": "a migration off NetSuite for all our historical data?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "second half of a split question"}},
+      {"t_s": 48, "end_s": 56, "speaker": "me", "text": "We'd run a bulk import of the historical tables and then keep a nightly sync until cutover."},
+      {"t_s": 57, "end_s": 62, "speaker": "Dana", "text": "It's always the data that bites you, isn't it? Anyway.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "rhetorical tag question"}},
+      {"t_s": 63, "end_s": 64, "speaker": "Dana", "text": "And onboarding?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "short follow-up question needing facts"}},
+      {"t_s": 65, "end_s": 71, "speaker": "me", "text": "Onboarding is included for teams over twenty-five seats, usually two weeks."},
+      {"t_s": 72, "end_s": 78, "speaker": "Dana", "text": "What would stop us from just building this ourselves on Postgres? I mean, we could, but we'd rather not.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "objection the user must address"}},
+      {"t_s": 79, "end_s": 88, "speaker": "me", "text": "You could, but you'd own the modeling layer, permissions and the dashboards forever."},
+      {"t_s": 89, "end_s": 91, "speaker": "Dana", "text": "Makes sense. Let me loop in my boss.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "statement"}}
+    ]
+  },
+  {
+    "meeting": "backchannel after a question",
+    "notes": "Two people on the other side; the second one says mm-hmm right after the first asks the user something.",
+    "lines": [
+      {"t_s": 0, "end_s": 5, "speaker": "Omar", "text": "Thanks for joining, James. Lucia is on with me too.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "intro"}},
+      {"t_s": 6, "end_s": 7, "speaker": "Lucia", "text": "Hi there.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "greeting"}},
+      {"t_s": 8, "end_s": 9, "speaker": "me", "text": "Hi both."},
+      {"t_s": 10, "end_s": 15, "speaker": "Omar", "text": "What's the difference between your Team and Enterprise tiers?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "factual product question"}},
+      {"t_s": 15.5, "end_s": 16, "speaker": "Lucia", "text": "Mm-hmm.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "backchannel from another voice"}},
+      {"t_s": 18, "end_s": 26, "speaker": "me", "text": "Enterprise adds single sign-on, audit logs and a dedicated success manager."},
+      {"t_s": 27, "end_s": 31, "speaker": "Lucia", "text": "Omar, did you send them our data retention policy?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "addressed to a colleague by name"}},
+      {"t_s": 32, "end_s": 34, "speaker": "Omar", "text": "Not yet, I'll do it today.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "colleague answering"}},
+      {"t_s": 35, "end_s": 40, "speaker": "Lucia", "text": "James, how long do you keep deleted records around?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "named question to the user needing policy facts"}},
+      {"t_s": 41, "end_s": 47, "speaker": "me", "text": "Thirty days in the trash, then they're purged from backups within ninety."}
+    ]
+  },
+  {
+    "meeting": "job interview",
+    "notes": "The user is the candidate in a software engineering interview.",
+    "lines": [
+      {"t_s": 0, "end_s": 9, "speaker": "Priya", "text": "So I'm Priya, I lead the platform team here, we mostly work on billing and internal tooling.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "intro"}},
+      {"t_s": 10, "end_s": 14, "speaker": "Priya", "text": "Walk me through how you'd design a rate limiter for a public API.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "imperative technical question"}},
+      {"t_s": 15, "end_s": 40, "speaker": "me", "text": "I'd start with a token bucket per API key, stored in Redis, with a sliding window for bursts."},
+      {"t_s": 41, "end_s": 42, "speaker": "Priya", "text": "Okay, nice.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "acknowledgment"}},
+      {"t_s": 43, "end_s": 47, "speaker": "Priya", "text": "What happens when the Redis node goes down?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "follow-up technical question"}},
+      {"t_s": 48, "end_s": 60, "speaker": "me", "text": "Fail open for a short window and alert, since blocking every customer is worse than a brief overage."},
+      {"t_s": 61, "end_s": 66, "speaker": "Priya", "text": "Tell me about a time you disagreed with a technical decision.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "behavioural question, phrasing help"}},
+      {"t_s": 67, "end_s": 90, "speaker": "me", "text": "On my last team we wanted to adopt microservices early, and I pushed for a modular monolith first."},
+      {"t_s": 91, "end_s": 95, "speaker": "Priya", "text": "Does that make sense with how we work? We're pretty small.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "thinking aloud, speaker continues", "ambiguous": true}},
+      {"t_s": 95.5, "end_s": 100, "speaker": "Priya", "text": "Honestly it does, we went through the same thing last year.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "speaker answers own question"}},
+      {"t_s": 101, "end_s": 104, "speaker": "Priya", "text": "Okay, what questions do you have for me?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "candidate needs good questions to ask"}}
+    ]
+  },
+  {
+    "meeting": "standup with names",
+    "notes": "Group standup; the user is James, an engineer. Most questions go to other people by name.",
+    "lines": [
+      {"t_s": 0, "end_s": 4, "speaker": "Kai", "text": "Morning everyone, let's go around quickly.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "facilitation"}},
+      {"t_s": 5, "end_s": 9, "speaker": "Kai", "text": "Priya, where are we on the invoice migration?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "named question to someone else"}},
+      {"t_s": 10, "end_s": 18, "speaker": "Priya", "text": "About eighty percent done, the backfill runs tonight.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "colleague status"}},
+      {"t_s": 19, "end_s": 23, "speaker": "Kai", "text": "Great. Any blockers, Sam?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "named question to someone else"}},
+      {"t_s": 24, "end_s": 27, "speaker": "Sam", "text": "Nope, all good on my side.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "colleague status"}},
+      {"t_s": 28, "end_s": 33, "speaker": "Kai", "text": "James, what's the ETA on the checkout bug?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "own status the user knows"}},
+      {"t_s": 34, "end_s": 38, "speaker": "me", "text": "Should land tomorrow, the fix is in review."},
+      {"t_s": 39, "end_s": 46, "speaker": "Sam", "text": "James, remind me, what's the difference between idempotency keys and request IDs in our API?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "explanation question to the user"}},
+      {"t_s": 47, "end_s": 56, "speaker": "me", "text": "Idempotency keys let a retry be applied once; request IDs are only for tracing."},
+      {"t_s": 57, "end_s": 61, "speaker": "Kai", "text": "Cool, anything else from anyone?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "open floor to the group"}}
+    ]
+  },
+  {
+    "meeting": "webinar video",
+    "notes": "The user is watching a recorded webinar and never speaks; nothing is aimed at the user.",
+    "lines": [
+      {"t_s": 0, "end_s": 6, "speaker": "Host", "text": "Welcome back everyone to the growth playbook series.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "broadcast"}},
+      {"t_s": 7, "end_s": 12, "speaker": "Host", "text": "How many of you have struggled to price a new product?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "question to an audience"}},
+      {"t_s": 13, "end_s": 22, "speaker": "Host", "text": "So why do you think usage-based pricing took off the way it did?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "host asks the guest"}},
+      {"t_s": 23, "end_s": 40, "speaker": "Guest", "text": "Because it lines up what customers pay with the value they actually get.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "guest answer"}},
+      {"t_s": 41, "end_s": 47, "speaker": "Host", "text": "What should a founder do first when the numbers don't work?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "host asks the guest"}},
+      {"t_s": 48, "end_s": 60, "speaker": "Guest", "text": "Talk to the ten customers who churned last month before touching price.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "guest answer"}}
+    ]
+  },
+  {
+    "meeting": "support call",
+    "notes": "The user is a support engineer; the customer describes problems mostly as statements.",
+    "lines": [
+      {"t_s": 0, "end_s": 7, "speaker": "Customer", "text": "Hi, I keep getting a 403 error when I call the reports endpoint with my new API key.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "problem statement needing diagnosis"}},
+      {"t_s": 8, "end_s": 12, "speaker": "me", "text": "Okay, did you create the key in the same workspace?"},
+      {"t_s": 13, "end_s": 16, "speaker": "Customer", "text": "Yeah, same workspace.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "answering the user"}},
+      {"t_s": 17, "end_s": 19, "speaker": "Customer", "text": "How do I check its scopes?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "how-to question"}},
+      {"t_s": 20, "end_s": 26, "speaker": "me", "text": "Open Settings, then API keys, and the scopes are listed beside each key."},
+      {"t_s": 27, "end_s": 30, "speaker": "Customer", "text": "Oh, it only has read on dashboards.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "observation"}},
+      {"t_s": 31, "end_s": 33, "speaker": "Customer", "text": "Can I add scopes without rotating it?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "product how-to"}},
+      {"t_s": 34, "end_s": 40, "speaker": "me", "text": "No, scopes are fixed, so you'd create a new key and revoke the old one."},
+      {"t_s": 41, "end_s": 44, "speaker": "Customer", "text": "Ugh, of course. Okay, doing it now.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "statement"}}
+    ]
+  },
+  {
+    "meeting": "french sales call",
+    "notes": "Canadian French prospect; questions in French need answers too.",
+    "lines": [
+      {"t_s": 0, "end_s": 3, "speaker": "Julie", "text": "Bonjour James, merci d'être là.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "greeting"}},
+      {"t_s": 4, "end_s": 9, "speaker": "Julie", "text": "Combien ça coûte pour une équipe de quarante personnes?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "pricing question in French"}},
+      {"t_s": 10, "end_s": 16, "speaker": "me", "text": "Pour quarante personnes, c'est environ vingt mille par année."},
+      {"t_s": 17, "end_s": 22, "speaker": "Julie", "text": "Et vos données sont hébergées au Canada?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "data residency question"}},
+      {"t_s": 23, "end_s": 28, "speaker": "me", "text": "Oui, on a une région à Montréal."},
+      {"t_s": 29, "end_s": 32, "speaker": "Julie", "text": "Parfait, c'est noté.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "acknowledgment"}}
+    ]
+  },
+  {
+    "meeting": "personal call with a companion",
+    "notes": "Casual call with a friend; the microphone also carries someone in the room with the user. Nothing needs an AI answer.",
+    "lines": [
+      {"t_s": 0, "end_s": 3, "speaker": "Thomas", "text": "Yo, what's up man, how are you?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "small talk"}},
+      {"t_s": 4, "end_s": 6, "speaker": "me", "text": "Good, good. Sarah's here too."},
+      {"t_s": 7, "end_s": 10, "speaker": "Thomas", "text": "Sarah! You're studying medicine, right?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "question to the companion"}},
+      {"t_s": 11, "end_s": 14, "speaker": "me", "text": "Yeah, third year, it's a lot."},
+      {"t_s": 15, "end_s": 20, "speaker": "Thomas", "text": "Do you want to be a dermatologist or something?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "question to the companion"}},
+      {"t_s": 21, "end_s": 25, "speaker": "me", "text": "Maybe, I like the hours."},
+      {"t_s": 26, "end_s": 33, "speaker": "Thomas", "text": "Man, I signed up for a marathon. Why did I do that, what the hell?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "rhetorical"}},
+      {"t_s": 34, "end_s": 37, "speaker": "Thomas", "text": "Did you get the money I sent?", "label": {"worth_answering": false, "aimed_at_user": true, "why": "personal fact the user knows"}},
+      {"t_s": 38, "end_s": 40, "speaker": "me", "text": "Yeah, got it, thanks."},
+      {"t_s": 41, "end_s": 45, "speaker": "Thomas", "text": "Is it the twelfth or thirteenth of December?", "label": {"worth_answering": false, "aimed_at_user": false, "why": "thinking aloud, answers himself", "ambiguous": true}},
+      {"t_s": 46, "end_s": 47, "speaker": "Thomas", "text": "Twelfth, yeah.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "self answer"}},
+      {"t_s": 48, "end_s": 51, "speaker": "Thomas", "text": "Show me, show me the dog.", "label": {"worth_answering": false, "aimed_at_user": true, "why": "request to act, not to answer"}}
+    ]
+  },
+  {
+    "meeting": "advisor call",
+    "notes": "The user is a consultant; the client asks for numbers and explanations, sometimes without a question mark from the transcriber.",
+    "lines": [
+      {"t_s": 0, "end_s": 6, "speaker": "Client", "text": "We closed last quarter at about two hundred thousand in recurring revenue.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "context"}},
+      {"t_s": 7, "end_s": 12, "speaker": "Client", "text": "what's a healthy net revenue retention for a company our size", "label": {"worth_answering": true, "aimed_at_user": true, "why": "question without punctuation"}},
+      {"t_s": 13, "end_s": 20, "speaker": "me", "text": "For early stage B2B, above one hundred percent is good, one twenty is great."},
+      {"t_s": 21, "end_s": 26, "speaker": "Client", "text": "Can you speak to how we'd even measure that monthly?", "label": {"worth_answering": true, "aimed_at_user": true, "why": "indirect request for explanation"}},
+      {"t_s": 27, "end_s": 35, "speaker": "me", "text": "Take this month's revenue from customers who existed twelve months ago, divided by their revenue back then."},
+      {"t_s": 36, "end_s": 39, "speaker": "Client", "text": "Right, right, that's what I figured.", "label": {"worth_answering": false, "aimed_at_user": false, "why": "acknowledgment"}},
+      {"t_s": 40, "end_s": 47, "speaker": "Client", "text": "I'm curious whether we should raise prices before or after the next funding round.", "label": {"worth_answering": true, "aimed_at_user": true, "why": "statement-form advice request"}}
+    ]
+  }
+]

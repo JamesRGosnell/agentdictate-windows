@@ -16,6 +16,8 @@ mod knowledge;
 mod meeting;
 mod names;
 mod providers;
+#[cfg(windows)]
+mod question_eval;
 mod reveal;
 mod store;
 mod stream;
@@ -158,6 +160,17 @@ pub fn run_copilot_primer(instant: Option<&str>) -> anyhow::Result<usize> {
 #[cfg(windows)]
 pub fn run_copilot_bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize> {
     check::bakeoff(rounds, models)
+}
+
+/// Scores which lines of labelled calls the copilot would answer. Returns
+/// the number of failed judge calls.
+#[cfg(windows)]
+pub fn run_copilot_questions(
+    files: &[std::path::PathBuf],
+    fresh: bool,
+    samples: usize,
+) -> anyhow::Result<usize> {
+    question_eval::run(files, fresh, samples)
 }
 
 /// Times the wrap-up summary of a long call for each model. Returns the
