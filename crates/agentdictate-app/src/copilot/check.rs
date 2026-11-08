@@ -1146,3 +1146,631 @@ fn one_line(text: &str) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     line.chars().take(140).collect()
 }
+
+/// One timed model run.
+struct Timed {
+    first_ms: Option<u128>,
+    total_ms: u128,
+    searches: usize,
+    text: String,
+}
+
+fn timed(
+    provider: &dyn providers::AnswerProvider,
+    request: &AnswerRequest,
+) -> Result<Timed, String> {
+    let started = Instant::now();
+    let cancel = AtomicBool::new(false);
+    let mut first = None;
+    let mut searches = 0;
+    let mut text = String::new();
+    provider.stream(request, &cancel, &mut |event| match event {
+        StreamEvent::Text(delta) => {
+            first.get_or_insert_with(|| started.elapsed().as_millis());
+            text.push_str(&delta);
+        }
+        StreamEvent::Searching(_) => searches += 1,
+        _ => {}
+    })?;
+    Ok(Timed {
+        first_ms: first,
+        total_ms: started.elapsed().as_millis(),
+        searches,
+        text,
+    })
+}
+
+/// Results for one model in one role.
+#[derive(Default)]
+struct Tally {
+    firsts: Vec<u128>,
+    totals: Vec<u128>,
+    passed: usize,
+    runs: usize,
+}
+
+fn median(values: &[u128]) -> String {
+    if values.is_empty() {
+        return "-".to_owned();
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    format!("{:.1} s", sorted[sorted.len() / 2] as f64 / 1000.0)
+}
+
+/// Compares models role by role on one realistic sales call: the turn judge,
+/// the instant line, rewrites, and research. Every model gets the same
+/// prompts; each run is timed to first text and completion and its facts are
+/// checked. `claude:<model>` runs through the Claude Code CLI.
+pub(crate) fn bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize> {
+    use std::collections::BTreeMap;
+
+    use agentdictate_core::{CopilotProvider, RewriteStyle, rewrite_instruction};
+
+    let mut report = Report { failures: 0 };
+    let paths = crate::AppPaths::from_environment()?;
+    let settings = store::load(&store::settings_path(&paths.config_file));
+    let chatgpt = Arc::new(ChatGptCredentials::discover());
+    let quick: Vec<String> = if models.is_empty() {
+        [
+            "gpt-6-luna",
+            "gpt-5.6-luna",
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "claude:haiku",
+            "claude:sonnet",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    } else {
+        models.to_vec()
+    };
+    let researchers: Vec<String> = if models.is_empty() {
+        ["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "claude:sonnet"]
+            .map(str::to_owned)
+            .to_vec()
+    } else {
+        models.to_vec()
+    };
+    let lane = |model: &str| -> Result<(Box<dyn providers::AnswerProvider>, String), String> {
+        let mut lane = settings.clone();
+        let model = match model.strip_prefix("claude:") {
+            Some(model) => {
+                lane.provider = CopilotProvider::ClaudeCode;
+                model
+            }
+            None => {
+                lane.provider = CopilotProvider::ChatgptSubscription;
+                model
+            }
+        };
+        lane.set_answer_model(model.to_owned());
+        Ok((
+            providers::provider_for(&lane, &chatgpt, "", &[])?,
+            model.to_owned(),
+        ))
+    };
+
+    // A sales handbook of about 25,000 characters, as the primer carries it.
+    let mut handbook = String::from(
+        "[sales-handbook.md]\n# Northwind Sales Handbook\n\n\
+## Pricing\nGrowth plan: $49 per seat per month, or $470 per seat per year billed annually. \
+Enterprise plan: $79 per seat per month, or $790 per seat per year billed annually, minimum 50 seats. \
+Teams over 25 seats get onboarding included.\n\n\
+## Discounts\nReps may offer up to 15% off for a two-year commitment. Anything beyond that needs the VP of Sales.\n\n\
+## Security\nNorthwind is SOC 2 Type II certified, audited every year by Prescient Assurance. \
+Customer data is stored in AWS Canada (Montreal, ca-central-1) or AWS US-East, chosen at signup.\n\n\
+## Reliability\nThe Enterprise plan guarantees 99.95% monthly uptime, with service credits of 10% per 0.1% below it.\n\n\
+## Integrations\nNative integrations: Salesforce, HubSpot, and NetSuite. Everything else connects through Zapier. \
+NetSuite migrations are run by our onboarding team and usually take two weeks.\n\n\
+## Competitors\nAcme Inventory charges $55 per seat per month and cannot sync stock across multiple warehouses. \
+Northwind syncs every warehouse in near real time.\n\n",
+    );
+    for index in 0..60 {
+        handbook.push_str(&format!(
+            "## Product note {index}\nThe Northwind module {index} syncs inventory every {} minutes, supports {} warehouses, \
+and is included in the Growth and Enterprise plans. Customers in retail and logistics use it to cut stockouts.\n\n",
+            5 + index % 10,
+            2 + index % 7
+        ));
+    }
+    let system = answer_system_prompt(&settings, &handbook);
+    println!(
+        "Bake-off: {rounds} round(s), {} characters of knowledge\n  quick roles: {}\n  research: {}",
+        handbook.len(),
+        quick.join(", "),
+        researchers.join(", ")
+    );
+
+    let line = |id: u64, speaker: Speaker, text: &str| TranscriptLine {
+        id,
+        speaker,
+        text: text.to_owned(),
+        at_ms: id * 4_000,
+        voice: None,
+    };
+    let call = vec![
+        line(
+            1,
+            Speaker::Me,
+            "Thanks for making the time. Happy to walk you through Northwind.",
+        ),
+        line(
+            2,
+            Speaker::Them,
+            "Sure. We run three warehouses and we're about forty people on the ops side.",
+        ),
+        line(3, Speaker::Me, "Got it, that's right in our sweet spot."),
+    ];
+    let transcript = render_transcript(&call, &VoiceNames::new(), 8_000);
+
+    // The turn judge: should Me answer the latest line?
+    let judge_cases: [(&str, bool, Option<u64>); 4] = [
+        ("What would forty seats cost us per year?", true, Some(4)),
+        ("Yeah, okay, that makes sense.", false, Some(3)),
+        (
+            "I'm a bit worried about migrating everything off NetSuite.",
+            true,
+            Some(5),
+        ),
+        (
+            "So today I'm going to show you three ways to cut stockouts in your warehouse.",
+            false,
+            None,
+        ),
+    ];
+    // The instant line: the question and a fact the answer must carry.
+    let questions: [(&str, &[&str]); 5] = [
+        (
+            "What would forty seats on the Growth plan cost us per year?",
+            &["18,800", "18800"],
+        ),
+        ("Do you have SOC 2?", &["Type II", "Type 2"]),
+        (
+            "Where would our data live? We're based in Toronto.",
+            &["Canada", "Montreal", "ca-central"],
+        ),
+        (
+            "Honestly, Acme is cheaper. Why would we pay more?",
+            &["warehouse"],
+        ),
+        (
+            "Can you do anything on price if we sign for two years?",
+            &["15"],
+        ),
+    ];
+    // Rewrites of a drafted line.
+    let long_line = "For forty seats on the growth plan, it comes to about twenty thousand a year, \
+and annual billing saves you a fair bit compared with paying monthly.";
+    let draft = "Great question. For forty seats you'd be on our growth plan. Let me give you the exact number.";
+    let researched = format!(
+        "{draft}\n\nFor 40 seats on annual billing it's $18 per seat per month, about $8,640 a year."
+    );
+    let rewrites: [(&str, RewriteStyle, &str, String, &[&str]); 3] = [
+        (
+            "shorter",
+            RewriteStyle::Shorter,
+            long_line,
+            String::new(),
+            &[],
+        ),
+        (
+            "specific",
+            RewriteStyle::Specific,
+            long_line,
+            String::new(),
+            &["18,800", "470"],
+        ),
+        (
+            "from research",
+            RewriteStyle::Specific,
+            draft,
+            researched,
+            &["8,640", "18"],
+        ),
+    ];
+
+    let mut tallies: BTreeMap<(&str, String), Tally> = BTreeMap::new();
+    let mut record = |report: &mut Report,
+                      role: &'static str,
+                      model: &str,
+                      item: &str,
+                      outcome: Result<Timed, String>,
+                      check: &dyn Fn(&Timed) -> Option<String>| {
+        let tally = tallies.entry((role, model.to_owned())).or_default();
+        tally.runs += 1;
+        let label = format!("{role} {model}: {item}");
+        match outcome {
+            Ok(run) => {
+                if let Some(first) = run.first_ms {
+                    tally.firsts.push(first);
+                }
+                tally.totals.push(run.total_ms);
+                let detail = format!(
+                    "first {} ms, done {} ms{}: {}",
+                    run.first_ms.unwrap_or_default(),
+                    run.total_ms,
+                    if run.searches > 0 {
+                        format!(", {} search(es)", run.searches)
+                    } else {
+                        String::new()
+                    },
+                    one_line(&run.text)
+                );
+                match check(&run) {
+                    None => {
+                        tally.passed += 1;
+                        report.pass(&label, detail);
+                    }
+                    Some(problem) => report.fail(&label, format!("{problem} ({detail})")),
+                }
+            }
+            Err(error) => report.fail(&label, error),
+        }
+    };
+    let plain_line = |text: &str| {
+        let first = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        let first = first.trim();
+        let lower = text.to_lowercase();
+        // Answers quote the line to say; anything else first is a preamble.
+        if first.starts_with(['#', '-', '*', '\u{2022}']) {
+            Some("does not open with a line to say".to_owned())
+        } else if ["handbook", "my knowledge", "my documents", "the documents"]
+            .iter()
+            .any(|tell| lower.contains(tell))
+        {
+            Some("mentions its sources".to_owned())
+        } else {
+            None
+        }
+    };
+
+    for round in 1..=rounds {
+        println!("\n== Round {round} ==");
+        for model in &quick {
+            let (provider, id) = match lane(model) {
+                Ok(lane) => lane,
+                Err(error) => {
+                    report.fail(model, error);
+                    continue;
+                }
+            };
+            let key = uuid::Uuid::new_v4().to_string();
+            for (latest, expected, me_last) in judge_cases {
+                let request = AnswerRequest {
+                    system: turn_judge_system_prompt().to_owned(),
+                    user: turn_judge_user_prompt(
+                        &transcript,
+                        latest,
+                        TurnContext {
+                            situation: Situation::Conversation,
+                            me_last_spoke_secs: me_last,
+                        },
+                    ),
+                    image_jpeg: None,
+                    model: id.clone(),
+                    effort: CopilotEffort::Low,
+                    web_search: false,
+                    max_output_tokens: 200,
+                    cache_key: format!("{key}-judge"),
+                };
+                record(
+                    &mut report,
+                    "judge",
+                    model,
+                    latest,
+                    timed(provider.as_ref(), &request),
+                    &|run| match parse_turn_verdict(&run.text) {
+                        Some(verdict) if verdict == expected => None,
+                        Some(verdict) => Some(format!("judged {verdict}, expected {expected}")),
+                        None => Some("no verdict".to_owned()),
+                    },
+                );
+            }
+            for (question, facts) in questions {
+                let request = AnswerRequest {
+                    system: system.clone(),
+                    user: answer_user_prompt(
+                        &transcript,
+                        &detected_question_instruction(question),
+                        false,
+                        "",
+                    ),
+                    image_jpeg: None,
+                    model: id.clone(),
+                    effort: CopilotEffort::Low,
+                    web_search: false,
+                    max_output_tokens: 1024,
+                    cache_key: format!("{key}-instant"),
+                };
+                record(
+                    &mut report,
+                    "instant",
+                    model,
+                    question,
+                    timed(provider.as_ref(), &request),
+                    &|run| {
+                        if !facts.iter().any(|fact| run.text.contains(fact)) {
+                            Some(format!("missing {}", facts[0]))
+                        } else {
+                            plain_line(&run.text)
+                        }
+                    },
+                );
+            }
+            for (label, style, original, details, facts) in &rewrites {
+                let request = AnswerRequest {
+                    system: system.clone(),
+                    user: answer_user_prompt(
+                        &transcript,
+                        &rewrite_instruction(*style, original, details),
+                        false,
+                        "",
+                    ),
+                    image_jpeg: None,
+                    model: id.clone(),
+                    effort: CopilotEffort::Low,
+                    web_search: false,
+                    max_output_tokens: 400,
+                    cache_key: format!("{key}-rewrite"),
+                };
+                record(
+                    &mut report,
+                    "rewrite",
+                    model,
+                    label,
+                    timed(provider.as_ref(), &request),
+                    &|run| {
+                        let text = run.text.trim();
+                        let words = text.split_whitespace().count();
+                        if text.is_empty()
+                            || text.contains('\n')
+                            || text.starts_with(['"', '\u{201c}'])
+                        {
+                            Some("not a single plain line".to_owned())
+                        } else if *style == RewriteStyle::Shorter && words > 22 {
+                            Some(format!("{words} words"))
+                        } else if !facts.is_empty() && !facts.iter().any(|fact| text.contains(fact))
+                        {
+                            Some(format!("missing {}", facts[0]))
+                        } else {
+                            plain_line(text)
+                        }
+                    },
+                );
+            }
+        }
+        for model in &researchers {
+            let (provider, id) = match lane(model) {
+                Ok(lane) => lane,
+                Err(error) => {
+                    report.fail(model, error);
+                    continue;
+                }
+            };
+            let key = uuid::Uuid::new_v4().to_string();
+            for (question, wants_search, fact) in [
+                (
+                    "What uptime does your Enterprise plan guarantee?",
+                    false,
+                    "99.95",
+                ),
+                (
+                    "What's the latest stable version of the Rust compiler?",
+                    true,
+                    "",
+                ),
+            ] {
+                let request = AnswerRequest {
+                    system: system.clone(),
+                    user: answer_user_prompt(
+                        &transcript,
+                        &detected_question_instruction(question),
+                        false,
+                        "",
+                    ),
+                    image_jpeg: None,
+                    model: id.clone(),
+                    effort: settings.effort,
+                    web_search: true,
+                    max_output_tokens: 4096,
+                    cache_key: key.clone(),
+                };
+                record(
+                    &mut report,
+                    "research",
+                    model,
+                    question,
+                    timed(provider.as_ref(), &request),
+                    &|run| {
+                        if (run.searches > 0) != wants_search {
+                            Some(format!(
+                                "{} search",
+                                if wants_search {
+                                    "expected a"
+                                } else {
+                                    "unneeded"
+                                }
+                            ))
+                        } else if !run.text.contains(fact) {
+                            Some(format!("missing {fact}"))
+                        } else {
+                            None
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    println!("\n== Summary (median first text / median done / checks passed) ==");
+    for role in ["judge", "instant", "rewrite", "research"] {
+        println!("{role}:");
+        for ((_, model), tally) in tallies.iter().filter(|((name, _), _)| *name == role) {
+            println!(
+                "  {model:<16} first {:>6}  done {:>6}  passed {}/{}",
+                median(&tally.firsts),
+                median(&tally.totals),
+                tally.passed,
+                tally.runs
+            );
+        }
+    }
+    Ok(report.failures)
+}
+
+/// Times the wrap-up summary of an hour-long call for each model, as
+/// `summarize` sends it, and checks it keeps the decision, the action item,
+/// and the follow-up email.
+pub(crate) fn notes_bakeoff(models: &[String]) -> anyhow::Result<usize> {
+    use agentdictate_core::{CopilotProvider, notes_system_prompt};
+
+    let mut report = Report { failures: 0 };
+    let paths = crate::AppPaths::from_environment()?;
+    let settings = store::load(&store::settings_path(&paths.config_file));
+    let chatgpt = Arc::new(ChatGptCredentials::discover());
+    let models: Vec<String> = if models.is_empty() {
+        [
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "claude:haiku",
+            "claude:sonnet",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    } else {
+        models.to_vec()
+    };
+    let topics = [
+        "how stock moves between the Hamilton and Mississauga warehouses",
+        "the NetSuite migration and who owns the data mapping",
+        "seasonal spikes before Black Friday and how forecasts are set",
+        "the Shopify storefront and returns processing",
+        "reporting for the finance team at month end",
+        "training the night shift on the scanners",
+    ];
+    let mut lines = Vec::new();
+    let mut id = 0;
+    let mut push = |speaker: Speaker, text: String| {
+        id += 1;
+        lines.push(TranscriptLine {
+            id,
+            speaker,
+            text,
+            at_ms: id * 7_000,
+            voice: None,
+        });
+    };
+    for round in 0..80 {
+        let topic = topics[round % topics.len()];
+        push(
+            Speaker::Them,
+            format!(
+                "Right now our biggest headache is {topic}; we lose about {} hours a week on it.",
+                3 + round % 9
+            ),
+        );
+        push(
+            Speaker::Me,
+            format!(
+                "That's common. Northwind handles {topic} with live sync, so most teams get those hours back within a month."
+            ),
+        );
+        push(
+            Speaker::Them,
+            format!(
+                "Okay. And how would that work with our setup, given we're about {} people on that side?",
+                10 + round % 30
+            ),
+        );
+        push(
+            Speaker::Me,
+            "We'd map it during onboarding, which is included over twenty-five seats, and I'll show you the dashboard for it next time.".to_owned(),
+        );
+        if round == 40 {
+            push(
+                Speaker::Them,
+                "Let's do it: we'll run a pilot with the Hamilton warehouse starting November 3."
+                    .to_owned(),
+            );
+            push(
+                Speaker::Me,
+                "Great, I'll send the security questionnaire and the pilot agreement by Friday."
+                    .to_owned(),
+            );
+        }
+    }
+    let transcript = render_transcript(&lines, &VoiceNames::new(), 60_000);
+    println!(
+        "Notes bake-off: {} lines, {} characters of transcript",
+        lines.len(),
+        transcript.len()
+    );
+    for model in &models {
+        let mut lane = settings.clone();
+        let id = match model.strip_prefix("claude:") {
+            Some(id) => {
+                lane.provider = CopilotProvider::ClaudeCode;
+                id
+            }
+            None => {
+                lane.provider = CopilotProvider::ChatgptSubscription;
+                model.as_str()
+            }
+        };
+        lane.set_answer_model(id.to_owned());
+        let provider = match providers::provider_for(&lane, &chatgpt, "", &[]) {
+            Ok(provider) => provider,
+            Err(error) => {
+                report.fail(model, error);
+                continue;
+            }
+        };
+        let request = AnswerRequest {
+            system: notes_system_prompt().to_owned(),
+            user: format!("<transcript>\n{transcript}\n</transcript>"),
+            image_jpeg: None,
+            model: id.to_owned(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 2048,
+            cache_key: uuid::Uuid::new_v4().to_string(),
+        };
+        let label = format!("notes {model}");
+        match timed(provider.as_ref(), &request) {
+            Ok(run) => {
+                let mut problems = Vec::new();
+                if !run.text.contains("November 3") {
+                    problems.push("no pilot date");
+                }
+                if !run.text.to_lowercase().contains("questionnaire") {
+                    problems.push("no action item");
+                }
+                if !run.text.contains("Subject:") {
+                    problems.push("no email subject");
+                }
+                if run.total_ms > 30_000 {
+                    problems.push("over the 30 s wrap-up limit");
+                }
+                let detail = format!(
+                    "first {} ms, done {} ms, {} chars: {}",
+                    run.first_ms.unwrap_or_default(),
+                    run.total_ms,
+                    run.text.len(),
+                    one_line(&run.text)
+                );
+                if problems.is_empty() {
+                    report.pass(&label, detail);
+                } else {
+                    report.fail(&label, format!("{} ({detail})", problems.join(", ")));
+                }
+            }
+            Err(error) => report.fail(&label, error),
+        }
+    }
+    Ok(report.failures)
+}

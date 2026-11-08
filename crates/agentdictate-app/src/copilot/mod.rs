@@ -153,6 +153,20 @@ pub fn run_copilot_primer(instant: Option<&str>) -> anyhow::Result<usize> {
     check::primer(instant)
 }
 
+/// Compares models role by role on one realistic call. Returns the number
+/// of failed checks.
+#[cfg(windows)]
+pub fn run_copilot_bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize> {
+    check::bakeoff(rounds, models)
+}
+
+/// Times the wrap-up summary of a long call for each model. Returns the
+/// number of failed checks.
+#[cfg(windows)]
+pub fn run_copilot_notes_bakeoff(models: &[String]) -> anyhow::Result<usize> {
+    check::notes_bakeoff(models)
+}
+
 /// Reads the meeting window once, as live naming does. Returns the number of
 /// failed checks.
 #[cfg(windows)]

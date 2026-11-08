@@ -103,6 +103,22 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(failures == 0, "{failures} rewrite check(s) failed");
                 Ok(())
             }
+            Some("--bakeoff") => {
+                let rest = args.get(2..).unwrap_or_default();
+                let (rounds, models) = match rest.first().and_then(|arg| arg.parse().ok()) {
+                    Some(rounds) => (rounds, &rest[1..]),
+                    None => (2, rest),
+                };
+                let failures = agentdictate_app::run_copilot_bakeoff(rounds, models)?;
+                anyhow::ensure!(failures == 0, "{failures} bake-off check(s) failed");
+                Ok(())
+            }
+            Some("--bakeoff-notes") => {
+                let failures =
+                    agentdictate_app::run_copilot_notes_bakeoff(args.get(2..).unwrap_or_default())?;
+                anyhow::ensure!(failures == 0, "{failures} notes check(s) failed");
+                Ok(())
+            }
             Some("--primer") => {
                 let failures =
                     agentdictate_app::run_copilot_primer(args.get(2).map(String::as_str))?;
