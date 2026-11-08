@@ -15,10 +15,10 @@ use std::{
 };
 
 use agentdictate_core::{
-    CopilotEffort, HeardSpan, QUESTION_PAUSE_MS, Situation, Speaker, TranscriptLine, TurnContext,
-    VoiceNames, judge_transcript, kept_talking, parse_turn_verdict, render_transcript,
-    since_user_spoke_ms, turn_candidate, turn_judge_system_prompt, turn_judge_user_prompt,
-    turn_likely_question, utterance_similarity,
+    CopilotEffort, HeardSpan, JUDGE_TRANSCRIPT_CHARS, QUESTION_PAUSE_MS, Situation, Speaker,
+    TranscriptLine, TurnContext, VoiceNames, judge_transcript, kept_talking, parse_turn_verdict,
+    render_transcript, since_user_spoke_ms, turn_candidate, turn_judge_system_prompt,
+    turn_judge_user_prompt, turn_likely_question, utterance_similarity,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,8 +30,6 @@ use super::{
 use crate::codex_subscription::ChatGptCredentials;
 
 const SCRIPTED: &str = include_str!("question_eval.json");
-/// Matches the engine: transcript budget for the judge.
-const JUDGE_TRANSCRIPT_CHARS: usize = 8_000;
 /// Matches the engine: verdicts slower than this fall back to the wording.
 const VERDICT_WAIT_MS: u64 = 3_000;
 /// Matches the engine: automatic answers this close together are suppressed.

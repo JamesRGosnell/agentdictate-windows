@@ -27,6 +27,10 @@ pub struct HeardSpan<'a> {
     pub text: Option<&'a str>,
 }
 
+/// How much of the latest transcript the turn judge reads. A 3,000-character
+/// cap measured no faster and no more accurate on the question evaluation.
+pub const JUDGE_TRANSCRIPT_CHARS: usize = 8_000;
+
 /// Backchannels from another voice this short do not end a turn.
 const BACKCHANNEL_WORDS: usize = 3;
 /// Untranscribed speech from another voice this brief is a backchannel.
