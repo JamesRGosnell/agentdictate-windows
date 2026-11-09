@@ -342,24 +342,34 @@ pub fn run_copilot() -> anyhow::Result<()> {
         Arc::new(move |wav: Vec<u8>, language: &str| {
             // A meeting sends many short requests; ride out brief rate limits
             // and network blips instead of dropping what was said.
-            let mut attempt = 0;
-            let result = loop {
-                match transcribe_wav_with_chatgpt(&client, &chatgpt, &wav, language) {
-                    Err(error) if attempt < 2 && is_transient_failure(&error) => {
-                        attempt += 1;
-                        tracing::warn!(%error, attempt, "retrying copilot transcription");
-                        std::thread::sleep(std::time::Duration::from_millis(1_500 * attempt));
+            let with_retries = |transcribe: &dyn Fn() -> Result<String, String>| {
+                let mut attempt = 0;
+                loop {
+                    match transcribe() {
+                        Err(error) if attempt < 2 && is_transient_failure(&error) => {
+                            attempt += 1;
+                            tracing::warn!(%error, attempt, "retrying copilot transcription");
+                            std::thread::sleep(std::time::Duration::from_millis(1_500 * attempt));
+                        }
+                        result => break result,
                     }
-                    result => break result,
                 }
             };
-            match result {
+            let chatgpt_transcribe =
+                || transcribe_wav_with_chatgpt(&client, &chatgpt, &wav, language);
+            // An OpenAI API key is the user's chosen route for transcription;
+            // the ChatGPT sign-in is the fallback.
+            if openai_key.is_empty() {
+                return with_retries(&chatgpt_transcribe);
+            }
+            match with_retries(&|| {
+                providers::transcribe_wav_with_openai(&client, &openai_key, wav.clone(), language)
+            }) {
                 Ok(text) => Ok(text),
-                Err(error) if !openai_key.is_empty() => {
-                    tracing::warn!(%error, "ChatGPT transcription failed; using the OpenAI API");
-                    providers::transcribe_wav_with_openai(&client, &openai_key, wav, language)
+                Err(error) => {
+                    tracing::warn!(%error, "OpenAI transcription failed; using ChatGPT");
+                    chatgpt_transcribe()
                 }
-                Err(error) => Err(error),
             }
         })
     };

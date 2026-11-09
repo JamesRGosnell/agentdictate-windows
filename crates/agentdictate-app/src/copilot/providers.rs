@@ -703,7 +703,7 @@ pub(crate) fn transcribe_wav_with_openai(
         .map_err(|error| error.to_string())?;
     let mut form = reqwest::blocking::multipart::Form::new()
         .part("file", file)
-        .text("model", "gpt-4o-transcribe")
+        .text("model", "gpt-transcribe")
         .text("response_format", "json");
     if !language.trim().is_empty() {
         form = form.text("language", language.trim().to_owned());

@@ -197,11 +197,32 @@ pub(super) fn section(
         feedback,
     } = model;
     let provider = settings.provider;
-    let key = match provider {
-        CopilotProvider::OpenaiApi => Some(("OpenAI API key", openai_key)),
-        CopilotProvider::AnthropicApi => Some(("Anthropic API key", anthropic_key)),
-        CopilotProvider::ChatgptSubscription | CopilotProvider::ClaudeCode => None,
-    };
+    // The OpenAI key also transcribes the call, so it is always offered.
+    let mut keys = Vec::new();
+    if provider == CopilotProvider::AnthropicApi {
+        keys.push((
+            "copilot-settings-key",
+            "Anthropic API key",
+            "Answers with Claude; stored on this computer",
+            anthropic_key,
+            "copilot-settings-save-key",
+        ));
+    }
+    keys.push((
+        if provider == CopilotProvider::OpenaiApi {
+            "copilot-settings-key"
+        } else {
+            "copilot-settings-openai-key"
+        },
+        "OpenAI API key",
+        if provider == CopilotProvider::OpenaiApi {
+            "Answers and transcribes the call; stored on this computer"
+        } else {
+            "Transcribes the call; stored on this computer"
+        },
+        openai_key,
+        "copilot-settings-save-openai-key",
+    ));
     let answer_model = settings.answer_model();
     let fast_model = settings.fast_model();
 
@@ -335,11 +356,11 @@ pub(super) fn section(
             provider_chips,
             theme,
         ));
-    if let Some((label, input)) = key {
+    for (selector, label, detail, input, save) in keys {
         column = column.child(
             row(theme)
-                .debug_selector(|| "copilot-settings-key".to_owned())
-                .child(label_block(label, "Stored on this computer", theme))
+                .debug_selector(move || selector.to_owned())
+                .child(label_block(label, detail, theme))
                 .child(
                     h_flex()
                         .w(px(360.))
@@ -351,7 +372,7 @@ pub(super) fn section(
                                 .flex_1()
                                 .child(Input::new(&input).small()),
                         )
-                        .child(save_button("copilot-settings-save-key", cx)),
+                        .child(save_button(save, cx)),
                 ),
         );
     }

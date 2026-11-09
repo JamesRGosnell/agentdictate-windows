@@ -1931,6 +1931,8 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
     });
     let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
     assert!(harness.has("settings-group-copilot"));
+    // The OpenAI key transcribes the call whatever engine answers.
+    assert!(harness.has("copilot-settings-openai-key"));
     assert!(!harness.has("copilot-settings-key"));
     let top = harness.bounds("copilot-settings-provider-3").top();
     harness.scroll_route_by(-(f32::from(top) - 300.));

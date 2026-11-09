@@ -56,7 +56,7 @@ impl CopilotProvider {
     pub const fn default_answer_model(self) -> &'static str {
         match self {
             Self::ChatgptSubscription => "gpt-6-sol",
-            Self::AnthropicApi => "claude-opus-5-5",
+            Self::AnthropicApi => "claude-sonnet-5-5",
             Self::ClaudeCode => "opus",
             Self::OpenaiApi => "gpt-6.1-sol",
         }

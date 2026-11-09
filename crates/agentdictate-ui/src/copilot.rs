@@ -603,12 +603,12 @@ mod tests {
             ..CopilotSettings::default()
         };
         view.apply(CopilotEvent::Settings(Box::new(settings)));
-        assert_eq!(view.model_label(), "Claude Opus 5.5");
+        assert_eq!(view.model_label(), "Claude Sonnet 5.5");
         view.apply(CopilotEvent::Models(vec![ModelChoice::new(
-            "claude-opus-5-5",
-            "Opus",
+            "claude-sonnet-5-5",
+            "Sonnet",
         )]));
-        assert_eq!(view.model_label(), "Opus");
+        assert_eq!(view.model_label(), "Sonnet");
     }
 
     #[test]
