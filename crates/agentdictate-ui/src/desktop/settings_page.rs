@@ -30,6 +30,7 @@ pub(super) struct SettingsPageModel {
     pub(super) settings_form: Option<SettingsFormState>,
     pub(super) shortcut_capture_active: bool,
     pub(super) shortcut_capture_error: Option<String>,
+    pub(super) copilot: Option<super::copilot_settings::CopilotSectionModel>,
 }
 
 /// Keeps short controls compact while allowing long-form prompts to use the
@@ -81,6 +82,7 @@ pub(super) fn surface(
         settings_form,
         shortcut_capture_active,
         shortcut_capture_error,
+        copilot,
         ..
     } = model;
     let transcription_provider =
@@ -148,7 +150,10 @@ pub(super) fn surface(
                 settings_form.as_ref(),
                 theme,
                 cx,
-            )),
+            ))
+            .when_some(copilot, |page, copilot| {
+                page.child(super::copilot_settings::section(copilot, theme, cx))
+            }),
     )
 }
 

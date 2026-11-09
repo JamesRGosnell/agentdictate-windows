@@ -34,9 +34,10 @@ pub use copilot::{
 };
 #[cfg(feature = "desktop")]
 pub use desktop::{
-    APPLICATION_ID, CopilotActionSink, CopilotWindow, RecordingOverlay, SettingsShell,
-    run_copilot_window, run_recording_overlay, run_settings_shell_with_workspace_actions,
-    run_settings_shell_with_workspace_actions_and_updates,
+    APPLICATION_ID, CopilotActionSink, CopilotSettingsStore, CopilotWindow, RecordingOverlay,
+    SettingsShell, run_copilot_window, run_recording_overlay,
+    run_settings_shell_with_workspace_actions,
+    run_settings_shell_with_workspace_actions_and_updates, set_copilot_settings_store,
 };
 pub use history::{
     HistoryViewModel, RecoveryItemViewModel, RecoveryStage, RecoveryViewModel, TranscriptViewModel,

@@ -748,6 +748,13 @@ fn ending_the_session_takes_a_confirming_second_click(cx: &mut TestAppContext) {
     assert!(harness.actions().is_empty());
     harness.click("copilot-end");
     assert_eq!(harness.actions(), vec![CopilotAction::End]);
+    // The bar goes at once rather than waiting for the notes.
+    assert!(
+        harness
+            .host_calls()
+            .iter()
+            .any(|call| call == "visible false")
+    );
 }
 
 #[gpui::test]

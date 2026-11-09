@@ -16,6 +16,7 @@ use crate::{
     WorkspaceViewModel,
 };
 
+mod copilot_settings;
 mod copilot_view;
 mod history_action_lane;
 mod history_page;
@@ -36,6 +37,7 @@ use settings_shell::{
     RouteUiState, SettingsCommandState, SettingsEditState, ShellLayoutState, WorkspaceActionState,
 };
 
+pub use copilot_settings::{CopilotSettingsStore, set_copilot_settings_store};
 pub use copilot_view::{CopilotActionSink, CopilotWindow};
 pub use overlay_view::RecordingOverlay;
 
@@ -376,6 +378,7 @@ pub struct SettingsShell {
     workspace_actions: WorkspaceActionState,
     routes: RouteUiState,
     layout: ShellLayoutState,
+    copilot: copilot_settings::CopilotSettingsState,
     _subscriptions: Vec<Subscription>,
 }
 

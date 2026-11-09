@@ -58,7 +58,7 @@ impl CopilotProvider {
             Self::ChatgptSubscription => "gpt-6-sol",
             Self::AnthropicApi => "claude-opus-5-5",
             Self::ClaudeCode => "opus",
-            Self::OpenaiApi => "gpt-5.5",
+            Self::OpenaiApi => "gpt-6.1-sol",
         }
     }
 
@@ -71,7 +71,7 @@ impl CopilotProvider {
             Self::ChatgptSubscription => "gpt-6-luna",
             Self::AnthropicApi => "claude-haiku-5-5",
             Self::ClaudeCode => "haiku",
-            Self::OpenaiApi => "gpt-5.4-mini",
+            Self::OpenaiApi => "gpt-6-luna",
         }
     }
 
@@ -81,7 +81,7 @@ impl CopilotProvider {
     #[must_use]
     pub const fn default_instant_model(self) -> &'static str {
         match self {
-            Self::ChatgptSubscription => "gpt-6-sol",
+            Self::ChatgptSubscription | Self::OpenaiApi => "gpt-6-sol",
             _ => self.default_fast_model(),
         }
     }
@@ -113,9 +113,12 @@ impl CopilotProvider {
                 ("fable", "Fable (latest)"),
             ],
             Self::OpenaiApi => &[
+                ("gpt-6.1-sol", "GPT-6.1 Sol"),
+                ("gpt-6-sol", "GPT-6 Sol"),
+                ("gpt-6.1-terra", "GPT-6.1 Terra"),
+                ("gpt-6-astra", "GPT-6 Astra"),
+                ("gpt-6-luna", "GPT-6 Luna"),
                 ("gpt-5.5", "GPT-5.5"),
-                ("gpt-5.6-luna", "GPT-5.6 Luna"),
-                ("gpt-5.4-mini", "GPT-5.4 mini"),
             ],
         };
         pairs

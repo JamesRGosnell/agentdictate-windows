@@ -30,8 +30,6 @@ pub use codex_subscription::CodexSubscriptionTransport;
 pub use codex_subscription::sign_in_with_chatgpt;
 #[cfg(windows)]
 pub use copilot::check_copilot_brain;
-#[cfg(all(windows, feature = "desktop"))]
-pub use copilot::run_copilot;
 pub use copilot::{COPILOT_ARGUMENT, is_copilot_argument};
 #[cfg(windows)]
 pub use copilot::{
@@ -40,6 +38,8 @@ pub use copilot::{
     run_copilot_primer, run_copilot_questions, run_copilot_rewrites, run_copilot_voices,
     run_copilot_window,
 };
+#[cfg(all(windows, feature = "desktop"))]
+pub use copilot::{install_copilot_settings_store, run_copilot};
 pub use daemon::{CapturedRecording, Daemon, DaemonError, RecordingController};
 pub use diagnostics::init_file_logging;
 pub use hotkey_dispatch::{

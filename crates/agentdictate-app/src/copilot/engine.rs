@@ -526,7 +526,7 @@ impl Engine {
                 break false;
             }
         };
-        self.finish(&incoming);
+        self.finish(&incoming, user_ended);
         user_ended
     }
 
@@ -2387,7 +2387,10 @@ impl Engine {
     }
 
     /// Ends the session: drains audio and transcription, then writes notes.
-    fn finish(mut self, incoming: &Receiver<EngineMsg>) {
+    /// When the user ended it, the bar is already gone, so the notes are
+    /// written out of sight and land on the Meetings page; a session that
+    /// ended on its own shows the wrap-up instead.
+    fn finish(mut self, incoming: &Receiver<EngineMsg>, user_ended: bool) {
         self.ending = true;
         self.cancel_answer();
         self.stop_audio();
@@ -2426,7 +2429,9 @@ impl Engine {
             (self.ui)(CopilotEvent::Exit);
             return;
         }
-        (self.ui)(CopilotEvent::Ending);
+        if !user_ended {
+            (self.ui)(CopilotEvent::Ending);
+        }
         let summary = self.summarize();
         match self.write_notes(summary.as_deref()) {
             Ok(path) => {
@@ -2440,14 +2445,16 @@ impl Engine {
                 self.follow_up_email = follow_up
                     .as_deref()
                     .map(|email| EmailDraft::from_follow_up(email, &self.notes_title()));
-                (self.ui)(CopilotEvent::NotesSaved {
-                    path: path.to_string_lossy().into_owned(),
-                    summary,
-                    follow_up,
-                });
-                self.notes_path = Some(path);
-                if !close_requested {
-                    self.wrap_up(incoming);
+                if !user_ended {
+                    (self.ui)(CopilotEvent::NotesSaved {
+                        path: path.to_string_lossy().into_owned(),
+                        summary,
+                        follow_up,
+                    });
+                    self.notes_path = Some(path);
+                    if !close_requested {
+                        self.wrap_up(incoming);
+                    }
                 }
             }
             Err(error) => tracing::error!(%error, "could not save meeting notes"),
@@ -3450,7 +3457,7 @@ mod tests {
         ] {
             engine.messages.send(message).unwrap();
         }
-        engine.finish(&incoming);
+        engine.finish(&incoming, false);
         let opened = OPENED.with(|opened| opened.borrow().clone());
         assert_eq!(
             opened,
@@ -3483,7 +3490,7 @@ mod tests {
             .messages
             .send(EngineMsg::Action(CopilotAction::End))
             .unwrap();
-        engine.finish(&incoming);
+        engine.finish(&incoming, false);
         let events = events.lock().unwrap();
         let saved = events
             .iter()
@@ -3502,6 +3509,30 @@ mod tests {
         assert!(matches!(events.last(), Some(CopilotEvent::Exit)));
         let notes = std::fs::read_to_string(&saved.0).unwrap();
         assert!(notes.contains("Hi Sam,"));
+    }
+
+    #[test]
+    fn ending_by_hand_writes_notes_without_reopening_the_bar() {
+        let (mut engine, incoming, events, _requests, directory) =
+            harness(CopilotSettings::default());
+        engine.publish(TranscriptLine {
+            id: 1,
+            speaker: Speaker::Them,
+            text: "Can we start with a pilot?".into(),
+            at_ms: 0,
+            voice: None,
+        });
+        engine.finish(&incoming, true);
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            CopilotEvent::Ending | CopilotEvent::NotesSaved { .. } | CopilotEvent::Show
+        )));
+        assert!(matches!(events.last(), Some(CopilotEvent::Exit)));
+        let saved = std::fs::read_dir(directory.path().join("meetings"))
+            .unwrap()
+            .count();
+        assert!(saved > 0, "notes are still written");
     }
 
     #[test]

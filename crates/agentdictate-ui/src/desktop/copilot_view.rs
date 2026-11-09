@@ -1144,6 +1144,9 @@ impl CopilotWindow {
                         this.end_armed_at = None;
                         this.act(CopilotAction::End);
                         this.stop_typing(true, cx);
+                        // The bar goes at once; notes finish out of sight and
+                        // land on the Meetings page.
+                        this.set_visible(false, cx);
                         cx.notify();
                     }))
             } else {

@@ -102,6 +102,21 @@ fn is_transient_failure(error: &str) -> bool {
         .any(|pattern| error.contains(pattern))
 }
 
+/// Lets the main window's Settings read and save the copilot's settings.
+#[cfg(all(windows, feature = "desktop"))]
+pub fn install_copilot_settings_store() -> anyhow::Result<()> {
+    let paths = crate::AppPaths::from_environment()?;
+    let path = std::sync::Arc::new(store::settings_path(&paths.config_file));
+    let load_path = std::sync::Arc::clone(&path);
+    agentdictate_ui::set_copilot_settings_store(agentdictate_ui::CopilotSettingsStore {
+        load: std::sync::Arc::new(move || store::load(&load_path)),
+        save: std::sync::Arc::new(move |settings| {
+            store::save(&path, settings).map_err(|error| error.to_string())
+        }),
+    });
+    Ok(())
+}
+
 /// Starts the copilot, or brings the running one forward.
 #[cfg(windows)]
 pub fn launch_copilot() -> std::io::Result<()> {

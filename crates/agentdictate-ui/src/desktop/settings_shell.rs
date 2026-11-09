@@ -166,6 +166,7 @@ impl SettingsShell {
             workspace_actions: WorkspaceActionState::default(),
             routes: RouteUiState::default(),
             layout: ShellLayoutState::default(),
+            copilot: super::copilot_settings::CopilotSettingsState::default(),
             _subscriptions: Vec::new(),
         }
     }
@@ -293,6 +294,7 @@ impl SettingsShell {
             },
             routes,
             layout: ShellLayoutState::default(),
+            copilot: super::copilot_settings::CopilotSettingsState::open(window, cx),
             _subscriptions: subscriptions,
         }
     }

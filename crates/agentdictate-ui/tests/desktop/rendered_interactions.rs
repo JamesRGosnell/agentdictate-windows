@@ -1916,3 +1916,34 @@ fn successful_api_key_save_clears_the_secret_field(cx: &mut TestAppContext) {
             if api_key.expose_secret() == "sk-test-secret"
     ));
 }
+
+#[gpui::test]
+fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext) {
+    let saved = Arc::new(Mutex::new(agentdictate_core::CopilotSettings::default()));
+    let load = Arc::clone(&saved);
+    let store = Arc::clone(&saved);
+    agentdictate_ui::set_copilot_settings_store(agentdictate_ui::CopilotSettingsStore {
+        load: Arc::new(move || load.lock().unwrap().clone()),
+        save: Arc::new(move |settings| {
+            *store.lock().unwrap() = settings.clone();
+            Ok(())
+        }),
+    });
+    let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
+    assert!(harness.has("settings-group-copilot"));
+    assert!(!harness.has("copilot-settings-key"));
+    let top = harness.bounds("copilot-settings-provider-3").top();
+    harness.scroll_route_by(-(f32::from(top) - 300.));
+    // OpenAI API is the fourth engine; choosing it saves at once and asks
+    // for its key.
+    harness.click("copilot-settings-provider-3");
+    assert_eq!(
+        saved.lock().unwrap().provider,
+        agentdictate_core::CopilotProvider::OpenaiApi
+    );
+    assert!(harness.has("copilot-settings-key"));
+    assert!(harness.has("copilot-settings-feedback"));
+    let auto_answer = saved.lock().unwrap().auto_answer;
+    harness.click("copilot-settings-toggle-0");
+    assert_eq!(saved.lock().unwrap().auto_answer, !auto_answer);
+}

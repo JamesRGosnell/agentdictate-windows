@@ -191,6 +191,10 @@ fn run() -> anyhow::Result<()> {
     }
     let _log_guard = init_file_logging(&paths.logs, "agentdictate.log")?;
     tracing::info!("native settings window starting");
+    #[cfg(windows)]
+    if let Err(error) = agentdictate_app::install_copilot_settings_store() {
+        tracing::warn!(%error, "copilot settings are unavailable in Settings");
+    }
     let (mut bootstrap_client, initial) = connect_or_start_daemon(&paths)?;
     let workspace = bootstrap_client.send(ClientCommand::get_workspace(1))?;
     // UI actions use short-lived sessions so a closed settings window cannot
