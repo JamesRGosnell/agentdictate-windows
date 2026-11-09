@@ -638,9 +638,7 @@ fn process(
         if is_paused != was_paused {
             was_paused = is_paused;
             if is_paused {
-                if let Some(utterance) = segmenter.flush() {
-                    emit(vec![SegmentEvent::Utterance(utterance)]);
-                }
+                emit(segmenter.flush());
                 sink(AudioMsg::Level {
                     speaker,
                     level: 0.0,
@@ -725,9 +723,7 @@ fn process(
             });
         }
     }
-    if let Some(utterance) = segmenter.flush() {
-        emit(vec![SegmentEvent::Utterance(utterance)]);
-    }
+    emit(segmenter.flush());
 }
 
 #[cfg(test)]

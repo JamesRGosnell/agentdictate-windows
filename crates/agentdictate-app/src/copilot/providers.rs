@@ -158,8 +158,21 @@ fn responses_body(request: &AnswerRequest, model: &str) -> Value {
         "store": false,
         "stream": true,
         "include": [],
-        "prompt_cache_key": request.cache_key,
+        "prompt_cache_key": cache_key(&request.cache_key),
     })
+}
+
+/// The OpenAI API rejects cache keys over 64 characters; longer keys are
+/// sent as their SHA-256, which keeps them distinct and stable.
+fn cache_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if key.len() <= 64 {
+        return key.to_owned();
+    }
+    Sha256::digest(key.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Models the service rejected during this process, tried last afterwards
@@ -886,6 +899,15 @@ mod tests {
         ));
         assert!(!is_model_rejection(StatusCode::BAD_REQUEST, "bad image"));
         assert!(!is_model_rejection(StatusCode::TOO_MANY_REQUESTS, "model"));
+    }
+
+    #[test]
+    fn cache_keys_fit_the_services_limit() {
+        assert_eq!(cache_key("copilot-short"), "copilot-short");
+        let long = cache_key(&"question-eval-".repeat(10));
+        assert_eq!(long.len(), 64);
+        assert_eq!(long, cache_key(&"question-eval-".repeat(10)));
+        assert_ne!(long, cache_key(&"question-eval-".repeat(11)));
     }
 
     #[test]

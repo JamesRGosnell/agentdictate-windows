@@ -329,17 +329,16 @@ impl Segmenter {
         }
     }
 
-    /// Ends any utterance in progress (session end or pause).
-    pub(crate) fn flush(&mut self) -> Option<Utterance> {
+    /// Ends any utterance in progress (session end or pause): its last
+    /// streamed chunk, then the utterance, or that it was discarded.
+    pub(crate) fn flush(&mut self) -> Vec<SegmentEvent> {
         self.onset_run = 0;
         self.pre_roll.clear();
-        self.active.as_ref()?;
         let mut events = Vec::new();
-        self.close(&mut events);
-        events.into_iter().find_map(|event| match event {
-            SegmentEvent::Utterance(utterance) => Some(utterance),
-            _ => None,
-        })
+        if self.active.is_some() {
+            self.close(&mut events);
+        }
+        events
     }
 }
 
@@ -470,6 +469,17 @@ mod tests {
         assert_eq!(utterance.start_sample, provisional.start_sample);
         assert!(utterance.samples.len() > provisional.samples.len());
         assert_eq!(streamed(&events, utterance.start_sample), utterance.samples);
+    }
+
+    #[test]
+    fn flushing_mid_speech_streams_the_rest_before_the_utterance() {
+        let mut segmenter = Segmenter::new(SegmenterConfig::microphone());
+        let mut events = segmenter.push(&silence(400));
+        events.extend(segmenter.push(&tone(1_030, 0.3)));
+        events.extend(segmenter.flush());
+        let utterance = utterances(events.clone()).remove(0);
+        assert_eq!(streamed(&events, utterance.start_sample), utterance.samples);
+        assert!(segmenter.flush().is_empty());
     }
 
     #[test]

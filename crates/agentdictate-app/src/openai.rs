@@ -346,6 +346,12 @@ impl ReqwestOpenAiTransport {
         }
     }
 
+    /// The key requests are sent with.
+    #[must_use]
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
     pub fn set_api_key(&mut self, api_key: impl Into<String>) {
         self.api_key = api_key.into().trim().to_owned();
     }

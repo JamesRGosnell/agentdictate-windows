@@ -47,14 +47,21 @@ pub struct AgentProcess {
     hotkey_control: Option<Arc<dyn HotkeyReconfigurer>>,
     recording_mode_control: Option<Arc<RwLock<String>>>,
     should_quit: bool,
+    /// The key dictation's own settings file holds; empty when it has none.
+    /// Only this is ever saved to config.json.
+    own_api_key: String,
 }
 
 /// One OpenAI API key serves the whole app: without a key of its own,
 /// dictation uses the one saved for the meeting copilot, for transcription,
-/// cleanup and the model list alike.
-fn adopt_shared_api_key(settings: &mut agentdictate_core::Settings, config_file: &std::path::Path) {
-    if settings.openai_api_key.trim().is_empty() {
-        settings.openai_api_key = crate::copilot::saved_openai_key(config_file);
+/// cleanup and the model list alike. The copilot's key is only borrowed,
+/// never written to dictation's settings file.
+fn effective_api_key(own: &str, config_file: &std::path::Path) -> String {
+    let own = own.trim();
+    if own.is_empty() {
+        crate::copilot::saved_openai_key(config_file)
+    } else {
+        own.to_owned()
     }
 }
 
@@ -62,7 +69,8 @@ impl AgentProcess {
     pub fn open(paths: AppPaths) -> anyhow::Result<Self> {
         paths.ensure_directories()?;
         let mut settings = load_settings(&paths.config_file)?;
-        adopt_shared_api_key(&mut settings, &paths.config_file);
+        let own_api_key = settings.openai_api_key.trim().to_owned();
+        settings.openai_api_key = effective_api_key(&own_api_key, &paths.config_file);
         let runtime = Runtime::open(&paths.database_file)?;
         runtime.reconcile_recovery_deletions(&paths.recordings)?;
         let model_catalog = ModelCatalog::open(&paths.cache, &settings.openai_api_key);
@@ -97,6 +105,7 @@ impl AgentProcess {
             hotkey_control: None,
             recording_mode_control: None,
             should_quit: false,
+            own_api_key,
         })
     }
 
@@ -225,7 +234,7 @@ impl AgentProcess {
         let parsed_hotkey = hotkey_changed
             .then(|| settings.hotkey.parse::<HotkeySpec>())
             .transpose()?;
-        settings.openai_api_key = self.daemon.settings().openai_api_key.clone();
+        settings.openai_api_key = self.own_api_key.clone();
         let old_hotkey = hotkey_changed
             .then(|| self.daemon.settings().hotkey.parse::<HotkeySpec>().ok())
             .flatten();
@@ -281,6 +290,9 @@ impl AgentProcess {
                 }
             }
         }
+        // Keep the key in effect with the transports; a new one is applied
+        // through them below.
+        settings.openai_api_key = self.daemon.settings().openai_api_key.clone();
         self.daemon
             .transcriber_mut()
             .update_settings(settings.clone());
@@ -295,6 +307,7 @@ impl AgentProcess {
                 .map_err(|_| anyhow::anyhow!("recording-mode control is unavailable"))? =
                 self.daemon.settings().recording_mode.clone();
         }
+        self.sync_api_key();
         Ok(())
     }
 
@@ -302,7 +315,32 @@ impl AgentProcess {
         let mut settings = self.daemon.settings().clone();
         settings.openai_api_key = api_key.trim().to_owned();
         save_settings(&self.config_file, &settings)?;
-        adopt_shared_api_key(&mut settings, &self.config_file);
+        self.own_api_key = settings.openai_api_key.clone();
+        self.sync_api_key();
+        self.refresh_model_catalog()?;
+        Ok(())
+    }
+
+    /// The key dictation's transcription requests use now; for tests.
+    #[doc(hidden)]
+    pub fn dictation_api_key_in_effect(&mut self) -> String {
+        self.daemon
+            .transcriber_mut()
+            .speech_mut()
+            .openai_mut()
+            .api_key()
+            .to_owned()
+    }
+
+    /// Puts the key dictation should use into effect, picking up a key saved
+    /// or removed in the meeting copilot's settings since the last check.
+    fn sync_api_key(&mut self) {
+        let key = effective_api_key(&self.own_api_key, &self.config_file);
+        let mut settings = self.daemon.settings().clone();
+        if settings.openai_api_key == key {
+            return;
+        }
+        settings.openai_api_key = key;
         let transcriber = self.daemon.transcriber_mut();
         transcriber
             .speech_mut()
@@ -313,8 +351,6 @@ impl AgentProcess {
             .set_api_key(&settings.openai_api_key);
         transcriber.update_settings(settings.clone());
         self.daemon.update_settings(settings);
-        self.refresh_model_catalog()?;
-        Ok(())
     }
 
     fn refresh_model_catalog(&self) -> io::Result<()> {
@@ -417,6 +453,14 @@ impl IpcHandler for AgentProcess {
 
     fn handle(&mut self, command: ClientCommand) -> ServerMessage {
         let command_tag = command.kind();
+        if matches!(
+            command_tag,
+            ClientCommandTag::StartRecording
+                | ClientCommandTag::GetSnapshot
+                | ClientCommandTag::RefreshModelCatalog
+        ) {
+            self.sync_api_key();
+        }
         if command_tag == ClientCommandTag::StartRecording {
             self.begin_recording_priority();
         }

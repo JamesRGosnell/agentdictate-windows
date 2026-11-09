@@ -121,5 +121,48 @@ fn the_meeting_copilots_openai_key_serves_dictation_too() {
         panic!("snapshot query should return settings");
     };
     assert!(settings.has_api_key, "one key serves the whole app");
-    assert!(settings.values.openai_api_key.is_empty(), "never sent to the UI");
+    assert!(
+        settings.values.openai_api_key.is_empty(),
+        "never sent to the UI"
+    );
+}
+
+#[test]
+fn the_borrowed_key_is_never_saved_and_follows_the_copilots_key() {
+    let directory = tempdir().unwrap();
+    let paths = app_paths(directory.path());
+    let copilot = paths.config_file.with_file_name("copilot.json");
+    std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+    std::fs::write(&copilot, r#"{"openai_api_key": "sk-shared-test"}"#).unwrap();
+    let config_file = paths.config_file.clone();
+    let mut process = AgentProcess::open(paths).unwrap();
+    let snapshot = |process: &mut AgentProcess| {
+        let ServerMessageKind::Snapshot { settings, .. } =
+            process.handle(ClientCommand::get_snapshot(1)).kind
+        else {
+            panic!("snapshot query should return settings");
+        };
+        settings
+    };
+    // Saving a dictation setting does not copy the copilot's key.
+    let mut values = snapshot(&mut process).values;
+    values.language = "fr".into();
+    let saved = process.handle(ClientCommand::update_settings(2, &values));
+    assert!(!matches!(
+        saved.kind,
+        ServerMessageKind::CommandRejected { .. }
+    ));
+    let on_disk = std::fs::read_to_string(&config_file).unwrap();
+    assert!(!on_disk.contains("sk-shared-test"), "{on_disk}");
+    assert!(snapshot(&mut process).has_api_key);
+    // Removing the key in the copilot's settings reaches dictation.
+    std::fs::write(&copilot, r#"{"openai_api_key": ""}"#).unwrap();
+    assert!(!snapshot(&mut process).has_api_key);
+    // A key added there takes effect on a settings save too.
+    std::fs::write(&copilot, r#"{"openai_api_key": "sk-new-test"}"#).unwrap();
+    values.language = "en".into();
+    process.handle(ClientCommand::update_settings(3, &values));
+    assert!(process.dictation_api_key_in_effect() == "sk-new-test");
+    let on_disk = std::fs::read_to_string(&config_file).unwrap();
+    assert!(!on_disk.contains("sk-new-test"), "{on_disk}");
 }

@@ -336,15 +336,20 @@ const MIN_COMMIT_SAMPLES: usize = 1_600;
 /// Whether a final line asks what was judged from its partial words.
 fn same_question(partial: &str, line: &str) -> bool {
     let partial = partial.trim();
-    line.contains(partial) || utterance_similarity(partial, line) >= 0.7
+    // A line that goes on past the question asks something more.
+    line.trim_end().ends_with(partial) || utterance_similarity(partial, line) >= 0.7
 }
+
+/// After a stream fails, its side uploads speech for this long before
+/// streaming is tried again.
+const LIVE_RETRY_AFTER: Duration = Duration::from_secs(120);
 
 /// One side's streaming transcription.
 #[derive(Default)]
 struct LiveLane {
     stream: Option<LiveStream>,
-    /// The stream failed; this side is transcribed by upload from now on.
-    failed: bool,
+    /// The stream failed; this side is transcribed by upload until then.
+    failed_until: Option<Instant>,
     /// The utterance being streamed, by its first sample.
     utterance: Option<u64>,
     /// Samples of that utterance appended, and of those, committed.
@@ -364,6 +369,13 @@ struct LiveLane {
 struct LiveWaiting {
     job: TranscriptionJob,
     tags: Vec<u64>,
+}
+
+impl LiveLane {
+    fn failed(&self) -> bool {
+        self.failed_until
+            .is_some_and(|until| Instant::now() < until)
+    }
 }
 
 const fn lane_index(speaker: Speaker) -> usize {
@@ -1236,7 +1248,7 @@ impl Engine {
         };
         let messages = self.messages.clone();
         let lane = &mut self.live[lane_index(speaker)];
-        if lane.failed {
+        if lane.failed() {
             return;
         }
         if lane.utterance != Some(start_sample) {
@@ -1278,7 +1290,7 @@ impl Engine {
     ) -> Option<TranscriptionJob> {
         let tag = self.next_live_tag;
         let lane = &mut self.live[lane_index(speaker)];
-        let Some(stream) = lane.stream.as_ref().filter(|_| !lane.failed) else {
+        let Some(stream) = lane.stream.as_ref().filter(|_| !lane.failed()) else {
             return Some(job);
         };
         if lane.utterance != Some(utterance.start_sample)
@@ -1310,7 +1322,7 @@ impl Engine {
         let lane = &mut self.live[lane_index(speaker)];
         match event {
             LiveEvent::Partial(text) => {
-                if lane.failed {
+                if lane.failed() {
                     return;
                 }
                 lane.partial = text;
@@ -1372,15 +1384,14 @@ impl Engine {
         lane.texts.retain(|tag, _| needed.contains(tag));
         for (early, start_ms, end_ms, text) in done {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            // The words are final now, or dropped as noise, echo or a repeat.
+            (self.ui)(CopilotEvent::PartialTranscript {
+                speaker,
+                text: String::new(),
+            });
             match early {
                 Some(id) => self.handle_early_transcribed(id, Ok(text)),
-                None => {
-                    (self.ui)(CopilotEvent::PartialTranscript {
-                        speaker,
-                        text: String::new(),
-                    });
-                    self.handle_transcribed(speaker, start_ms, end_ms, Ok(text));
-                }
+                None => self.handle_transcribed(speaker, start_ms, end_ms, Ok(text)),
             }
         }
     }
@@ -1389,13 +1400,23 @@ impl Engine {
     /// handing over what it was waiting on so nothing said is lost.
     fn live_failed(&mut self, speaker: Speaker, error: String) {
         let lane = &mut self.live[lane_index(speaker)];
-        if lane.failed {
+        if lane.failed() {
             return;
         }
-        tracing::warn!(?speaker, %error, "streaming transcription failed; uploading speech instead");
-        lane.failed = true;
+        tracing::warn!(
+            ?speaker,
+            %error,
+            retry_secs = LIVE_RETRY_AFTER.as_secs(),
+            "streaming transcription failed; uploading speech until it is retried"
+        );
+        lane.failed_until = Some(Instant::now() + LIVE_RETRY_AFTER);
         lane.stream = None;
         lane.partial.clear();
+        // A new stream starts from the next utterance.
+        lane.utterance = None;
+        lane.appended = 0;
+        lane.committed = 0;
+        lane.tags.clear();
         let waiting = std::mem::take(&mut lane.waiting);
         (self.ui)(CopilotEvent::PartialTranscript {
             speaker,
@@ -2739,6 +2760,13 @@ impl Engine {
         loop {
             // Flushed utterances arrive as audio messages; transcripts follow.
             match incoming.recv_timeout(Duration::from_millis(100)) {
+                // The last stretch of speech is streamed so its utterance can
+                // be committed rather than uploaded again.
+                Ok(EngineMsg::Audio(AudioMsg::Speech {
+                    speaker,
+                    start_sample,
+                    samples,
+                })) => self.stream_speech(speaker, start_sample, samples),
                 Ok(EngineMsg::Audio(AudioMsg::Utterance { speaker, utterance })) => {
                     self.queue_utterance(speaker, utterance);
                 }
@@ -3249,6 +3277,42 @@ mod tests {
         let turn = engine.pending_turn.as_ref().unwrap();
         assert_ne!(turn.id, early);
         assert!(!turn.awaiting_final);
+    }
+
+    #[test]
+    fn a_line_that_asks_more_than_its_partial_question_is_judged_again() {
+        assert!(same_question(
+            "Is that included?",
+            "Okay. Is that included?"
+        ));
+        assert!(!same_question(
+            "Is that included?",
+            "Is that included? And what does onboarding cost?"
+        ));
+    }
+
+    #[test]
+    fn streaming_is_retried_after_a_failure_cools_down() {
+        let ((mut engine, _incoming, _events, _requests, _directory), sent) = live_harness();
+        speech(&mut engine, 16_000);
+        engine.handle_live(Speaker::Them, LiveEvent::Failed("socket closed".into()));
+        let lane = &mut engine.live[lane_index(Speaker::Them)];
+        assert!(lane.failed());
+        lane.failed_until = Some(Instant::now() - Duration::from_secs(1));
+        let before = sent.lock().unwrap().len();
+        engine.handle_audio(AudioMsg::Speech {
+            speaker: Speaker::Them,
+            start_sample: 99_000,
+            samples: vec![0; 16_000],
+        });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while sent.lock().unwrap().len() == before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            sent.lock().unwrap().len() > before,
+            "a new stream carries speech"
+        );
     }
 
     #[test]
