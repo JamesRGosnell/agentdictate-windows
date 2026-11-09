@@ -35,8 +35,8 @@ pub use copilot::{COPILOT_ARGUMENT, is_copilot_argument};
 pub use copilot::{
     copilot_launch_reason, launch_copilot, run_copilot_answers, run_copilot_bakeoff,
     run_copilot_check, run_copilot_echo_test, run_copilot_names, run_copilot_notes_bakeoff,
-    run_copilot_primer, run_copilot_questions, run_copilot_rewrites, run_copilot_voices,
-    run_copilot_window,
+    run_copilot_primer, run_copilot_questions, run_copilot_replay, run_copilot_rewrites,
+    run_copilot_voices, run_copilot_window,
 };
 #[cfg(all(windows, feature = "desktop"))]
 pub use copilot::{install_copilot_settings_store, run_copilot};

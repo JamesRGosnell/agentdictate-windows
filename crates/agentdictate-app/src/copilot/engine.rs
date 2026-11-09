@@ -6,7 +6,7 @@
 //! busy engine never delays the words the user is waiting for.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -32,6 +32,7 @@ use agentdictate_core::{
 
 use super::{
     knowledge::{Knowledge, fingerprint},
+    live::{LiveCommand, LiveEvent, LiveFactory, LiveStream},
     names::{Clue, Roster},
     providers::{AnswerProvider, AnswerRequest, complete, replacement_for},
     reveal::RevealGate,
@@ -124,6 +125,12 @@ pub(crate) enum AudioMsg {
         speaker: Speaker,
         active: bool,
     },
+    /// The next stretch of speech in progress, for streaming transcription.
+    Speech {
+        speaker: Speaker,
+        start_sample: u64,
+        samples: Vec<i16>,
+    },
     /// Speech that paused long enough to have ended, sent ahead of its
     /// [`AudioMsg::Utterance`] so transcription can start early.
     Provisional {
@@ -152,6 +159,14 @@ impl AudioMsg {
             SegmentEvent::SpeechDiscarded => vec![Self::Speaking {
                 speaker,
                 active: false,
+            }],
+            SegmentEvent::Speech {
+                start_sample,
+                samples,
+            } => vec![Self::Speech {
+                speaker,
+                start_sample,
+                samples,
             }],
             SegmentEvent::Provisional(utterance) => vec![Self::Provisional { speaker, utterance }],
             SegmentEvent::Utterance(utterance) => vec![
@@ -217,6 +232,8 @@ pub(crate) struct Services {
     /// Documents the user wants answers to draw on.
     pub knowledge_dir: PathBuf,
     pub language: String,
+    /// Streams speech for live transcription; `None` transcribes by upload.
+    pub live: Option<LiveFactory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +251,11 @@ pub(crate) enum EngineMsg {
         start_ms: u64,
         end_ms: u64,
         text: Result<String, String>,
+    },
+    /// News from a side's streaming transcription.
+    Live {
+        speaker: Speaker,
+        event: LiveEvent,
     },
     /// A provisional utterance's transcript.
     EarlyTranscribed {
@@ -304,6 +326,44 @@ fn wait_for_instant(done: &Receiver<()>, cancel: &AtomicBool) -> bool {
             }
             Err(RecvTimeoutError::Timeout) => {}
         }
+    }
+}
+
+/// Fewer new samples than this (100 ms) are not committed on their own:
+/// the service needs at least that much audio to transcribe.
+const MIN_COMMIT_SAMPLES: usize = 1_600;
+
+/// One side's streaming transcription.
+#[derive(Default)]
+struct LiveLane {
+    stream: Option<LiveStream>,
+    /// The stream failed; this side is transcribed by upload from now on.
+    failed: bool,
+    /// The utterance being streamed, by its first sample.
+    utterance: Option<u64>,
+    /// Samples of that utterance appended, and of those, committed.
+    appended: usize,
+    committed: usize,
+    /// Commits of that utterance, in order.
+    tags: Vec<u64>,
+    /// Finished text by commit.
+    texts: HashMap<u64, String>,
+    /// Transcriptions waiting on commits, kept whole so a failed stream can
+    /// hand them to the upload path.
+    waiting: Vec<LiveWaiting>,
+    /// Text heard so far of speech not yet transcribed in full.
+    partial: String,
+}
+
+struct LiveWaiting {
+    job: TranscriptionJob,
+    tags: Vec<u64>,
+}
+
+const fn lane_index(speaker: Speaker) -> usize {
+    match speaker {
+        Speaker::Me => 0,
+        Speaker::Them => 1,
     }
 }
 
@@ -392,6 +452,8 @@ pub(crate) struct Engine {
     in_flight: Arc<AtomicUsize>,
     early: Vec<EarlyTranscript>,
     next_early: u64,
+    live: [LiveLane; 2],
+    next_live_tag: u64,
     transcript: Vec<TranscriptLine>,
     next_line: u64,
     them_spans: VecDeque<ThemSpan>,
@@ -461,6 +523,8 @@ impl Engine {
             in_flight: Arc::new(AtomicUsize::new(0)),
             early: Vec::new(),
             next_early: 1,
+            live: [LiveLane::default(), LiveLane::default()],
+            next_live_tag: 1,
             transcript: Vec::new(),
             next_line: 1,
             them_spans: VecDeque::new(),
@@ -793,6 +857,7 @@ impl Engine {
                 text,
             } => self.handle_transcribed(speaker, start_ms, end_ms, text),
             EngineMsg::EarlyTranscribed { id, text } => self.handle_early_transcribed(id, text),
+            EngineMsg::Live { speaker, event } => self.handle_live(speaker, event),
             EngineMsg::AnswerFinished { id, title, text } => {
                 self.handle_answer_finished(id, title, text);
             }
@@ -1009,6 +1074,11 @@ impl Engine {
                 }
                 (self.ui)(CopilotEvent::Speaking { speaker, active });
             }
+            AudioMsg::Speech {
+                speaker,
+                start_sample,
+                samples,
+            } => self.stream_speech(speaker, start_sample, samples),
             AudioMsg::Provisional { speaker, utterance } => {
                 self.transcribe_early(speaker, &utterance);
             }
@@ -1036,7 +1106,9 @@ impl Engine {
     /// Starts transcribing speech that paused, before the pause is long
     /// enough to end it, so the text is ready sooner if it did end.
     fn transcribe_early(&mut self, speaker: Speaker, utterance: &Utterance) {
-        let Some(jobs) = &self.jobs else { return };
+        let Some(jobs) = self.jobs.clone() else {
+            return;
+        };
         // A longer copy of the same speech replaces a shorter one.
         self.early.retain(|early| {
             !(early.speaker == speaker && early.start_sample == utterance.start_sample)
@@ -1056,7 +1128,11 @@ impl Engine {
             early: Some(id),
             queued_at: Instant::now(),
         };
-        if jobs.send(job).is_err() {
+        let sent = match self.stream_job(speaker, utterance, job) {
+            None => true,
+            Some(job) => jobs.send(job).is_ok(),
+        };
+        if !sent {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
             return;
         }
@@ -1122,20 +1198,203 @@ impl Engine {
                 return;
             }
         }
-        let Some(jobs) = &self.jobs else { return };
+        let Some(jobs) = self.jobs.clone() else {
+            return;
+        };
         self.in_flight.fetch_add(1, Ordering::AcqRel);
-        if jobs
-            .send(TranscriptionJob {
-                speaker,
-                start_ms,
-                end_ms,
-                wav: wav_bytes(&utterance.samples),
-                early: None,
-                queued_at: Instant::now(),
-            })
-            .is_err()
-        {
+        let job = TranscriptionJob {
+            speaker,
+            start_ms,
+            end_ms,
+            wav: wav_bytes(&utterance.samples),
+            early: None,
+            queued_at: Instant::now(),
+        };
+        let sent = match self.stream_job(speaker, &utterance, job) {
+            None => true,
+            Some(job) => jobs.send(job).is_ok(),
+        };
+        if !sent {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Streams speech in progress to its side's live transcription, opening
+    /// the stream on first use.
+    fn stream_speech(&mut self, speaker: Speaker, start_sample: u64, samples: Vec<i16>) {
+        let Some(factory) = self.services.live.clone() else {
+            return;
+        };
+        let messages = self.messages.clone();
+        let lane = &mut self.live[lane_index(speaker)];
+        if lane.failed {
+            return;
+        }
+        if lane.utterance != Some(start_sample) {
+            // Audio of an earlier utterance that was never committed (its
+            // transcript came by upload) must not lead this one.
+            if lane.appended > lane.committed
+                && let Some(stream) = &lane.stream
+            {
+                stream.send(LiveCommand::Clear);
+            }
+            lane.utterance = Some(start_sample);
+            lane.appended = 0;
+            lane.committed = 0;
+            lane.tags.clear();
+            lane.partial.clear();
+        }
+        let stream = lane.stream.get_or_insert_with(|| {
+            factory(
+                speaker,
+                Box::new(move |event| {
+                    let _ = messages.send(EngineMsg::Live { speaker, event });
+                }),
+            )
+        });
+        lane.appended += samples.len();
+        if !stream.send(LiveCommand::Append(samples)) {
+            self.live_failed(speaker, "streaming transcription stopped".into());
+        }
+    }
+
+    /// Transcribes `job` from the live stream when the stream holds exactly
+    /// `utterance`'s audio; otherwise hands it back for upload. The caller
+    /// has counted the job in flight either way.
+    fn stream_job(
+        &mut self,
+        speaker: Speaker,
+        utterance: &Utterance,
+        job: TranscriptionJob,
+    ) -> Option<TranscriptionJob> {
+        let tag = self.next_live_tag;
+        let lane = &mut self.live[lane_index(speaker)];
+        let Some(stream) = lane.stream.as_ref().filter(|_| !lane.failed) else {
+            return Some(job);
+        };
+        if lane.utterance != Some(utterance.start_sample)
+            || lane.appended != utterance.samples.len()
+        {
+            return Some(job);
+        }
+        let fresh = lane.appended - lane.committed;
+        if fresh >= MIN_COMMIT_SAMPLES || (fresh > 0 && lane.tags.is_empty()) {
+            if !stream.send(LiveCommand::Commit { tag }) {
+                return Some(job);
+            }
+            self.next_live_tag += 1;
+            lane.tags.push(tag);
+            lane.committed = lane.appended;
+        }
+        if lane.tags.is_empty() {
+            return Some(job);
+        }
+        lane.waiting.push(LiveWaiting {
+            job,
+            tags: lane.tags.clone(),
+        });
+        self.resolve_live(speaker);
+        None
+    }
+
+    fn handle_live(&mut self, speaker: Speaker, event: LiveEvent) {
+        let lane = &mut self.live[lane_index(speaker)];
+        match event {
+            LiveEvent::Partial(text) => {
+                if lane.failed {
+                    return;
+                }
+                lane.partial = text;
+                let mut shown: Vec<&str> = lane
+                    .tags
+                    .iter()
+                    .filter_map(|tag| lane.texts.get(tag).map(String::as_str))
+                    .collect();
+                shown.push(&lane.partial);
+                let text = shown.join(" ").trim().to_owned();
+                (self.ui)(CopilotEvent::PartialTranscript { speaker, text });
+            }
+            LiveEvent::Committed { tag, text } => {
+                lane.partial.clear();
+                lane.texts.insert(tag, text);
+                self.resolve_live(speaker);
+            }
+            LiveEvent::Failed(error) => self.live_failed(speaker, error),
+        }
+    }
+
+    /// Finishes every waiting transcription whose commits are all back.
+    fn resolve_live(&mut self, speaker: Speaker) {
+        let lane = &mut self.live[lane_index(speaker)];
+        let mut done = Vec::new();
+        lane.waiting.retain_mut(|waiting| {
+            if !waiting.tags.iter().all(|tag| lane.texts.contains_key(tag)) {
+                return true;
+            }
+            let text = waiting
+                .tags
+                .iter()
+                .filter_map(|tag| lane.texts.get(tag))
+                .map(|text| text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            done.push((
+                waiting.job.early,
+                waiting.job.start_ms,
+                waiting.job.end_ms,
+                text,
+            ));
+            false
+        });
+        // Keep only text that a waiting job or the current utterance needs.
+        let needed: HashSet<u64> = lane
+            .waiting
+            .iter()
+            .flat_map(|waiting| waiting.tags.iter().copied())
+            .chain(lane.tags.iter().copied())
+            .collect();
+        lane.texts.retain(|tag, _| needed.contains(tag));
+        for (early, start_ms, end_ms, text) in done {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            match early {
+                Some(id) => self.handle_early_transcribed(id, Ok(text)),
+                None => {
+                    (self.ui)(CopilotEvent::PartialTranscript {
+                        speaker,
+                        text: String::new(),
+                    });
+                    self.handle_transcribed(speaker, start_ms, end_ms, Ok(text));
+                }
+            }
+        }
+    }
+
+    /// Moves a side to upload transcription for the rest of the session,
+    /// handing over what it was waiting on so nothing said is lost.
+    fn live_failed(&mut self, speaker: Speaker, error: String) {
+        let lane = &mut self.live[lane_index(speaker)];
+        if lane.failed {
+            return;
+        }
+        tracing::warn!(?speaker, %error, "streaming transcription failed; uploading speech instead");
+        lane.failed = true;
+        lane.stream = None;
+        lane.partial.clear();
+        let waiting = std::mem::take(&mut lane.waiting);
+        (self.ui)(CopilotEvent::PartialTranscript {
+            speaker,
+            text: String::new(),
+        });
+        for waiting in waiting {
+            // Still counted in flight; the upload worker finishes it.
+            let sent = self
+                .jobs
+                .as_ref()
+                .is_some_and(|jobs| jobs.send(waiting.job).is_ok());
+            if !sent {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -2411,6 +2670,7 @@ impl Engine {
                 Ok(EngineMsg::EarlyTranscribed { id, text }) => {
                     self.handle_early_transcribed(id, text);
                 }
+                Ok(EngineMsg::Live { speaker, event }) => self.handle_live(speaker, event),
                 Ok(EngineMsg::AnswerFinished { id, title, text }) => {
                     self.handle_answer_finished(id, title, text);
                 }
@@ -2729,6 +2989,7 @@ mod tests {
             notes_dir: directory.path().join("meetings"),
             knowledge_dir: directory.path().join("knowledge"),
             language: String::new(),
+            live: None,
         };
         let engine = Engine::new(
             services,
@@ -3131,6 +3392,194 @@ mod tests {
         for message in AudioMsg::from_segment(Speaker::Them, SegmentEvent::Utterance(utterance)) {
             engine.handle_audio(message);
         }
+    }
+
+    /// A harness whose sides stream to a fake: commands land in the
+    /// returned list, and the test plays the service's part.
+    fn live_harness() -> (Harness, Arc<Mutex<Vec<(Speaker, LiveCommand)>>>) {
+        let (mut engine, incoming, events, requests, directory) =
+            harness(CopilotSettings::default());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let commands = Arc::clone(&sent);
+        engine.services.live = Some(Arc::new(move |speaker, _events| {
+            let (sender, receiver) = mpsc::channel::<LiveCommand>();
+            let commands = Arc::clone(&commands);
+            std::thread::spawn(move || {
+                for command in receiver {
+                    commands.lock().unwrap().push((speaker, command));
+                }
+            });
+            LiveStream::new(sender)
+        }));
+        engine.start_transcription_workers();
+        ((engine, incoming, events, requests, directory), sent)
+    }
+
+    fn commits(sent: &Mutex<Vec<(Speaker, LiveCommand)>>) -> Vec<u64> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let tags: Vec<u64> = sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, command)| match command {
+                    LiveCommand::Commit { tag } => Some(*tag),
+                    _ => None,
+                })
+                .collect();
+            if !tags.is_empty() || Instant::now() > deadline {
+                return tags;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Whether an upload transcription comes back soon.
+    fn uploaded(incoming: &Receiver<EngineMsg>) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match incoming.recv_timeout(left) {
+                Ok(EngineMsg::Transcribed { .. } | EngineMsg::EarlyTranscribed { .. }) => {
+                    return true;
+                }
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    fn speech(engine: &mut Engine, samples: usize) {
+        engine.handle_audio(AudioMsg::Speech {
+            speaker: Speaker::Them,
+            start_sample: 1_600,
+            samples: vec![0; samples],
+        });
+    }
+
+    #[test]
+    fn streamed_speech_shows_partial_words_then_its_final_line() {
+        let ((mut engine, incoming, events, _requests, _directory), sent) = live_harness();
+        speech(&mut engine, 16_000);
+        engine.handle_live(Speaker::Them, LiveEvent::Partial("What's the".into()));
+        speech(&mut engine, 16_000);
+        them_said(
+            &mut engine,
+            Utterance {
+                released_after_ms: 400,
+                ..provisional(32_000)
+            },
+        );
+        let tags = commits(&sent);
+        assert_eq!(tags.len(), 1);
+        engine.handle_live(
+            Speaker::Them,
+            LiveEvent::Committed {
+                tag: tags[0],
+                text: "What's the price?".into(),
+            },
+        );
+        assert_eq!(engine.transcript.len(), 1);
+        assert_eq!(engine.transcript[0].text, "What's the price?");
+        assert!(engine.them_spans.iter().all(|span| span.text.is_some()));
+        // Nothing was uploaded.
+        assert!(!uploaded(&incoming));
+        assert_eq!(engine.in_flight.load(Ordering::Acquire), 0);
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CopilotEvent::PartialTranscript { speaker: Speaker::Them, text } if text == "What's the"
+        )));
+        assert!(matches!(
+            events.iter().rev().find(|event| matches!(event, CopilotEvent::PartialTranscript { .. })),
+            Some(CopilotEvent::PartialTranscript { text, .. }) if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn speech_that_goes_on_after_a_pause_joins_both_streamed_parts() {
+        let ((mut engine, incoming, _events, _requests, _directory), sent) = live_harness();
+        speech(&mut engine, 16_000);
+        engine.handle_audio(AudioMsg::Provisional {
+            speaker: Speaker::Them,
+            utterance: provisional(16_000),
+        });
+        speech(&mut engine, 16_000);
+        them_said(
+            &mut engine,
+            Utterance {
+                released_after_ms: 400,
+                ..provisional(32_000)
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let tags = loop {
+            let tags = commits(&sent);
+            if tags.len() == 2 || Instant::now() > deadline {
+                break tags;
+            }
+        };
+        assert_eq!(tags.len(), 2, "one commit at the pause, one at the end");
+        for (tag, text) in [(tags[1], "the price?"), (tags[0], "What's")] {
+            engine.handle_live(
+                Speaker::Them,
+                LiveEvent::Committed {
+                    tag,
+                    text: text.into(),
+                },
+            );
+        }
+        assert_eq!(engine.transcript.len(), 1);
+        assert_eq!(engine.transcript[0].text, "What's the price?");
+        assert!(!uploaded(&incoming));
+        assert_eq!(engine.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_failed_stream_uploads_what_it_was_waiting_on_and_what_follows() {
+        let ((mut engine, incoming, _events, _requests, _directory), sent) = live_harness();
+        speech(&mut engine, 32_000);
+        them_said(
+            &mut engine,
+            Utterance {
+                released_after_ms: 400,
+                ..provisional(32_000)
+            },
+        );
+        assert_eq!(commits(&sent).len(), 1);
+        engine.handle_live(Speaker::Them, LiveEvent::Failed("socket closed".into()));
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(message);
+        assert_eq!(engine.transcript.len(), 1);
+        assert_eq!(engine.transcript[0].text, "64044 bytes");
+        // Later speech on that side goes straight to upload.
+        let streamed = sent.lock().unwrap().len();
+        engine.handle_audio(AudioMsg::Speech {
+            speaker: Speaker::Them,
+            start_sample: 99_000,
+            samples: vec![0; 16_000],
+        });
+        assert_eq!(sent.lock().unwrap().len(), streamed);
+        assert!(engine.live[lane_index(Speaker::Them)].stream.is_none());
+        assert_eq!(engine.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn speech_the_stream_missed_part_of_is_uploaded() {
+        let ((mut engine, incoming, _events, _requests, _directory), sent) = live_harness();
+        // The stream holds less than the utterance (it was flushed early).
+        speech(&mut engine, 16_000);
+        them_said(
+            &mut engine,
+            Utterance {
+                released_after_ms: 400,
+                ..provisional(32_000)
+            },
+        );
+        assert!(commits(&sent).is_empty());
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(message);
+        assert_eq!(engine.transcript[0].text, "64044 bytes");
     }
 
     #[test]

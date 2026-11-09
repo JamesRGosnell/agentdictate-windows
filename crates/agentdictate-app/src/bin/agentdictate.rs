@@ -73,6 +73,20 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(failures == 0, "{failures} copilot check(s) failed");
                 Ok(())
             }
+            Some("--replay") => {
+                let call = args
+                    .iter()
+                    .skip(2)
+                    .find(|arg| !arg.starts_with("--"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("usage: copilot --replay <call.wav> [--upload]")
+                    })?;
+                let upload = args.iter().any(|arg| arg == "--upload");
+                let problems =
+                    agentdictate_app::run_copilot_replay(std::path::Path::new(call), upload)?;
+                anyhow::ensure!(problems == 0, "{problems} replay problem(s)");
+                Ok(())
+            }
             Some("--echo-test") => {
                 let speech = args.get(2).ok_or_else(|| {
                     anyhow::anyhow!("usage: agentdictate copilot --echo-test speech.wav")

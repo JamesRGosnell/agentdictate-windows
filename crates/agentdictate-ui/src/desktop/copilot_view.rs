@@ -2269,8 +2269,15 @@ impl CopilotWindow {
         let people = self.render_people(&labels, &lines, cx);
         let speaking_them = self.model.speaking_them;
         let speaking_me = self.model.speaking_me;
+        let partials: Vec<(Speaker, String)> = [
+            (Speaker::Them, self.model.partial_them.clone()),
+            (Speaker::Me, self.model.partial_me.clone()),
+        ]
+        .into_iter()
+        .filter(|(_, text)| !text.trim().is_empty())
+        .collect();
         let mut content = v_flex().w_full().gap(px(12.)).p(px(16.));
-        if lines.is_empty() {
+        if lines.is_empty() && partials.is_empty() {
             content = content.child(
                 div()
                     .pt(px(80.))
@@ -2334,6 +2341,39 @@ impl CopilotWindow {
                             .text_size(px(13.5))
                             .line_height(rems(1.4))
                             .child(line.text.clone()),
+                    ),
+            );
+        }
+        // Words still being transcribed, replaced by the final line.
+        for (speaker, text) in partials {
+            let (label, tint) = match speaker {
+                Speaker::Me => ("You", ME),
+                Speaker::Them => ("Them", ACCENT),
+            };
+            content = content.child(
+                h_flex()
+                    .debug_selector(move || format!("copilot-partial-{speaker:?}").to_lowercase())
+                    .w_full()
+                    .items_start()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .flex_none()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(tint).opacity(0.7))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(13.5))
+                            .line_height(rems(1.4))
+                            .italic()
+                            .text_color(color(DIM))
+                            .child(text),
                     ),
             );
         }

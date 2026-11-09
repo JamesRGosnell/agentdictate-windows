@@ -136,6 +136,9 @@ pub struct CopilotViewModel {
     pub speaking_me: bool,
     pub speaking_them: bool,
     pub transcript: Vec<TranscriptLine>,
+    /// Words heard so far of each side's speech still being transcribed.
+    pub partial_me: String,
+    pub partial_them: String,
     /// Newest last.
     pub answers: Vec<AnswerCardModel>,
     pub insights: CopilotInsights,
@@ -159,6 +162,13 @@ pub struct CopilotViewModel {
 }
 
 impl CopilotViewModel {
+    fn partial_mut(&mut self, speaker: Speaker) -> &mut String {
+        match speaker {
+            Speaker::Me => &mut self.partial_me,
+            Speaker::Them => &mut self.partial_them,
+        }
+    }
+
     #[must_use]
     pub fn new(settings: CopilotSettings, session_started_unix_ms: i64) -> Self {
         let models = settings.provider.suggested_models();
@@ -169,6 +179,8 @@ impl CopilotViewModel {
             speaking_me: false,
             speaking_them: false,
             transcript: Vec::new(),
+            partial_me: String::new(),
+            partial_them: String::new(),
             answers: Vec::new(),
             insights: CopilotInsights::default(),
             settings,
@@ -311,7 +323,12 @@ impl CopilotViewModel {
                 Speaker::Me => self.speaking_me = active,
                 Speaker::Them => self.speaking_them = active,
             },
+            CopilotEvent::PartialTranscript { speaker, text } => {
+                *self.partial_mut(speaker) = text;
+                return CopilotEffect::ScrollTranscript;
+            }
             CopilotEvent::Transcript(line) => {
+                self.partial_mut(line.speaker).clear();
                 let position = self
                     .transcript
                     .iter()

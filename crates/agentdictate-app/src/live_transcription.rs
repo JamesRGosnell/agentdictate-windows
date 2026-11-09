@@ -74,8 +74,9 @@ impl Drop for LiveTranscription {
     }
 }
 
+/// 16 kHz to 24 kHz PCM, the rate the realtime API takes.
 #[derive(Default)]
-struct Resampler {
+pub(crate) struct Resampler {
     previous: Option<i16>,
     input_index: u64,
     output_index: u64,
@@ -84,7 +85,7 @@ struct Resampler {
 
 impl Resampler {
     // Continuous linear interpolation at the exact 3:2 rate, including across chunk boundaries.
-    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         for &byte in bytes {
             let Some(first) = self.pending_byte.take() else {
@@ -109,13 +110,17 @@ impl Resampler {
     }
 }
 
-fn stream_audio(
-    audio: PathBuf,
-    options: &DictationOptions,
-    key: &str,
+pub(crate) type RealtimeSocket =
+    tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+
+/// Opens a realtime transcription session at 24 kHz PCM with turn detection
+/// off, so the caller decides when speech ends by committing. Reads time out
+/// after 40 ms so the caller can interleave sending audio and reading events.
+pub(crate) fn connect_realtime(
     url: &str,
-    command: &AtomicU8,
-) -> anyhow::Result<String> {
+    key: &str,
+    transcription: Value,
+) -> anyhow::Result<RealtimeSocket> {
     let mut request = url.into_client_request()?;
     request
         .headers_mut()
@@ -146,10 +151,57 @@ fn stream_audio(
         _ => anyhow::bail!("unsupported transport"),
     };
     tcp.set_read_timeout(Some(Duration::from_millis(40)))?;
-    socket.send(Message::text(json!({"type":"session.update","session":{"type":"transcription","audio":{"input":{
-        "format":{"type":"audio/pcm","rate":24000}, "turn_detection":null,
-        "transcription":{"model":"gpt-live-transcribe","prompt":options.context,"keywords":options.keywords(),"languages":options.languages(),"delay":"medium"}
-    }}}}).to_string()))?;
+    socket.send(Message::text(
+        json!({"type":"session.update","session":{"type":"transcription","audio":{"input":{
+            "format":{"type":"audio/pcm","rate":24000}, "turn_detection":null,
+            "transcription":transcription
+        }}}})
+        .to_string(),
+    ))?;
+    Ok(socket)
+}
+
+/// Sends PCM (24 kHz, 16-bit little-endian) to the session's input buffer.
+pub(crate) fn append_audio(socket: &mut RealtimeSocket, pcm: &[u8]) -> anyhow::Result<()> {
+    socket.send(Message::text(
+        json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(pcm)}).to_string(),
+    ))?;
+    Ok(())
+}
+
+/// Reads one server event, or `None` when nothing arrived in time.
+pub(crate) fn read_event(socket: &mut RealtimeSocket) -> anyhow::Result<Option<Value>> {
+    match socket.read() {
+        Ok(Message::Text(text)) => Ok(Some(serde_json::from_str(&text)?)),
+        Ok(Message::Close(_)) => anyhow::bail!("connection closed"),
+        Ok(_) => {
+            socket.flush()?;
+            Ok(None)
+        }
+        Err(tungstenite::Error::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn stream_audio(
+    audio: PathBuf,
+    options: &DictationOptions,
+    key: &str,
+    url: &str,
+    command: &AtomicU8,
+) -> anyhow::Result<String> {
+    let mut socket = connect_realtime(
+        url,
+        key,
+        json!({"model":"gpt-live-transcribe","prompt":options.context,"keywords":options.keywords(),"languages":options.languages(),"delay":"medium"}),
+    )?;
     let mut file = File::open(audio)?;
     let data_offset = data_start(&mut file)?;
     let mut final_end = None;
@@ -224,10 +276,7 @@ fn stream_audio(
                 if count > 0 {
                     let pcm = resampler.push(&buffer[..count]);
                     if !pcm.is_empty() {
-                        socket.send(Message::text(
-                        json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(pcm)})
-                            .to_string(),
-                    ))?;
+                        append_audio(&mut socket, &pcm)?;
                     }
                 } else if control == FINISH {
                     anyhow::ensure!(resampler.pending_byte.is_none(), "incomplete PCM sample");
@@ -241,42 +290,29 @@ fn stream_audio(
                 }
             }
         }
-        match socket.read() {
-            Ok(Message::Text(text)) => {
-                let value: Value = serde_json::from_str(&text)?;
-                match value.get("type").and_then(Value::as_str) {
-                    Some("session.updated" | "transcription_session.updated") => ready = true,
-                    Some("error" | "conversation.item.input_audio_transcription.failed") => {
-                        anyhow::bail!("service rejected transcription")
-                    }
-                    Some("input_audio_buffer.committed") if committed => {
-                        commit_id = value
-                            .get("item_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                    }
-                    Some("conversation.item.input_audio_transcription.completed") if committed => {
-                        if let (Some(id), Some(text)) = (
-                            value.get("item_id").and_then(Value::as_str),
-                            value.get("transcript").and_then(Value::as_str),
-                        ) {
-                            anyhow::ensure!(completed.len() < 8, "unexpected transcript items");
-                            completed.insert(id.into(), text.into());
-                        }
-                    }
-                    _ => {}
+        if let Some(value) = read_event(&mut socket)? {
+            match value.get("type").and_then(Value::as_str) {
+                Some("session.updated" | "transcription_session.updated") => ready = true,
+                Some("error" | "conversation.item.input_audio_transcription.failed") => {
+                    anyhow::bail!("service rejected transcription")
                 }
+                Some("input_audio_buffer.committed") if committed => {
+                    commit_id = value
+                        .get("item_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                Some("conversation.item.input_audio_transcription.completed") if committed => {
+                    if let (Some(id), Some(text)) = (
+                        value.get("item_id").and_then(Value::as_str),
+                        value.get("transcript").and_then(Value::as_str),
+                    ) {
+                        anyhow::ensure!(completed.len() < 8, "unexpected transcript items");
+                        completed.insert(id.into(), text.into());
+                    }
+                }
+                _ => {}
             }
-            Ok(Message::Close(_)) => anyhow::bail!("connection closed"),
-            Ok(_) => {
-                socket.flush()?;
-            }
-            Err(tungstenite::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(error.into()),
         }
         if let Some(text) = commit_id.as_ref().and_then(|id| completed.get(id)) {
             anyhow::ensure!(!text.trim().is_empty(), "empty transcript");

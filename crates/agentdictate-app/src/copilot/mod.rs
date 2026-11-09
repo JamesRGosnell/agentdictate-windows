@@ -15,11 +15,14 @@ mod brain;
 mod check;
 mod engine;
 mod knowledge;
+mod live;
 mod meeting;
 mod names;
 mod providers;
 #[cfg(windows)]
 mod question_eval;
+#[cfg(windows)]
+mod replay_check;
 mod reveal;
 mod store;
 mod stream;
@@ -100,6 +103,13 @@ fn is_transient_failure(error: &str) -> bool {
     ["limit", "temporarily unavailable", "could not reach"]
         .iter()
         .any(|pattern| error.contains(pattern))
+}
+
+/// Replays a recorded call through a headless session and reports how soon
+/// the transcript and answers arrived; returns the number of problems.
+#[cfg(windows)]
+pub fn run_copilot_replay(path: &std::path::Path, upload: bool) -> anyhow::Result<usize> {
+    replay_check::run(path, upload)
 }
 
 /// Lets the main window's Settings read and save the copilot's settings.
@@ -275,30 +285,22 @@ fn launch_decision(
     }
 }
 
-/// Runs the copilot process until the user ends the session.
-#[cfg(all(windows, feature = "desktop"))]
-pub fn run_copilot() -> anyhow::Result<()> {
-    use std::{
-        rc::Rc,
-        sync::{Arc, Mutex, mpsc},
-    };
+/// What a copilot session runs on: transcription (streamed when an OpenAI
+/// key is set), answer providers, models, and where notes go.
+#[cfg(windows)]
+fn session_services(
+    paths: &crate::AppPaths,
+    settings: &agentdictate_core::CopilotSettings,
+    settings_path: std::path::PathBuf,
+    platform: std::sync::Arc<dyn engine::Platform>,
+) -> anyhow::Result<engine::Services> {
+    use std::sync::{Arc, Mutex};
 
-    use agentdictate_core::{CopilotAction, CopilotEvent, CopilotProvider, ModelChoice};
-    use agentdictate_ui::{CopilotViewModel, CopilotWindowHost, run_copilot_window};
+    use agentdictate_core::{CopilotProvider, ModelChoice};
 
     use crate::codex_subscription::{ChatGptCredentials, transcribe_wav_with_chatgpt};
-    use engine::{Engine, EngineMsg, ModelLoader, ProviderFactory, Services, Transcriber, UiSink};
+    use engine::{ModelLoader, ProviderFactory, Services, Transcriber};
 
-    let Some(instance) = win::instance::acquire() else {
-        tracing::info!("meeting copilot is already running; asked it to show");
-        return Ok(());
-    };
-    tracing::info!("meeting copilot starting");
-    let paths = crate::AppPaths::from_environment()?;
-    paths.ensure_directories()?;
-    let settings_path = store::settings_path(&paths.config_file);
-    let settings = store::load(&settings_path);
-    let marker = dismissed_marker(&settings_path);
     let dictation = agentdictate_runtime::load_settings(&paths.config_file).ok();
     let language = if settings.language.trim().is_empty() {
         dictation
@@ -328,6 +330,27 @@ pub fn run_copilot() -> anyhow::Result<()> {
     }
     let known_chatgpt_models: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // An OpenAI API key streams speech as it is spoken; without one, or if
+    // the stream fails, speech is uploaded at each pause.
+    let live_factory: Option<live::LiveFactory> = {
+        let key = if settings.openai_api_key.trim().is_empty() {
+            dictation_openai_key.clone()
+        } else {
+            settings.openai_api_key.trim().to_owned()
+        };
+        let language = language.clone();
+        (!key.is_empty()).then(|| {
+            Arc::new(move |speaker, events| {
+                live::spawn(
+                    live::REALTIME_URL.into(),
+                    key.clone(),
+                    live::transcription_settings(&language),
+                    speaker,
+                    events,
+                )
+            }) as live::LiveFactory
+        })
+    };
     let transcriber: Transcriber = {
         let chatgpt = Arc::clone(&chatgpt);
         let openai_key = if settings.openai_api_key.trim().is_empty() {
@@ -414,13 +437,8 @@ pub fn run_copilot() -> anyhow::Result<()> {
         })
     };
 
-    let (ui_sender, ui_events) = mpsc::channel::<CopilotEvent>();
-    let ui: UiSink = Arc::new(move |event| {
-        let _ = ui_sender.send(event);
-    });
-    let (engine_sender, engine_messages) = mpsc::channel::<EngineMsg>();
-    let services = Services {
-        platform: Arc::new(win::WindowsPlatform),
+    Ok(Services {
+        platform,
         providers: provider_factory,
         brain: Arc::new(|settings, query| {
             brain::context(settings, query).map_err(|error| error.to_string())
@@ -431,7 +449,44 @@ pub fn run_copilot() -> anyhow::Result<()> {
         notes_dir: paths.meetings_dir(),
         knowledge_dir: paths.knowledge_dir(),
         language,
+        live: live_factory,
+    })
+}
+
+/// Runs the copilot process until the user ends the session.
+#[cfg(all(windows, feature = "desktop"))]
+pub fn run_copilot() -> anyhow::Result<()> {
+    use std::{
+        rc::Rc,
+        sync::{Arc, mpsc},
     };
+
+    use agentdictate_core::{CopilotAction, CopilotEvent};
+    use agentdictate_ui::{CopilotViewModel, CopilotWindowHost, run_copilot_window};
+
+    use engine::{Engine, EngineMsg, UiSink};
+
+    let Some(instance) = win::instance::acquire() else {
+        tracing::info!("meeting copilot is already running; asked it to show");
+        return Ok(());
+    };
+    tracing::info!("meeting copilot starting");
+    let paths = crate::AppPaths::from_environment()?;
+    paths.ensure_directories()?;
+    let settings_path = store::settings_path(&paths.config_file);
+    let settings = store::load(&settings_path);
+    let marker = dismissed_marker(&settings_path);
+    let (ui_sender, ui_events) = mpsc::channel::<CopilotEvent>();
+    let ui: UiSink = Arc::new(move |event| {
+        let _ = ui_sender.send(event);
+    });
+    let (engine_sender, engine_messages) = mpsc::channel::<EngineMsg>();
+    let services = session_services(
+        &paths,
+        &settings,
+        settings_path,
+        Arc::new(win::WindowsPlatform),
+    )?;
     let engine = Engine::new(
         services,
         settings.clone(),

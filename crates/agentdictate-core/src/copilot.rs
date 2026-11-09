@@ -1004,6 +1004,12 @@ pub enum CopilotEvent {
         active: bool,
     },
     Transcript(TranscriptLine),
+    /// Words heard so far of speech still being transcribed; empty once its
+    /// line is final.
+    PartialTranscript {
+        speaker: Speaker,
+        text: String,
+    },
     AnswerStarted {
         id: u64,
         title: String,

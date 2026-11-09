@@ -11,6 +11,8 @@ const BLOCK: usize = 320; // 20 ms
 const BLOCK_MS: usize = 20;
 /// Silent blocks kept at the end of an utterance.
 const TAIL_BLOCKS: usize = 8;
+/// Speech is streamed in chunks of about this many blocks (100 ms).
+const STREAM_CHUNK_BLOCKS: usize = 5;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SegmenterConfig {
@@ -102,6 +104,16 @@ impl Utterance {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SegmentEvent {
     SpeechStarted,
+    /// The next stretch of the utterance that started at `start_sample`, for
+    /// streaming transcription. Sent only once an utterance has enough
+    /// voiced audio to be transcribed, so noise is never streamed; the
+    /// chunks of an utterance join into exactly the samples of the
+    /// [`SegmentEvent::Provisional`] and [`SegmentEvent::Utterance`] that
+    /// follow them.
+    Speech {
+        start_sample: u64,
+        samples: Vec<i16>,
+    },
     /// Speech ended without enough voiced audio to transcribe.
     SpeechDiscarded,
     /// Speech paused long enough that it may have ended: the utterance as it
@@ -119,6 +131,8 @@ struct Active {
     silent_run: usize,
     blocks: usize,
     peak_rms: f32,
+    /// Samples already sent as [`SegmentEvent::Speech`].
+    streamed: usize,
 }
 
 pub(crate) struct Segmenter {
@@ -183,15 +197,13 @@ impl Segmenter {
             self.pending.push(sample);
             if self.pending.len() == BLOCK {
                 let block = std::mem::replace(&mut self.pending, Vec::with_capacity(BLOCK));
-                if let Some(event) = self.block(block) {
-                    events.push(event);
-                }
+                self.block(block, &mut events);
             }
         }
         events
     }
 
-    fn block(&mut self, block: Vec<f32>) -> Option<SegmentEvent> {
+    fn block(&mut self, block: Vec<f32>, events: &mut Vec<SegmentEvent>) {
         let rms = (block.iter().map(|sample| sample * sample).sum::<f32>() / BLOCK as f32).sqrt();
         self.last_rms = rms;
         let block_start = self.consumed_samples;
@@ -215,15 +227,20 @@ impl Segmenter {
                 self.config.end_blocks
             };
             if active.silent_run >= end_after || active.blocks >= self.config.max_blocks {
-                return Some(self.close());
+                self.close(events);
+                return;
             }
+            let min_speech = self.config.min_speech_blocks;
             if self.config.provisional_blocks > 0
                 && active.silent_run == self.config.provisional_blocks
-                && active.voiced_blocks >= self.config.min_speech_blocks
+                && active.voiced_blocks >= min_speech
             {
-                return Some(SegmentEvent::Provisional(Self::utterance(active)));
+                Self::stream(active, min_speech, 0, events);
+                events.push(SegmentEvent::Provisional(Self::utterance(active)));
+                return;
             }
-            return None;
+            Self::stream(active, min_speech, STREAM_CHUNK_BLOCKS * BLOCK, events);
+            return;
         }
         if voiced {
             self.onset_run += 1;
@@ -250,31 +267,59 @@ impl Segmenter {
                 voiced_blocks: self.onset_run,
                 silent_run: 0,
                 peak_rms: rms,
+                streamed: 0,
             });
             self.onset_run = 0;
-            return Some(SegmentEvent::SpeechStarted);
+            events.push(SegmentEvent::SpeechStarted);
         }
-        None
     }
 
-    fn close(&mut self) -> SegmentEvent {
-        let active = self.active.take().expect("an active utterance");
-        if active.voiced_blocks < self.config.min_speech_blocks {
-            return SegmentEvent::SpeechDiscarded;
+    /// Samples of the utterance that would be kept if it ended now: silence
+    /// past the kept tail is dropped. Never shrinks as the utterance grows.
+    fn kept(active: &Active) -> usize {
+        let dropped_blocks = active.silent_run.saturating_sub(TAIL_BLOCKS);
+        active.samples.len().saturating_sub(dropped_blocks * BLOCK)
+    }
+
+    /// Sends the kept samples not yet streamed, once the utterance has enough
+    /// voiced audio and at least `min_chunk` samples are waiting.
+    fn stream(
+        active: &mut Active,
+        min_speech_blocks: usize,
+        min_chunk: usize,
+        events: &mut Vec<SegmentEvent>,
+    ) {
+        if active.voiced_blocks < min_speech_blocks {
+            return;
         }
-        SegmentEvent::Utterance(Self::utterance(&active))
+        let kept = Self::kept(active);
+        if kept <= active.streamed || kept - active.streamed < min_chunk.max(1) {
+            return;
+        }
+        events.push(SegmentEvent::Speech {
+            start_sample: active.start_sample,
+            samples: to_pcm(&active.samples[active.streamed..kept]),
+        });
+        active.streamed = kept;
+    }
+
+    fn close(&mut self, events: &mut Vec<SegmentEvent>) {
+        let mut active = self.active.take().expect("an active utterance");
+        if active.voiced_blocks < self.config.min_speech_blocks {
+            events.push(SegmentEvent::SpeechDiscarded);
+            return;
+        }
+        Self::stream(&mut active, self.config.min_speech_blocks, 0, events);
+        events.push(SegmentEvent::Utterance(Self::utterance(&active)));
     }
 
     /// The utterance as it would end now. Silence past the kept tail is
     /// dropped, so the samples stay the same however long the pause runs.
     fn utterance(active: &Active) -> Utterance {
         let dropped_blocks = active.silent_run.saturating_sub(TAIL_BLOCKS);
-        let keep = active.samples.len().saturating_sub(dropped_blocks * BLOCK);
+        let keep = Self::kept(active);
         Utterance {
-            samples: active.samples[..keep]
-                .iter()
-                .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16)
-                .collect(),
+            samples: to_pcm(&active.samples[..keep]),
             start_sample: active.start_sample,
             voiced_blocks: active.voiced_blocks,
             peak_rms: active.peak_rms,
@@ -289,11 +334,20 @@ impl Segmenter {
         self.onset_run = 0;
         self.pre_roll.clear();
         self.active.as_ref()?;
-        match self.close() {
+        let mut events = Vec::new();
+        self.close(&mut events);
+        events.into_iter().find_map(|event| match event {
             SegmentEvent::Utterance(utterance) => Some(utterance),
             _ => None,
-        }
+        })
     }
+}
+
+fn to_pcm(samples: &[f32]) -> Vec<i16> {
+    samples
+        .iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16)
+        .collect()
 }
 
 /// Linear resampler from an arbitrary device rate to 16 kHz mono.
@@ -370,6 +424,66 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Joins the streamed chunks of the utterance starting at `start`.
+    fn streamed(events: &[SegmentEvent], start: u64) -> Vec<i16> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SegmentEvent::Speech {
+                    start_sample,
+                    samples,
+                } if *start_sample == start => Some(samples.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn streamed_speech_joins_into_the_provisional_and_final_utterance() {
+        let mut segmenter = Segmenter::new(SegmenterConfig::system_audio());
+        let mut events = segmenter.push(&silence(400));
+        events.extend(segmenter.push(&tone(900, 0.3)));
+        let chunks = events
+            .iter()
+            .filter(|event| matches!(event, SegmentEvent::Speech { .. }))
+            .count();
+        assert!(chunks >= 5, "{chunks} chunks streamed while speaking");
+        events.extend(segmenter.push(&silence(400)));
+        let provisional = events
+            .iter()
+            .find_map(|event| match event {
+                SegmentEvent::Provisional(utterance) => Some(utterance.clone()),
+                _ => None,
+            })
+            .expect("a provisional utterance");
+        assert_eq!(
+            streamed(&events, provisional.start_sample),
+            provisional.samples
+        );
+        // Speech resumes, then ends: the stream covers the whole utterance.
+        events.extend(segmenter.push(&tone(500, 0.3)));
+        events.extend(segmenter.push(&silence(1_000)));
+        let utterance = utterances(events.clone()).remove(0);
+        assert_eq!(utterance.start_sample, provisional.start_sample);
+        assert!(utterance.samples.len() > provisional.samples.len());
+        assert_eq!(streamed(&events, utterance.start_sample), utterance.samples);
+    }
+
+    #[test]
+    fn short_noise_is_never_streamed() {
+        let mut segmenter = Segmenter::new(SegmenterConfig::microphone());
+        let mut events = segmenter.push(&silence(400));
+        events.extend(segmenter.push(&tone(120, 0.3)));
+        events.extend(segmenter.push(&silence(1_000)));
+        assert!(events.contains(&SegmentEvent::SpeechDiscarded));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SegmentEvent::Speech { .. }))
+        );
     }
 
     #[test]

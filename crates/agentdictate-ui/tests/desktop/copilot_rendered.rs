@@ -770,3 +770,24 @@ fn turning_off_screen_share_hiding_updates_the_host(cx: &mut TestAppContext) {
             .any(|call| call == "capture excluded false")
     );
 }
+
+#[gpui::test]
+fn words_heard_so_far_show_until_the_final_line_replaces_them(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness
+        .view
+        .update(harness.cx, |view, cx| view.show_transcript(cx));
+    harness.send(CopilotEvent::PartialTranscript {
+        speaker: Speaker::Them,
+        text: "So what does pricing look".into(),
+    });
+    assert!(harness.has("copilot-partial-them"));
+    assert!(!harness.has("copilot-partial-me"));
+    harness.send(CopilotEvent::Transcript(them(
+        1,
+        0,
+        "So what does pricing look like?",
+        0,
+    )));
+    assert!(!harness.has("copilot-partial-them"));
+}

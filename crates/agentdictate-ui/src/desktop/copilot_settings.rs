@@ -45,6 +45,9 @@ fn store() -> Option<CopilotSettingsStore> {
     STORE.with(|slot| slot.borrow().clone())
 }
 
+/// A switch: label, detail, whether it is on, and how to flip it.
+type Toggle = (&'static str, &'static str, bool, fn(&mut CopilotSettings));
+
 const SAVED: &str = "Saved. Applies when your next meeting starts.";
 
 #[derive(Default)]
@@ -279,7 +282,7 @@ pub(super) fn section(
         })
         .collect::<Vec<_>>();
 
-    let toggles: [(&'static str, &'static str, bool, fn(&mut CopilotSettings)); 8] = [
+    let toggles: [Toggle; 8] = [
         (
             "Answer questions automatically",
             "Show an answer when someone asks you something",
