@@ -333,6 +333,12 @@ fn wait_for_instant(done: &Receiver<()>, cancel: &AtomicBool) -> bool {
 /// the service needs at least that much audio to transcribe.
 const MIN_COMMIT_SAMPLES: usize = 1_600;
 
+/// Whether a final line asks what was judged from its partial words.
+fn same_question(partial: &str, line: &str) -> bool {
+    let partial = partial.trim();
+    line.contains(partial) || utterance_similarity(partial, line) >= 0.7
+}
+
 /// One side's streaming transcription.
 #[derive(Default)]
 struct LiveLane {
@@ -398,6 +404,9 @@ struct PendingTurn {
     likely: bool,
     draft: Option<Draft>,
     heard: Instant,
+    /// Started from words still being heard; waits for the line to be
+    /// final before it can be shown, and is redone if the line changed.
+    awaiting_final: bool,
 }
 
 /// An answer drafted ahead of the verdict, hidden until confirmed.
@@ -1312,7 +1321,13 @@ impl Engine {
                     .collect();
                 shown.push(&lane.partial);
                 let text = shown.join(" ").trim().to_owned();
-                (self.ui)(CopilotEvent::PartialTranscript { speaker, text });
+                (self.ui)(CopilotEvent::PartialTranscript {
+                    speaker,
+                    text: text.clone(),
+                });
+                if speaker == Speaker::Them {
+                    self.consider_partial_turn(&text);
+                }
             }
             LiveEvent::Committed { tag, text } => {
                 lane.partial.clear();
@@ -1605,14 +1620,67 @@ impl Engine {
     /// hidden until the judgment and a pause confirm it, so confirming adds no
     /// delay; other lines are answered once the judge asks for it.
     fn consider_turn(&mut self, text: String, end_ms: u64, voice: Option<u8>) {
-        if !self.settings.auto_answer
-            || self.ending
-            || !self.insights.situation.user_takes_part()
-            || !turn_candidate(&text)
-            || only_listening(&self.transcript, self.elapsed_ms())
+        if !self.may_consider_turn(&text) {
+            if self
+                .pending_turn
+                .as_ref()
+                .is_some_and(|turn| turn.awaiting_final)
+            {
+                self.drop_turn();
+            }
+            return;
+        }
+        // The question was already being judged and drafted from the words
+        // heard so far: keep that work when the final line says the same.
+        if let Some(turn) = self
+            .pending_turn
+            .as_mut()
+            .filter(|turn| turn.awaiting_final && same_question(&turn.text, &text))
+        {
+            tracing::info!(
+                turn_id = turn.id,
+                head_start_ms = turn.heard.elapsed().as_millis() as u64,
+                "a question judged from partial words became final"
+            );
+            turn.awaiting_final = false;
+            turn.text = text;
+            turn.end_ms = end_ms;
+            turn.voice = voice;
+            turn.heard = Instant::now();
+            self.evaluate_turn();
+            return;
+        }
+        self.start_turn(text, end_ms, voice, false);
+    }
+
+    fn may_consider_turn(&self, text: &str) -> bool {
+        self.settings.auto_answer
+            && !self.ending
+            && self.insights.situation.user_takes_part()
+            && turn_candidate(text)
+            && !only_listening(&self.transcript, self.elapsed_ms())
+    }
+
+    /// Judges and drafts a question the other side is still finishing, so
+    /// the answer is ready sooner. Nothing shows before the line is final
+    /// and the usual pause confirms it.
+    fn consider_partial_turn(&mut self, text: &str) {
+        let text = text.trim();
+        if !text.ends_with('?') || !turn_likely_question(text) || !self.may_consider_turn(text) {
+            return;
+        }
+        if self
+            .pending_turn
+            .as_ref()
+            .is_some_and(|turn| turn.awaiting_final && same_question(&turn.text, text))
         {
             return;
         }
+        tracing::info!("judging a question from partial words");
+        self.start_turn(text.to_owned(), 0, None, true);
+    }
+
+    fn start_turn(&mut self, text: String, end_ms: u64, voice: Option<u8>, awaiting_final: bool) {
         self.drop_turn();
         let id = self.next_turn;
         self.next_turn += 1;
@@ -1643,6 +1711,7 @@ impl Engine {
             likely,
             draft,
             heard: Instant::now(),
+            awaiting_final,
         });
     }
 
@@ -1704,7 +1773,11 @@ impl Engine {
     /// Wake at the question's actual confirmation deadline when audio goes
     /// quiet, rather than rounding it up to the next 250 ms maintenance tick.
     fn next_wait(&self) -> Duration {
-        let Some(turn) = self.pending_turn.as_ref().filter(|_| !self.them_speaking) else {
+        let Some(turn) = self
+            .pending_turn
+            .as_ref()
+            .filter(|turn| !self.them_speaking && !turn.awaiting_final)
+        else {
             return IDLE_TICK;
         };
         let pause_left = Duration::from_millis(
@@ -1725,6 +1798,14 @@ impl Engine {
         let Some(turn) = self.pending_turn.as_ref() else {
             return;
         };
+        if turn.awaiting_final {
+            // Speech that runs on long past the question was not a question
+            // to answer.
+            if turn.heard.elapsed() > TURN_EXPIRY {
+                self.drop_turn();
+            }
+            return;
+        }
         let resumed = self.them_spans.iter().any(|span| {
             kept_talking(
                 turn.end_ms,
@@ -3116,6 +3197,71 @@ mod tests {
     }
 
     #[test]
+    fn a_question_heard_in_partial_words_is_judged_and_drafted_before_it_ends() {
+        let ((mut engine, _incoming, _events, requests, _directory), _sent) = live_harness();
+        engine.handle_live(
+            Speaker::Them,
+            LiveEvent::Partial("What does pricing look like for us?".into()),
+        );
+        let turn = engine.pending_turn.as_ref().expect("judged early");
+        assert!(turn.awaiting_final);
+        let early = turn.id;
+        assert!(turn.draft.is_some(), "the answer is drafted, hidden");
+        // More partial words of the same question start nothing new.
+        engine.handle_live(
+            Speaker::Them,
+            LiveEvent::Partial("What does pricing look like for us?".into()),
+        );
+        assert_eq!(engine.pending_turn.as_ref().unwrap().id, early);
+        // Nothing shows while the line is still being heard, verdict or not.
+        engine.pending_turn.as_mut().unwrap().verdict = Some(true);
+        engine.evaluate_turn();
+        assert!(engine.pending_turn.is_some());
+        assert_eq!(engine.next_wait(), IDLE_TICK);
+        // The final line says the same: the early work is kept.
+        engine.consider_turn("What does pricing look like for us?".into(), 4_000, None);
+        let turn = engine.pending_turn.as_ref().unwrap();
+        assert_eq!(turn.id, early);
+        assert!(!turn.awaiting_final);
+        assert_eq!(turn.end_ms, 4_000);
+        let judged = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.system == turn_judge_system_prompt())
+            .count();
+        assert!(judged <= 1, "judged once, not again for the final line");
+    }
+
+    #[test]
+    fn a_partial_question_that_ends_differently_is_judged_again() {
+        let ((mut engine, _incoming, _events, _requests, _directory), _sent) = live_harness();
+        engine.handle_live(
+            Speaker::Them,
+            LiveEvent::Partial("Is that included?".into()),
+        );
+        let early = engine.pending_turn.as_ref().unwrap().id;
+        engine.consider_turn(
+            "Before that, walk me through how onboarding works for a new team.".into(),
+            4_000,
+            None,
+        );
+        let turn = engine.pending_turn.as_ref().unwrap();
+        assert_ne!(turn.id, early);
+        assert!(!turn.awaiting_final);
+    }
+
+    #[test]
+    fn partial_words_that_are_not_a_question_start_nothing() {
+        let ((mut engine, _incoming, _events, _requests, _directory), _sent) = live_harness();
+        engine.handle_live(
+            Speaker::Them,
+            LiveEvent::Partial("So what we really need is".into()),
+        );
+        assert!(engine.pending_turn.is_none());
+    }
+
+    #[test]
     fn question_timers_wake_at_confirmation_and_verdict_deadlines() {
         let (mut engine, _incoming, _events, _requests, _directory) =
             harness(CopilotSettings::default());
@@ -3130,6 +3276,7 @@ mod tests {
             likely: true,
             draft: None,
             heard: Instant::now(),
+            awaiting_final: false,
         });
         assert!(engine.next_wait() <= Duration::from_millis(20));
         engine.them_speaking = true;
@@ -3356,6 +3503,7 @@ mod tests {
                 likely: true,
                 draft: None,
                 heard: Instant::now() - Duration::from_millis(1_600),
+                awaiting_final: false,
             });
             engine.evaluate_turn();
         };

@@ -65,6 +65,7 @@ pub(crate) fn run(path: &Path, upload: bool) -> anyhow::Result<usize> {
     let seconds =
         read_speech(path).map_err(anyhow::Error::msg)?.len() as f64 / f64::from(SAMPLE_RATE);
     let paths = crate::AppPaths::from_environment()?;
+    let _log = crate::init_file_logging(&paths.logs, "copilot-replay.log")?;
     let mut settings = store::load(&store::settings_path(&paths.config_file));
     settings.save_notes = false;
     settings.live_insights = false;

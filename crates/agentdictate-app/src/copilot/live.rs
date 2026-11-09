@@ -109,7 +109,7 @@ pub(crate) fn spawn(
 
 /// The transcription settings for a call in `language` (empty: automatic).
 pub(crate) fn transcription_settings(language: &str) -> Value {
-    let mut settings = json!({"model": "gpt-live-transcribe", "delay": "medium"});
+    let mut settings = json!({"model": "gpt-live-transcribe", "delay": "low"});
     let language = language.trim();
     if !language.is_empty() {
         settings["languages"] = json!([language]);
