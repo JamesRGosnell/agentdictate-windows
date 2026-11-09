@@ -49,10 +49,20 @@ pub struct AgentProcess {
     should_quit: bool,
 }
 
+/// One OpenAI API key serves the whole app: without a key of its own,
+/// dictation uses the one saved for the meeting copilot, for transcription,
+/// cleanup and the model list alike.
+fn adopt_shared_api_key(settings: &mut agentdictate_core::Settings, config_file: &std::path::Path) {
+    if settings.openai_api_key.trim().is_empty() {
+        settings.openai_api_key = crate::copilot::saved_openai_key(config_file);
+    }
+}
+
 impl AgentProcess {
     pub fn open(paths: AppPaths) -> anyhow::Result<Self> {
         paths.ensure_directories()?;
-        let settings = load_settings(&paths.config_file)?;
+        let mut settings = load_settings(&paths.config_file)?;
+        adopt_shared_api_key(&mut settings, &paths.config_file);
         let runtime = Runtime::open(&paths.database_file)?;
         runtime.reconcile_recovery_deletions(&paths.recordings)?;
         let model_catalog = ModelCatalog::open(&paths.cache, &settings.openai_api_key);
@@ -292,6 +302,7 @@ impl AgentProcess {
         let mut settings = self.daemon.settings().clone();
         settings.openai_api_key = api_key.trim().to_owned();
         save_settings(&self.config_file, &settings)?;
+        adopt_shared_api_key(&mut settings, &self.config_file);
         let transcriber = self.daemon.transcriber_mut();
         transcriber
             .speech_mut()

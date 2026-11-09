@@ -103,3 +103,23 @@ fn app_paths(root: &Path) -> AppPaths {
         root.join("runtime"),
     )
 }
+
+#[test]
+fn the_meeting_copilots_openai_key_serves_dictation_too() {
+    let directory = tempdir().unwrap();
+    let paths = app_paths(directory.path());
+    std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        paths.config_file.with_file_name("copilot.json"),
+        r#"{"openai_api_key": "sk-shared-test"}"#,
+    )
+    .unwrap();
+    let mut process = AgentProcess::open(paths).unwrap();
+    let ServerMessageKind::Snapshot { settings, .. } =
+        process.handle(ClientCommand::get_snapshot(1)).kind
+    else {
+        panic!("snapshot query should return settings");
+    };
+    assert!(settings.has_api_key, "one key serves the whole app");
+    assert!(settings.values.openai_api_key.is_empty(), "never sent to the UI");
+}

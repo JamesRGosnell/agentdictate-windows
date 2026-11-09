@@ -127,6 +127,15 @@ pub fn install_copilot_settings_store() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The OpenAI API key saved in the copilot's settings beside
+/// `config_file`, or empty.
+pub(crate) fn saved_openai_key(config_file: &std::path::Path) -> String {
+    store::load(&store::settings_path(config_file))
+        .openai_api_key
+        .trim()
+        .to_owned()
+}
+
 /// Starts the copilot, or brings the running one forward.
 #[cfg(windows)]
 pub fn launch_copilot() -> std::io::Result<()> {

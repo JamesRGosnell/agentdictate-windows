@@ -219,9 +219,9 @@ pub(super) fn section(
         },
         "OpenAI API key",
         if provider == CopilotProvider::OpenaiApi {
-            "Answers and transcribes the call; stored on this computer"
+            "Answers, transcribes calls and dictation; stored on this computer"
         } else {
-            "Transcribes the call; stored on this computer"
+            "Transcribes calls and dictation; stored on this computer"
         },
         openai_key,
         "copilot-settings-save-openai-key",
