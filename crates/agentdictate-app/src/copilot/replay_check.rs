@@ -1,4 +1,4 @@
-//! `agentdictate copilot --replay <call.wav> [--upload]`: plays a recorded
+//! `agentdictate copilot --replay <call.wav> [--upload] [--instant=<model>]`: plays a recorded
 //! call through a real copilot session with no window and reports how soon
 //! the transcript and automatic answers arrived.
 //!
@@ -61,7 +61,7 @@ impl Platform for ReplayPlatform {
 }
 
 /// Replays `path` and prints the timings. Returns the number of problems.
-pub(crate) fn run(path: &Path, upload: bool) -> anyhow::Result<usize> {
+pub(crate) fn run(path: &Path, upload: bool, instant: Option<&str>) -> anyhow::Result<usize> {
     let seconds =
         read_speech(path).map_err(anyhow::Error::msg)?.len() as f64 / f64::from(SAMPLE_RATE);
     let paths = crate::AppPaths::from_environment()?;
@@ -72,6 +72,9 @@ pub(crate) fn run(path: &Path, upload: bool) -> anyhow::Result<usize> {
     settings.web_search = false;
     settings.screen_context = false;
     settings.auto_answer = true;
+    if let Some(model) = instant {
+        settings.set_fast_model(model);
+    }
     let mut services = session_services(
         &paths,
         &settings,

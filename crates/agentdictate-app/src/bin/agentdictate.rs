@@ -79,11 +79,17 @@ fn run() -> anyhow::Result<()> {
                     .skip(2)
                     .find(|arg| !arg.starts_with("--"))
                     .ok_or_else(|| {
-                        anyhow::anyhow!("usage: copilot --replay <call.wav> [--upload]")
+                        anyhow::anyhow!(
+                            "usage: copilot --replay <call.wav> [--upload] [--instant=<model>]"
+                        )
                     })?;
                 let upload = args.iter().any(|arg| arg == "--upload");
-                let problems =
-                    agentdictate_app::run_copilot_replay(std::path::Path::new(call), upload)?;
+                let instant = args.iter().find_map(|arg| arg.strip_prefix("--instant="));
+                let problems = agentdictate_app::run_copilot_replay(
+                    std::path::Path::new(call),
+                    upload,
+                    instant,
+                )?;
                 anyhow::ensure!(problems == 0, "{problems} replay problem(s)");
                 Ok(())
             }

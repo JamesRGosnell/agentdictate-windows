@@ -108,8 +108,12 @@ fn is_transient_failure(error: &str) -> bool {
 /// Replays a recorded call through a headless session and reports how soon
 /// the transcript and answers arrived; returns the number of problems.
 #[cfg(windows)]
-pub fn run_copilot_replay(path: &std::path::Path, upload: bool) -> anyhow::Result<usize> {
-    replay_check::run(path, upload)
+pub fn run_copilot_replay(
+    path: &std::path::Path,
+    upload: bool,
+    instant: Option<&str>,
+) -> anyhow::Result<usize> {
+    replay_check::run(path, upload, instant)
 }
 
 /// Lets the main window's Settings read and save the copilot's settings.

@@ -1201,7 +1201,9 @@ fn median(values: &[u128]) -> String {
 /// Compares models role by role on one realistic sales call: the turn judge,
 /// the instant line, rewrites, and research. Every model gets the same
 /// prompts; each run is timed to first text and completion and its facts are
-/// checked. `claude:<model>` runs through the Claude Code CLI.
+/// checked. `claude:<model>` runs through the Claude Code CLI,
+/// `anthropic:<model>` on the Anthropic API key, and `chatgpt:<model>` on the
+/// ChatGPT sign-in.
 pub(crate) fn bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize> {
     use std::collections::BTreeMap;
 
@@ -1234,15 +1236,22 @@ pub(crate) fn bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize>
     };
     let lane = |model: &str| -> Result<(Box<dyn providers::AnswerProvider>, String), String> {
         let mut lane = settings.clone();
-        let model = match model.strip_prefix("claude:") {
-            Some(model) => {
-                lane.provider = CopilotProvider::ClaudeCode;
-                model
-            }
-            None => {
+        let model = if let Some(model) = model.strip_prefix("claude:") {
+            lane.provider = CopilotProvider::ClaudeCode;
+            model
+        } else if let Some(model) = model.strip_prefix("anthropic:") {
+            lane.provider = CopilotProvider::AnthropicApi;
+            model
+        } else if let Some(model) = model.strip_prefix("chatgpt:") {
+            lane.provider = CopilotProvider::ChatgptSubscription;
+            model
+        } else {
+            // GPT models run on the OpenAI key when that is the chosen
+            // engine, otherwise on the ChatGPT sign-in.
+            if lane.provider != CopilotProvider::OpenaiApi {
                 lane.provider = CopilotProvider::ChatgptSubscription;
-                model
             }
+            model
         };
         lane.set_answer_model(model.to_owned());
         Ok((
@@ -1473,11 +1482,18 @@ and annual billing saves you a fair bit compared with paying monthly.";
             for (question, facts) in questions {
                 let request = AnswerRequest {
                     system: system.clone(),
-                    user: answer_user_prompt(
-                        &transcript,
-                        &detected_question_instruction(question),
-                        false,
-                        "",
+                    // As the engine asks for an instant draft.
+                    user: format!(
+                        "{}
+
+{}",
+                        answer_user_prompt(
+                            &transcript,
+                            &detected_question_instruction(question),
+                            false,
+                            "",
+                        ),
+                        agentdictate_core::INSTANT_GUIDANCE
                     ),
                     image_jpeg: None,
                     model: id.clone(),
