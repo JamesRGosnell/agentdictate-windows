@@ -93,6 +93,29 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(problems == 0, "{problems} replay problem(s)");
                 Ok(())
             }
+            Some("--score") => {
+                let recording = args
+                    .iter()
+                    .skip(2)
+                    .find(|arg| !arg.starts_with("--"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "usage: copilot --score <recording> [--me=<speaker>] [--minutes=<n>] [--from=<minute>] [--documents=<folder>]"
+                        )
+                    })?;
+                let value = |name: &str| args.iter().find_map(|arg| arg.strip_prefix(name));
+                let problems = agentdictate_app::run_copilot_score(
+                    std::path::Path::new(recording),
+                    value("--me="),
+                    value("--minutes=").and_then(|minutes| minutes.parse().ok()),
+                    value("--from=")
+                        .and_then(|from| from.parse().ok())
+                        .unwrap_or(0.0),
+                    value("--documents=").map(std::path::Path::new),
+                )?;
+                anyhow::ensure!(problems == 0, "{problems} problem(s) while scoring");
+                Ok(())
+            }
             Some("--echo-test") => {
                 let speech = args.get(2).ok_or_else(|| {
                     anyhow::anyhow!("usage: agentdictate copilot --echo-test speech.wav")

@@ -27,6 +27,8 @@ mod question_eval;
 #[cfg(windows)]
 mod replay_check;
 mod reveal;
+#[cfg(windows)]
+mod score;
 mod store;
 mod stream;
 mod vad;
@@ -117,6 +119,26 @@ pub fn run_copilot_replay(
     instant: Option<&str>,
 ) -> anyhow::Result<usize> {
     replay_check::run(path, upload, instant)
+}
+
+/// Plays a recorded conversation through a headless session, with one
+/// speaker as the user, and scores every suggestion against what that person
+/// really said; returns the number of problems.
+#[cfg(windows)]
+pub fn run_copilot_score(
+    recording: &std::path::Path,
+    me: Option<&str>,
+    minutes: Option<f64>,
+    from: f64,
+    documents: Option<&std::path::Path>,
+) -> anyhow::Result<usize> {
+    score::run(&score::Options {
+        recording: recording.to_owned(),
+        me: me.map(str::to_owned),
+        minutes,
+        from,
+        documents: documents.map(std::path::Path::to_owned),
+    })
 }
 
 /// Lets the main window's Settings read and save the copilot's settings.

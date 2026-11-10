@@ -5,7 +5,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
@@ -53,10 +53,34 @@ pub(crate) struct ReplayAudio {
     worker: Option<JoinHandle<()>>,
 }
 
+/// One side of a replayed call: who is speaking and their audio, with
+/// silence where the other side speaks.
+pub(crate) struct Lane {
+    pub speaker: Speaker,
+    pub samples: Vec<f32>,
+}
+
 impl ReplayAudio {
     pub(crate) fn start(path: PathBuf, sink: AudioSink) -> Result<Self, String> {
         let samples = read_speech(&path)?;
         tracing::info!(path = %path.display(), seconds = samples.len() / SAMPLE_RATE as usize, "replaying a recorded call");
+        Self::start_lanes(
+            vec![Lane {
+                speaker: Speaker::Them,
+                samples,
+            }],
+            Arc::default(),
+            sink,
+        )
+    }
+
+    /// Plays every lane at once, in real time. `began` is set when the first
+    /// sample plays.
+    pub(crate) fn start_lanes(
+        lanes: Vec<Lane>,
+        began: Arc<OnceLock<Instant>>,
+        sink: AudioSink,
+    ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let worker = {
@@ -64,7 +88,7 @@ impl ReplayAudio {
             let paused = Arc::clone(&paused);
             std::thread::Builder::new()
                 .name("copilot-replay".into())
-                .spawn(move || replay(&samples, &sink, &stop, &paused))
+                .spawn(move || replay(&lanes, &began, &sink, &stop, &paused))
                 .map_err(|error| error.to_string())?
         };
         Ok(Self {
@@ -75,10 +99,23 @@ impl ReplayAudio {
     }
 }
 
-fn replay(samples: &[f32], sink: &AudioSink, stop: &AtomicBool, paused: &AtomicBool) {
-    let speaker = Speaker::Them;
-    let mut segmenter = Segmenter::new(SegmenterConfig::system_audio());
-    let emit = |events: Vec<SegmentEvent>| {
+fn replay(
+    lanes: &[Lane],
+    began: &OnceLock<Instant>,
+    sink: &AudioSink,
+    stop: &AtomicBool,
+    paused: &AtomicBool,
+) {
+    let mut segmenters: Vec<Segmenter> = lanes
+        .iter()
+        .map(|lane| {
+            Segmenter::new(match lane.speaker {
+                Speaker::Me => SegmenterConfig::microphone(),
+                Speaker::Them => SegmenterConfig::system_audio(),
+            })
+        })
+        .collect();
+    let emit = |speaker: Speaker, events: Vec<SegmentEvent>| {
         for message in events
             .into_iter()
             .flat_map(|event| AudioMsg::from_segment(speaker, event))
@@ -89,8 +126,14 @@ fn replay(samples: &[f32], sink: &AudioSink, stop: &AtomicBool, paused: &AtomicB
     // Let the window open before the "call" begins.
     std::thread::sleep(Duration::from_millis(2_500));
     let block = SAMPLE_RATE as usize / 50;
+    let blocks = lanes
+        .iter()
+        .map(|lane| lane.samples.len().div_ceil(block))
+        .max()
+        .unwrap_or(0);
     let started = Instant::now();
-    for (index, chunk) in samples.chunks(block).enumerate() {
+    let _ = began.set(started);
+    for index in 0..blocks {
         if stop.load(Ordering::Relaxed) {
             return;
         }
@@ -101,19 +144,25 @@ fn replay(samples: &[f32], sink: &AudioSink, stop: &AtomicBool, paused: &AtomicB
         if paused.load(Ordering::Relaxed) {
             continue;
         }
-        emit(segmenter.push(chunk));
-        if index % 3 == 0 {
-            sink(AudioMsg::Level {
-                speaker,
-                level: segmenter.level(),
-            });
+        for (lane, segmenter) in lanes.iter().zip(&mut segmenters) {
+            let from = (index * block).min(lane.samples.len());
+            let to = (from + block).min(lane.samples.len());
+            emit(lane.speaker, segmenter.push(&lane.samples[from..to]));
+            if index % 3 == 0 {
+                sink(AudioMsg::Level {
+                    speaker: lane.speaker,
+                    level: segmenter.level(),
+                });
+            }
         }
     }
-    emit(segmenter.push_silence(SAMPLE_RATE as usize));
-    sink(AudioMsg::Level {
-        speaker,
-        level: 0.0,
-    });
+    for (lane, segmenter) in lanes.iter().zip(&mut segmenters) {
+        emit(lane.speaker, segmenter.push_silence(SAMPLE_RATE as usize));
+        sink(AudioMsg::Level {
+            speaker: lane.speaker,
+            level: 0.0,
+        });
+    }
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(100));
     }
