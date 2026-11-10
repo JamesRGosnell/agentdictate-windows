@@ -56,6 +56,10 @@ const KNOWLEDGE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// Connections opened when a session starts: the judge, the instant draft,
 /// and the researched answer run at the same time.
 const WARM_CONNECTIONS: usize = 3;
+/// Judgments asked for at once where requests are billed singly: most come
+/// back in about a second but one in ten takes twice that, and the first
+/// to arrive decides.
+const RACED_JUDGES: usize = 2;
 /// Longest the researched answer waits for the instant draft it continues.
 const INSTANT_WAIT: Duration = Duration::from_secs(8);
 const CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
@@ -698,7 +702,8 @@ impl Engine {
             max_output_tokens: 16,
             cache_key: format!("{}-warm-up", self.session_key),
         };
-        for lane in 0..WARM_CONNECTIONS {
+        // Each raced judgment needs a connection of its own.
+        for lane in 0..WARM_CONNECTIONS + self.judges() - 1 {
             let providers = Arc::clone(&self.services.providers);
             let settings = settings.clone();
             let request = request.clone();
@@ -1762,25 +1767,54 @@ impl Engine {
             max_output_tokens: 200,
             cache_key: format!("{}-turns", self.session_key),
         };
-        let providers = Arc::clone(&self.services.providers);
-        let messages = self.messages.clone();
-        let _ = std::thread::Builder::new()
-            .name("copilot-turn".into())
-            .spawn(move || {
-                let started = Instant::now();
-                let cancel = AtomicBool::new(false);
-                let respond = providers(&settings)
-                    .and_then(|provider| complete(provider.as_ref(), &request, &cancel))
-                    .ok()
-                    .and_then(|text| parse_turn_verdict(&text));
-                tracing::info!(
-                    turn_id = id,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    ?respond,
-                    "copilot turn judged"
-                );
-                let _ = messages.send(EngineMsg::TurnVerdict { id, respond });
-            });
+        let judges = self.judges();
+        let request = Arc::new(request);
+        let settings = Arc::new(settings);
+        // Set by the first judgment; the others stop and stay silent.
+        let decided = Arc::new(AtomicBool::new(false));
+        let undecided = Arc::new(AtomicUsize::new(judges));
+        for _ in 0..judges {
+            let providers = Arc::clone(&self.services.providers);
+            let messages = self.messages.clone();
+            let request = Arc::clone(&request);
+            let settings = Arc::clone(&settings);
+            let decided = Arc::clone(&decided);
+            let undecided = Arc::clone(&undecided);
+            let _ = std::thread::Builder::new()
+                .name("copilot-turn".into())
+                .spawn(move || {
+                    let started = Instant::now();
+                    let respond = providers(&settings)
+                        .and_then(|provider| complete(provider.as_ref(), &request, &decided))
+                        .ok()
+                        .and_then(|text| parse_turn_verdict(&text));
+                    let last = undecided.fetch_sub(1, Ordering::AcqRel) == 1;
+                    // A failed judgment is reported only when none is left to
+                    // do better.
+                    if respond.is_none() && !last {
+                        return;
+                    }
+                    if decided.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                    tracing::info!(
+                        turn_id = id,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        ?respond,
+                        "copilot turn judged"
+                    );
+                    let _ = messages.send(EngineMsg::TurnVerdict { id, respond });
+                });
+        }
+    }
+
+    /// How many judgments one turn asks for. A subscription's allowance is
+    /// counted in requests and a CLI request is a process, so those ask once.
+    fn judges(&self) -> usize {
+        match self.settings.provider {
+            CopilotProvider::OpenaiApi | CopilotProvider::AnthropicApi => RACED_JUDGES,
+            CopilotProvider::ChatgptSubscription | CopilotProvider::ClaudeCode => 1,
+        }
     }
 
     fn verdict_wait(&self, likely: bool) -> Duration {
@@ -3872,6 +3906,74 @@ mod tests {
             CopilotEvent::AnswerDelta { .. } | CopilotEvent::InstantDelta { .. }
         )));
         assert!(engine.answers.is_empty());
+    }
+
+    #[test]
+    fn a_billed_provider_races_two_judgments_and_answers_once() {
+        let settings = CopilotSettings {
+            provider: CopilotProvider::OpenaiApi,
+            ..CopilotSettings::default()
+        };
+        let (mut engine, incoming, events, requests, _directory) = harness(settings);
+        after_a_pause(&mut engine);
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("What does the pro plan cost per seat?".into()),
+        );
+        let turn_id = engine.pending_turn.as_ref().expect("a turn to judge").id;
+        // Only the first judgment is reported.
+        let mut verdicts = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match incoming.recv_timeout(Duration::from_millis(200)) {
+                Ok(message) => {
+                    if matches!(&message, EngineMsg::TurnVerdict { id, .. } if *id == turn_id) {
+                        verdicts += 1;
+                    }
+                    engine.handle(message);
+                }
+                Err(_)
+                    if engine.active_answer.is_none()
+                        && !engine.insights_in_flight
+                        && engine.pending_turn.is_none() =>
+                {
+                    break;
+                }
+                Err(_) => engine.evaluate_turn(),
+            }
+        }
+        assert_eq!(verdicts, 1);
+        assert_eq!(answers_started(&events), 1);
+        let judged = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.system == turn_judge_system_prompt())
+            .count();
+        assert_eq!(judged, RACED_JUDGES);
+    }
+
+    #[test]
+    fn a_subscription_asks_for_one_judgment() {
+        let (mut engine, incoming, _events, requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("What does the pro plan cost per seat?".into()),
+        );
+        drain(&mut engine, &incoming);
+        let judged = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.system == turn_judge_system_prompt())
+            .count();
+        assert_eq!(judged, 1);
     }
 
     #[test]
