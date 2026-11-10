@@ -1234,7 +1234,15 @@ pub(crate) fn bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize>
     } else {
         models.to_vec()
     };
+    // "gpt-6-sol@none" drafts instant answers with that reasoning effort.
+    let instant_effort = |model: &str| {
+        model
+            .split_once('@')
+            .and_then(|(_, effort)| CopilotEffort::named(effort))
+            .unwrap_or(CopilotEffort::Low)
+    };
     let lane = |model: &str| -> Result<(Box<dyn providers::AnswerProvider>, String), String> {
+        let model = model.split_once('@').map_or(model, |(model, _)| model);
         let mut lane = settings.clone();
         let model = if let Some(model) = model.strip_prefix("claude:") {
             lane.provider = CopilotProvider::ClaudeCode;
@@ -1584,7 +1592,7 @@ and annual billing saves you a fair bit compared with paying monthly.";
                     ),
                     image_jpeg: None,
                     model: id.clone(),
-                    effort: CopilotEffort::Low,
+                    effort: instant_effort(model),
                     web_search: false,
                     max_output_tokens: 1024,
                     cache_key: format!("{key}-instant"),

@@ -210,12 +210,37 @@ fn responses_body(request: &AnswerRequest, model: &str) -> Value {
         "tools": tools,
         "tool_choice": "auto",
         "parallel_tool_calls": false,
-        "reasoning": {"effort": request.effort.as_str(), "summary": "auto"},
+        "reasoning": {"effort": effort_for(model, request.effort).as_str(), "summary": "auto"},
         "store": false,
         "stream": true,
         "include": [],
         "prompt_cache_key": cache_key(&request.cache_key),
     })
+}
+
+/// Models that refused to answer without reasoning in this process.
+static MUST_REASON: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The effort to ask `model` for: the least it accepts that is not below
+/// `effort`.
+fn effort_for(model: &str, effort: CopilotEffort) -> CopilotEffort {
+    let must_reason = MUST_REASON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if must_reason.iter().any(|known| known == model) {
+        effort.at_least_low()
+    } else {
+        effort
+    }
+}
+
+/// True when the service refused the request's reasoning effort.
+fn is_effort_rejection(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::BAD_REQUEST && {
+        let body = body.to_lowercase();
+        body.contains("unsupported value")
+            && (body.contains("'none'") || body.contains("'minimal'"))
+    }
 }
 
 /// The OpenAI API rejects cache keys over 64 characters; longer keys are
@@ -441,6 +466,17 @@ impl AnswerProvider for ResponsesProvider {
                 refreshed = true;
                 continue;
             }
+            // Some models cannot skip reasoning; ask them again for a little.
+            if is_effort_rejection(status, &body)
+                && effort_for(model, request.effort) != request.effort.at_least_low()
+            {
+                tracing::warn!(model, "copilot model must reason; using low effort");
+                let mut must_reason = MUST_REASON
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                must_reason.push(model.clone());
+                continue;
+            }
             if is_model_rejection(status, &body) && index + 1 < models.len() {
                 remember_rejected(model);
                 rejected_here.push(model.clone());
@@ -580,7 +616,7 @@ fn anthropic_body(request: &AnswerRequest, full: bool) -> Value {
         body["tools"] = json!([anthropic_search_tool(&request.model)]);
     }
     if full {
-        body["output_config"] = json!({"effort": request.effort.as_str()});
+        body["output_config"] = json!({"effort": request.effort.at_least_low().as_str()});
         if supports_server_fallback(&request.model) {
             body["fallbacks"] = json!("default");
         }
@@ -718,7 +754,7 @@ impl AnswerProvider for ClaudeCodeProvider {
                 "--model",
                 &request.model,
                 "--effort",
-                request.effort.as_str(),
+                request.effort.at_least_low().as_str(),
                 "--tools",
                 tools,
                 "--allowedTools",
@@ -892,6 +928,38 @@ pub(crate) fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_that_must_reason_is_asked_for_low_effort_from_then_on() {
+        let refusal = "{\"error\":{\"message\":\"Unsupported value: 'none' is not supported with the 'test-thinker' model. Supported values are: 'low', 'medium'.\"}}";
+        assert!(is_effort_rejection(StatusCode::BAD_REQUEST, refusal));
+        assert!(!is_effort_rejection(
+            StatusCode::BAD_REQUEST,
+            "{\"error\":{\"message\":\"The model does not exist\"}}"
+        ));
+        assert!(!is_effort_rejection(StatusCode::TOO_MANY_REQUESTS, refusal));
+
+        let mut request = request();
+        request.effort = CopilotEffort::None;
+        assert_eq!(
+            responses_body(&request, "test-thinker")["reasoning"]["effort"],
+            "none"
+        );
+        MUST_REASON.lock().unwrap().push("test-thinker".into());
+        assert_eq!(
+            responses_body(&request, "test-thinker")["reasoning"]["effort"],
+            "low"
+        );
+        assert_eq!(
+            responses_body(&request, "test-quick")["reasoning"]["effort"],
+            "none"
+        );
+        // Claude's least effort is low.
+        assert_eq!(
+            anthropic_body(&request, true)["output_config"]["effort"],
+            "low"
+        );
+    }
 
     #[test]
     fn a_decision_asks_one_yes_or_no_question_and_reads_its_probability() {

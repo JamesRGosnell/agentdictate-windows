@@ -219,6 +219,17 @@ fn suggestions(events: &[(Instant, CopilotEvent)], began: Instant) -> Vec<Sugges
         .collect()
 }
 
+/// When the other side really stopped speaking before `shown`, from the
+/// labelled recording. The session's own notice of it comes late, once its
+/// pause detector is sure, which would flatter every timing.
+fn question_end(segments: &[Segment], me: &str, shown: f64) -> Option<f64> {
+    segments
+        .iter()
+        .filter(|segment| segment.speaker != me && segment.end <= shown)
+        .map(|segment| segment.end)
+        .max_by(f64::total_cmp)
+}
+
 /// What the user really said after `asked`: when they began and their words
 /// until the other side spoke again.
 fn reply_after(segments: &[Segment], me: &str, asked: f64) -> Option<(f64, String)> {
@@ -761,7 +772,14 @@ pub(crate) fn run(options: &Options) -> anyhow::Result<usize> {
     for problem in &problems {
         println!("  problem: {problem}");
     }
-    let shown = suggestions(&events, began);
+    let mut shown = suggestions(&events, began);
+    for suggestion in &mut shown {
+        if let Some(ended) =
+            question_end(&segments, &me, suggestion.shown.unwrap_or(suggestion.asked))
+        {
+            suggestion.asked = ended;
+        }
+    }
     let replies: Vec<Option<(f64, String)>> = shown
         .iter()
         .map(|suggestion| reply_after(&segments, &me, suggestion.asked))
@@ -1006,6 +1024,10 @@ mod tests {
         assert!((shown[0].asked - 6.0).abs() < 1e-6);
         assert!((shown[0].shown.unwrap() - 7.0).abs() < 1e-6);
         assert_eq!(shown[0].line(), "It's **$49** a seat.");
+
+        // The labelled recording says when the question really ended.
+        assert_eq!(question_end(&call(), "B", 7.0), Some(6.0));
+        assert_eq!(question_end(&call(), "B", 1.0), None);
 
         let reply = reply_after(&call(), "B", shown[0].asked).unwrap();
         assert!((reply.0 - 6.4).abs() < 1e-6);

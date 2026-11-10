@@ -10,7 +10,7 @@ use crate::{
 
 /// Quiet after the other side's line before an answer to it is shown:
 /// someone asking the user something waits; a rhetorical question runs on.
-pub const QUESTION_PAUSE_MS: u64 = 1_000;
+pub const QUESTION_PAUSE_MS: u64 = 700;
 
 /// Other-side speech starting this long after a line ended means the
 /// speaker kept talking rather than waiting for the user.

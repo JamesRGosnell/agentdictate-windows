@@ -197,14 +197,23 @@ pub enum CopilotEffort {
     Low,
     Medium,
     High,
+    /// No reasoning before the first word. For instant drafts; not offered
+    /// as a setting. Listed last so the offered efforts keep their numbers.
+    None,
+    /// The least reasoning a model allows short of none. Not offered as a
+    /// setting.
+    Minimal,
 }
 
 impl CopilotEffort {
+    /// The efforts offered for researched answers.
     pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -214,10 +223,34 @@ impl CopilotEffort {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::None | Self::Minimal => "Instant",
             Self::Low => "Fast",
             Self::Medium => "Balanced",
             Self::High => "Deep",
         }
+    }
+
+    /// This effort for services whose least is low.
+    #[must_use]
+    pub const fn at_least_low(self) -> Self {
+        match self {
+            Self::None | Self::Minimal => Self::Low,
+            other => other,
+        }
+    }
+
+    /// The effort a name such as "minimal" stands for.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        [
+            Self::None,
+            Self::Minimal,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+        ]
+        .into_iter()
+        .find(|effort| effort.as_str().eq_ignore_ascii_case(name.trim()))
     }
 }
 

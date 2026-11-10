@@ -2606,7 +2606,8 @@ impl Engine {
                         user: format!("{user}\n\n{INSTANT_GUIDANCE}"),
                         image_jpeg: image.clone(),
                         model: fast_model,
-                        effort: CopilotEffort::Low,
+                        // The first words matter most: no reasoning first.
+                        effort: CopilotEffort::None,
                         web_search: false,
                         max_output_tokens: 1024,
                         cache_key: format!("{session_key}-instant"),
