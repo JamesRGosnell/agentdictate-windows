@@ -19,15 +19,16 @@ use std::{
 
 use agentdictate_core::{
     CopilotEffort, CopilotMode, HeardSpan, JUDGE_TRANSCRIPT_CHARS, QUESTION_PAUSE_MS, Situation,
-    Speaker, TranscriptLine, TurnContext, VoiceNames, judge_transcript, kept_talking,
-    only_listening, parse_turn_verdict, render_transcript, since_user_spoke_ms, turn_candidate,
-    turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question, utterance_similarity,
+    Speaker, TURN_JUDGE_THRESHOLD, TranscriptLine, TurnContext, VoiceNames, judge_transcript,
+    kept_talking, only_listening, parse_turn_verdict, render_transcript, since_user_spoke_ms,
+    turn_candidate, turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question,
+    utterance_similarity,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    providers::{self, AnswerRequest},
+    providers::{self, AnswerRequest, Judged},
     store,
 };
 use crate::codex_subscription::ChatGptCredentials;
@@ -41,6 +42,8 @@ const VERDICT_WAIT_MS: u64 = 3_000;
 /// Matches the engine: automatic answers this close together are suppressed.
 const AUTO_ANSWER_COOLDOWN_MS: u64 = 6_000;
 pub(super) const PARALLEL_JUDGES: usize = 3;
+/// Probabilities at which a decision service's judgments are also scored.
+const THRESHOLDS: [f32; 8] = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 /// Rate-limited judge calls are retried after these pauses.
 pub(super) const RETRY_PAUSES_MS: [u64; 4] = [2_000, 5_000, 10_000, 20_000];
 
@@ -110,6 +113,18 @@ impl Outcome {
 struct Verdict {
     respond: Option<bool>,
     elapsed_ms: u64,
+    /// From a decision service; lets one run be scored at any threshold.
+    #[serde(default)]
+    probability: Option<f32>,
+}
+
+impl Verdict {
+    /// The verdict at `threshold`, when the judge gave a probability.
+    fn at(self, threshold: f32) -> Option<bool> {
+        self.probability
+            .map(|probability| probability >= threshold)
+            .or(self.respond)
+    }
 }
 
 #[derive(Default)]
@@ -256,9 +271,103 @@ pub(super) fn cache_key(model: &str, system: &str, user: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Which lines the copilot would answer, and how that compares to the labels.
+fn score(
+    lines: &[Line],
+    candidates: &[usize],
+    verdicts: &HashMap<usize, Verdict>,
+    threshold: f32,
+) -> (Tally, Vec<String>) {
+    let mut outcomes = vec![Outcome::NotJudged; lines.len()];
+    let mut last_answer: Option<(u64, String)> = None;
+    for &index in candidates {
+        let line = &lines[index];
+        let verdict = verdicts.get(&index).copied().unwrap_or(Verdict {
+            respond: None,
+            elapsed_ms: VERDICT_WAIT_MS,
+            probability: None,
+        });
+        let respond = match verdict.at(threshold) {
+            Some(respond) if verdict.elapsed_ms <= VERDICT_WAIT_MS => respond,
+            _ => turn_likely_question(&line.text),
+        };
+        let decided_ms = line.end_ms + QUESTION_PAUSE_MS.max(verdict.elapsed_ms);
+        let resumed = lines[index + 1..]
+            .iter()
+            .filter(|later| later.speaker == Speaker::Them && later.start_ms <= decided_ms)
+            .any(|later| {
+                kept_talking(
+                    line.end_ms,
+                    line.voice,
+                    &HeardSpan {
+                        start_ms: later.start_ms,
+                        end_ms: later.end_ms,
+                        voice: later.voice,
+                        text: Some(&later.text),
+                    },
+                )
+            });
+        outcomes[index] = if !respond {
+            Outcome::JudgedNo
+        } else if resumed {
+            Outcome::KeptTalking
+        } else if last_answer.as_ref().is_some_and(|(at, previous)| {
+            decided_ms.saturating_sub(*at) < AUTO_ANSWER_COOLDOWN_MS
+                || utterance_similarity(previous, &line.text) >= 0.6
+        }) {
+            Outcome::Cooldown
+        } else {
+            last_answer = Some((decided_ms, line.text.clone()));
+            Outcome::Answered
+        };
+    }
+
+    let mut tally = Tally {
+        minutes: lines
+            .last()
+            .map_or(0.0, |line| line.end_ms as f64 / 60_000.0),
+        ..Tally::default()
+    };
+    let mut errors = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(label) = line.label.as_ref().filter(|label| !label.ambiguous) else {
+            continue;
+        };
+        let answered = outcomes[index] == Outcome::Answered;
+        if answered {
+            tally.answered += 1;
+            tally.aimed_answered += usize::from(label.aimed_at_user);
+        }
+        match (label.worth_answering, answered) {
+            (true, true) => tally.true_positive += 1,
+            (false, true) => {
+                tally.false_positive += 1;
+                errors.push(format!("FP  {} ({})", clip(&line.text), label.why));
+            }
+            (true, false) => {
+                tally.false_negative += 1;
+                errors.push(format!(
+                    "FN  {} [{}] ({})",
+                    clip(&line.text),
+                    outcomes[index].describe(),
+                    label.why
+                ));
+            }
+            (false, false) => {}
+        }
+    }
+    (tally, errors)
+}
+
 /// Replays labelled calls and prints how well answered lines match the
-/// labels. Returns the number of failed judge calls.
-pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Result<usize> {
+/// labels. `ask_model` judges by asking the model even where the provider
+/// has a decision service. Returns the number of failed judge calls.
+pub(crate) fn run(
+    files: &[PathBuf],
+    fresh: bool,
+    samples: usize,
+    ask_model: bool,
+) -> anyhow::Result<usize> {
     let samples = samples.max(1);
     let paths = crate::AppPaths::from_environment()?;
     let mut settings = store::load(&store::settings_path(&paths.config_file));
@@ -303,6 +412,8 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
     let mut calls = 0;
     let mut latencies = Vec::new();
     let mut overall = Tally::default();
+    let mut sweep: Vec<Tally> = THRESHOLDS.iter().map(|_| Tally::default()).collect();
+    let mut decided = 0;
     for (set, eval_calls) in &sets {
         let mut set_tally = Tally::default();
         for call in eval_calls {
@@ -320,6 +431,12 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
                     .map(|&index| {
                         let user = judge_prompt(&lines, &names, index);
                         let key = cache_key(&model, system, &user);
+                        // Decisions are cached apart from the model's verdicts.
+                        let key = if ask_model {
+                            key
+                        } else {
+                            format!("decision:{key}")
+                        };
                         let key = if sample == 0 {
                             key
                         } else {
@@ -359,16 +476,23 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
                                     cache_key: format!("question-eval-{}", call.meeting),
                                 };
                                 let mut started = Instant::now();
-                                let attempt = || {
-                                    providers::provider_for(&settings, &chatgpt, "", &[]).and_then(
-                                        |provider| {
-                                            providers::complete(
-                                                provider.as_ref(),
-                                                &request,
-                                                &AtomicBool::new(false),
-                                            )
-                                        },
-                                    )
+                                let attempt = || -> Result<Judged, String> {
+                                    let provider =
+                                        providers::provider_for(&settings, &chatgpt, "", &[])?;
+                                    let cancel = AtomicBool::new(false);
+                                    if ask_model {
+                                        let text = providers::complete(
+                                            provider.as_ref(),
+                                            &request,
+                                            &cancel,
+                                        )?;
+                                        Ok(Judged {
+                                            respond: parse_turn_verdict(&text),
+                                            probability: None,
+                                        })
+                                    } else {
+                                        providers::judge_turn(provider.as_ref(), &request, &cancel)
+                                    }
                                 };
                                 let mut respond = attempt();
                                 for pause in RETRY_PAUSES_MS {
@@ -383,8 +507,15 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
                                     respond = attempt();
                                 }
                                 let verdict = Verdict {
-                                    respond: respond.as_deref().ok().and_then(parse_turn_verdict),
+                                    respond: respond
+                                        .as_ref()
+                                        .ok()
+                                        .and_then(|judged| judged.respond),
                                     elapsed_ms: started.elapsed().as_millis() as u64,
+                                    probability: respond
+                                        .as_ref()
+                                        .ok()
+                                        .and_then(|judged| judged.probability),
                                 };
                                 if respond.is_ok() {
                                     cache.lock().unwrap().insert(key.clone(), verdict);
@@ -409,84 +540,13 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
                 failures += verdicts.values().filter(|v| v.respond.is_none()).count();
                 latencies.extend(verdicts.values().map(|verdict| verdict.elapsed_ms));
 
-                let mut outcomes = vec![Outcome::NotJudged; lines.len()];
-                let mut last_answer: Option<(u64, String)> = None;
-                for &index in &candidates {
-                    let line = &lines[index];
-                    let verdict = verdicts.get(&index).copied().unwrap_or(Verdict {
-                        respond: None,
-                        elapsed_ms: VERDICT_WAIT_MS,
-                    });
-                    let respond = match verdict.respond {
-                        Some(respond) if verdict.elapsed_ms <= VERDICT_WAIT_MS => respond,
-                        _ => turn_likely_question(&line.text),
-                    };
-                    let decided_ms = line.end_ms + QUESTION_PAUSE_MS.max(verdict.elapsed_ms);
-                    let resumed = lines[index + 1..]
-                        .iter()
-                        .filter(|later| {
-                            later.speaker == Speaker::Them && later.start_ms <= decided_ms
-                        })
-                        .any(|later| {
-                            kept_talking(
-                                line.end_ms,
-                                line.voice,
-                                &HeardSpan {
-                                    start_ms: later.start_ms,
-                                    end_ms: later.end_ms,
-                                    voice: later.voice,
-                                    text: Some(&later.text),
-                                },
-                            )
-                        });
-                    outcomes[index] = if !respond {
-                        Outcome::JudgedNo
-                    } else if resumed {
-                        Outcome::KeptTalking
-                    } else if last_answer.as_ref().is_some_and(|(at, previous)| {
-                        decided_ms.saturating_sub(*at) < AUTO_ANSWER_COOLDOWN_MS
-                            || utterance_similarity(previous, &line.text) >= 0.6
-                    }) {
-                        Outcome::Cooldown
-                    } else {
-                        last_answer = Some((decided_ms, line.text.clone()));
-                        Outcome::Answered
-                    };
-                }
-
-                let mut tally = Tally {
-                    minutes: lines
-                        .last()
-                        .map_or(0.0, |line| line.end_ms as f64 / 60_000.0),
-                    ..Tally::default()
-                };
-                let mut errors = Vec::new();
-                for (index, line) in lines.iter().enumerate() {
-                    let Some(label) = line.label.as_ref().filter(|label| !label.ambiguous) else {
-                        continue;
-                    };
-                    let answered = outcomes[index] == Outcome::Answered;
-                    if answered {
-                        tally.answered += 1;
-                        tally.aimed_answered += usize::from(label.aimed_at_user);
-                    }
-                    match (label.worth_answering, answered) {
-                        (true, true) => tally.true_positive += 1,
-                        (false, true) => {
-                            tally.false_positive += 1;
-                            errors.push(format!("FP  {} ({})", clip(&line.text), label.why));
-                        }
-                        (true, false) => {
-                            tally.false_negative += 1;
-                            errors.push(format!(
-                                "FN  {} [{}] ({})",
-                                clip(&line.text),
-                                outcomes[index].describe(),
-                                label.why
-                            ));
-                        }
-                        (false, false) => {}
-                    }
+                decided += verdicts
+                    .values()
+                    .filter(|verdict| verdict.probability.is_some())
+                    .count();
+                let (tally, errors) = score(&lines, &candidates, &verdicts, TURN_JUDGE_THRESHOLD);
+                for (threshold, total) in THRESHOLDS.iter().zip(&mut sweep) {
+                    total.add(&score(&lines, &candidates, &verdicts, *threshold).0);
                 }
                 println!(
                     "  {set} / {} #{sample}: TP {} FP {} FN {}",
@@ -504,9 +564,16 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
         overall.add(&set_tally);
     }
     println!("OVERALL: {}", overall.summary());
+    if decided > 0 {
+        println!("By the probability at which an answer is shown ({decided} decisions):");
+        for (threshold, total) in THRESHOLDS.iter().zip(&sweep) {
+            println!("  {threshold:.1}: {}", total.summary());
+        }
+    }
     latencies.sort_unstable();
     if let Some(median) = latencies.get(latencies.len() / 2) {
-        println!("judge calls {calls}, failed {failures}, median {median} ms");
+        let p90 = latencies[(latencies.len() * 9 / 10).min(latencies.len() - 1)];
+        println!("judge calls {calls}, failed {failures}, median {median} ms, p90 {p90} ms");
     }
     save(&cache);
     Ok(failures)

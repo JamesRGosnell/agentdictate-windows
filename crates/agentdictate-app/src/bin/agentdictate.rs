@@ -149,7 +149,10 @@ fn run() -> anyhow::Result<()> {
                 let failures = if flag == "--answers" {
                     agentdictate_app::run_copilot_answers(&files, fresh, samples)?
                 } else {
-                    agentdictate_app::run_copilot_questions(&files, fresh, samples)?
+                    // `--model` asks the model even where a decision
+                    // service would judge.
+                    let ask_model = args.iter().any(|arg| arg == "--model");
+                    agentdictate_app::run_copilot_questions(&files, fresh, samples, ask_model)?
                 };
                 anyhow::ensure!(failures == 0, "{failures} model call(s) failed");
                 Ok(())

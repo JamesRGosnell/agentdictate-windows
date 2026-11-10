@@ -280,7 +280,10 @@ second, smaller models), **Fast** (about a second, larger models that know
 more), and **Slower** (several seconds). Fast models make the best instant
 answers: they start as quickly and draw on more world knowledge. Judging what
 to answer and live insights always use the engine's fastest model, whatever
-you pick, so they keep pace with the call.
+you pick, so they keep pace with the call. With the **OpenAI API** engine,
+judging goes through OpenAI's Decisions API, which returns a probability
+without writing a reply: about a quarter of a second, against more than a
+second for asking the model. If that service fails, the model is asked.
 
 **Speed** sets how much the researched model reasons before answering. Fast is
 recommended during live calls.

@@ -234,8 +234,9 @@ pub fn run_copilot_questions(
     files: &[std::path::PathBuf],
     fresh: bool,
     samples: usize,
+    ask_model: bool,
 ) -> anyhow::Result<usize> {
-    question_eval::run(files, fresh, samples)
+    question_eval::run(files, fresh, samples, ask_model)
 }
 
 /// Drafts and grades answers to the questions in labelled calls. Returns

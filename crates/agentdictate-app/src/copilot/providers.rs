@@ -24,6 +24,7 @@ use crate::codex_subscription::ChatGptCredentials;
 
 const CHATGPT_RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
+const OPENAI_DECISIONS_ENDPOINT: &str = "https://api.openai.com/v1/decisions";
 const OPENAI_TRANSCRIPTION_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
 const ANTHROPIC_MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 
@@ -41,6 +42,17 @@ pub(crate) struct AnswerRequest {
     pub cache_key: String,
 }
 
+/// A yes/no condition for a service that decides rather than writes.
+#[derive(Clone, Debug)]
+pub(crate) struct Decision {
+    /// How to decide; the same for every request, so it can be cached.
+    pub rules: String,
+    /// What the condition is about.
+    pub evidence: String,
+    pub question: String,
+    pub cache_key: String,
+}
+
 pub(crate) trait AnswerProvider: Send + Sync {
     /// Streams the answer into `sink`. Returns once the answer completes,
     /// fails, or `cancel` is observed.
@@ -50,6 +62,50 @@ pub(crate) trait AnswerProvider: Send + Sync {
         cancel: &AtomicBool,
         sink: &mut dyn FnMut(StreamEvent),
     ) -> Result<(), String>;
+
+    /// The probability that `decision` holds, from a service built to decide
+    /// without writing. `None` when this provider has no such service.
+    fn decide(&self, _decision: &Decision) -> Option<Result<f32, String>> {
+        None
+    }
+}
+
+/// The turn judge's verdict.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Judged {
+    pub respond: Option<bool>,
+    /// How likely the line calls for an answer, when a decision service said.
+    pub probability: Option<f32>,
+}
+
+/// Judges a turn with the provider's decision service, or by asking its
+/// model when it has none or the service fails.
+pub(crate) fn judge_turn(
+    provider: &dyn AnswerProvider,
+    request: &AnswerRequest,
+    cancel: &AtomicBool,
+) -> Result<Judged, String> {
+    let decision = Decision {
+        rules: agentdictate_core::turn_judge_rules().to_owned(),
+        evidence: request.user.clone(),
+        question: agentdictate_core::TURN_JUDGE_QUESTION.to_owned(),
+        cache_key: request.cache_key.clone(),
+    };
+    match provider.decide(&decision) {
+        Some(Ok(probability)) => {
+            return Ok(Judged {
+                respond: Some(probability >= agentdictate_core::TURN_JUDGE_THRESHOLD),
+                probability: Some(probability),
+            });
+        }
+        Some(Err(error)) => tracing::warn!(%error, "copilot decision failed; asking the model"),
+        None => {}
+    }
+    let text = complete(provider, request, cancel)?;
+    Ok(Judged {
+        respond: agentdictate_core::parse_turn_verdict(&text),
+        probability: None,
+    })
 }
 
 /// The process-wide HTTP client. Sharing it keeps connections open between
@@ -400,6 +456,84 @@ impl AnswerProvider for ResponsesProvider {
         }
         Err(format!("{service} has no usable model."))
     }
+
+    fn decide(&self, decision: &Decision) -> Option<Result<f32, String>> {
+        let ResponsesAuth::ApiKey(key) = &self.auth else {
+            return None;
+        };
+        if DECISIONS_UNAVAILABLE.load(Ordering::Relaxed) {
+            return None;
+        }
+        let sent = self
+            .client
+            .post(OPENAI_DECISIONS_ENDPOINT)
+            .bearer_auth(key)
+            .timeout(DECISION_TIMEOUT)
+            .json(&decision_body(decision))
+            .send();
+        let response = match sent {
+            Ok(response) => response,
+            Err(error) => return Some(Err(format!("Could not reach OpenAI: {error}"))),
+        };
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        if !status.is_success() {
+            // An account or key without the service would fail every time.
+            if matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST
+            ) {
+                DECISIONS_UNAVAILABLE.store(true, Ordering::Relaxed);
+            }
+            return Some(Err(http_failure("OpenAI", status, &body)));
+        }
+        Some(parse_decision(&body))
+    }
+}
+
+/// The only model the decision service runs.
+const DECISIONS_MODEL: &str = "gpt-6-luna";
+/// A decision slower than this is no faster than asking the model.
+const DECISION_TIMEOUT: Duration = Duration::from_secs(3);
+/// Set once the service refuses this key, so later judgments skip it.
+static DECISIONS_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+fn decision_body(decision: &Decision) -> Value {
+    json!({
+        "model": DECISIONS_MODEL,
+        "input": [
+            {"role": "developer", "content": [{"type": "input_text", "text": decision.rules}]},
+            {"role": "user", "content": [{"type": "input_text", "text": decision.evidence}]},
+        ],
+        "questions": [{
+            "type": "predicate",
+            "name": "answer",
+            "instructions": decision.question,
+        }],
+        "prompt_cache_key": cache_key(&decision.cache_key),
+    })
+}
+
+/// The probability in a decision response with one yes/no question.
+fn parse_decision(body: &str) -> Result<f32, String> {
+    let value: Value =
+        serde_json::from_str(body).map_err(|error| format!("Unreadable decision: {error}"))?;
+    let answer = value
+        .pointer("/answers/0")
+        .ok_or_else(|| "The decision has no answer.".to_owned())?;
+    answer
+        .get("probability")
+        .and_then(Value::as_f64)
+        .map(|probability| probability as f32)
+        .ok_or_else(|| {
+            format!(
+                "The decision was not a probability ({}).",
+                answer
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )
+        })
 }
 
 struct AnthropicProvider {
@@ -758,6 +892,61 @@ pub(crate) fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decision_asks_one_yes_or_no_question_and_reads_its_probability() {
+        let body = decision_body(&Decision {
+            rules: "Rules".into(),
+            evidence: "Transcript".into(),
+            question: "Answer it?".into(),
+            cache_key: "session-turns".into(),
+        });
+        assert_eq!(body["model"], "gpt-6-luna");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"][0]["text"], "Rules");
+        assert_eq!(body["input"][1]["content"][0]["text"], "Transcript");
+        assert_eq!(body["questions"][0]["type"], "predicate");
+        assert_eq!(body["questions"][0]["instructions"], "Answer it?");
+
+        let probability = parse_decision(
+            r#"{"answers":[{"type":"predicate","name":"answer","probability":0.92}]}"#,
+        );
+        assert!((probability.unwrap() - 0.92).abs() < 1e-6);
+        assert!(
+            parse_decision(r#"{"answers":[{"type":"refusal","name":"answer"}]}"#)
+                .unwrap_err()
+                .contains("refusal")
+        );
+        assert!(parse_decision("{}").is_err());
+    }
+
+    #[test]
+    fn a_turn_is_judged_by_the_decision_service_when_there_is_one() {
+        struct Decider(Option<Result<f32, String>>);
+        impl AnswerProvider for Decider {
+            fn stream(
+                &self,
+                _request: &AnswerRequest,
+                _cancel: &AtomicBool,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), String> {
+                sink(StreamEvent::Text(r#"{"answer": false}"#.into()));
+                Ok(())
+            }
+            fn decide(&self, decision: &Decision) -> Option<Result<f32, String>> {
+                assert!(!decision.rules.contains("Respond with ONLY"));
+                self.0.clone()
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let judged = |decided| judge_turn(&Decider(decided), &request(), &cancel).unwrap();
+        assert_eq!(judged(Some(Ok(0.9))).respond, Some(true));
+        assert_eq!(judged(Some(Ok(0.1))).respond, Some(false));
+        // Without the service, or when it fails, the model is asked.
+        let asked = judged(None);
+        assert_eq!((asked.respond, asked.probability), (Some(false), None));
+        assert_eq!(judged(Some(Err("down".into()))).respond, Some(false));
+    }
 
     #[test]
     fn a_rejected_model_maps_to_the_one_that_answered() {

@@ -25,9 +25,9 @@ use agentdictate_core::{
     call_view_user_prompt, combined_answer, detected_question_instruction, insights_system_prompt,
     insights_user_prompt_with, is_echo_of, judge_transcript, kept_talking, language_name,
     meeting_checklist, meeting_notes_with, mentions_name, notes_prompt, only_listening,
-    parse_call_view, parse_insights, parse_self_check, parse_translation, parse_turn_verdict,
-    render_transcript, researched_guidance, rewrite_instruction, self_check_system_prompt,
-    self_check_user_prompt, since_user_spoke_ms, split_follow_up, split_grounding, states_a_figure,
+    parse_call_view, parse_insights, parse_self_check, parse_translation, render_transcript,
+    researched_guidance, rewrite_instruction, self_check_system_prompt, self_check_user_prompt,
+    since_user_spoke_ms, split_follow_up, split_grounding, states_a_figure,
     translation_system_prompt, turn_candidate, turn_judge_system_prompt, turn_judge_user_prompt,
     turn_likely_question, typed_note, typed_question_instruction, utterance_similarity,
 };
@@ -36,7 +36,7 @@ use super::{
     knowledge::{Knowledge, fingerprint},
     live::{LiveCommand, LiveEvent, LiveFactory, LiveStream},
     names::{Clue, Roster},
-    providers::{AnswerProvider, AnswerRequest, complete, replacement_for},
+    providers::{AnswerProvider, AnswerRequest, complete, judge_turn, replacement_for},
     reveal::RevealGate,
     stream::StreamEvent,
     vad::{SegmentEvent, Utterance, wav_bytes},
@@ -2229,9 +2229,9 @@ impl Engine {
                 .spawn(move || {
                     let started = Instant::now();
                     let respond = providers(&settings)
-                        .and_then(|provider| complete(provider.as_ref(), &request, &decided))
+                        .and_then(|provider| judge_turn(provider.as_ref(), &request, &decided))
                         .ok()
-                        .and_then(|text| parse_turn_verdict(&text));
+                        .and_then(|judged| judged.respond);
                     let last = undecided.fetch_sub(1, Ordering::AcqRel) == 1;
                     // A failed judgment is reported only when none is left to
                     // do better.

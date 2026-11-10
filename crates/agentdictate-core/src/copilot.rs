@@ -1962,6 +1962,25 @@ push this to Thursday?\"), questions only announced and not yet asked (\"I have 
 and acknowledgments. Lines from Me that repeat Them's words are Them's audio echoing into Me's microphone, not Me speaking; when Me's lines are only such echoes, Me is just listening. In a casual or personal conversation between friends, answer true only for a direct factual or technical question to Me, never for questions about what Me's side just said or about their life. Respond with ONLY {\"answer\": true} or {\"answer\": false}."
 }
 
+/// How the turn judge's model is told to reply; a decision service needs no
+/// such instruction.
+const TURN_JUDGE_REPLY: &str = " Respond with ONLY {\"answer\": true} or {\"answer\": false}.";
+
+/// The turn judge's rules without the reply format, for a service that
+/// returns a probability.
+#[must_use]
+pub fn turn_judge_rules() -> &'static str {
+    let prompt = turn_judge_system_prompt();
+    prompt.strip_suffix(TURN_JUDGE_REPLY).unwrap_or(prompt)
+}
+
+/// The condition a decision service judges a turn by.
+pub const TURN_JUDGE_QUESTION: &str = "Following the rules above, should Me be shown an AI answer to the latest line from Them? True only when all the conditions for answering hold.";
+
+/// The least probability at which a decision service's judgment shows an
+/// answer.
+pub const TURN_JUDGE_THRESHOLD: f32 = 0.5;
+
 /// What the turn judge knows beyond the transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TurnContext {
