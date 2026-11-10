@@ -17,17 +17,19 @@ use std::{
 };
 
 use agentdictate_core::{
-    AnswerStatus, BrainSource, CallView, CopilotAction, CopilotEffort, CopilotEvent,
-    CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft, HeardSpan, INSTANT_GUIDANCE,
-    JUDGE_TRANSCRIPT_CHARS, ListenState, ModelChoice, QUESTION_PAUSE_MS, QuickAction,
-    RewriteEngine, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, TurnContext,
-    answer_system_prompt, answer_user_prompt, call_view_system_prompt, call_view_user_prompt,
-    combined_answer, detected_question_instruction, insights_system_prompt, insights_user_prompt,
-    is_echo_of, judge_transcript, kept_talking, meeting_notes_markdown, notes_system_prompt,
-    only_listening, parse_call_view, parse_insights, parse_turn_verdict, render_transcript,
-    researched_guidance, rewrite_instruction, since_user_spoke_ms, split_follow_up, turn_candidate,
-    turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question,
-    typed_question_instruction, utterance_similarity,
+    AlertKind, AnswerStatus, BrainSource, CallView, ChecklistItem, CopilotAction, CopilotAlert,
+    CopilotEffort, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft,
+    HeardSpan, INSTANT_GUIDANCE, JUDGE_TRANSCRIPT_CHARS, ListenState, ModelChoice, NotesExtras,
+    QUESTION_PAUSE_MS, QuickAction, RewriteEngine, RewriteStyle, Scorecard, Speaker, SpeakerLabels,
+    TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt, call_view_system_prompt,
+    call_view_user_prompt, combined_answer, detected_question_instruction, insights_system_prompt,
+    insights_user_prompt_with, is_echo_of, judge_transcript, kept_talking, language_name,
+    meeting_checklist, meeting_notes_with, mentions_name, notes_prompt, only_listening,
+    parse_call_view, parse_insights, parse_self_check, parse_translation, parse_turn_verdict,
+    render_transcript, researched_guidance, rewrite_instruction, self_check_system_prompt,
+    self_check_user_prompt, since_user_spoke_ms, split_follow_up, split_grounding, states_a_figure,
+    translation_system_prompt, turn_candidate, turn_judge_system_prompt, turn_judge_user_prompt,
+    turn_likely_question, typed_note, typed_question_instruction, utterance_similarity,
 };
 
 use super::{
@@ -117,6 +119,23 @@ const MEETING_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const MEETING_OVER_QUIET: Duration = Duration::from_secs(60);
 /// A session no one has spoken in for this long ends, meeting or not.
 const IDLE_END: Duration = Duration::from_secs(15 * 60);
+/// Answers left streaming while a newer one takes the top of the panel.
+const MAX_BACKGROUND_ANSWERS: usize = 2;
+/// How long the user talks with nothing heard from the other side before
+/// the bar says so.
+const DEAF_AFTER: Duration = Duration::from_secs(90);
+const DEAF_MIN_MY_LINES: usize = 3;
+/// Insights failures in a row before the bar says so.
+const INSIGHTS_FAILURES_SHOWN: u8 = 3;
+/// The least time between two alerts that the user was mentioned.
+const MENTION_COOLDOWN: Duration = Duration::from_secs(30);
+/// How much conversation a mention alert shows before the mention.
+const MENTION_CONTEXT_MS: u64 = 30_000;
+/// The least time between two checks of the user's own statements.
+const SELF_CHECK_GAP: Duration = Duration::from_secs(8);
+/// How long the notes-ready bar stays after the user ended the meeting.
+const NOTES_READY_WAIT: Duration = Duration::from_secs(25);
+const HEARING_PROBLEM: &str = "Can't hear the other side. Check that the call plays through your default speakers or headset.";
 
 /// Audio pipeline output, independent of the capture backend.
 #[derive(Clone, Debug)]
@@ -238,13 +257,23 @@ pub(crate) struct Services {
     pub language: String,
     /// Streams speech for live transcription; `None` transcribes by upload.
     pub live: Option<LiveFactory>,
+    /// The user's name from the computer's account, for the mention alert.
+    pub account_name: String,
+    /// Reads a calendar feed from an address or a file.
+    pub fetch: Fetcher,
+    /// Sends a finished meeting, as JSON, to an address.
+    pub post: Poster,
 }
+
+pub(crate) type Fetcher = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+pub(crate) type Poster = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HotkeyCommand {
     Assist,
     Toggle,
     Ask,
+    CatchUp,
 }
 
 pub(crate) enum EngineMsg {
@@ -299,6 +328,17 @@ pub(crate) enum EngineMsg {
         voice: u8,
         view: Result<Option<CallView>, String>,
     },
+    /// A transcript line in the user's language, when it needed translating.
+    Translated {
+        line: u64,
+        text: Option<String>,
+    },
+    /// What the user's documents contradict in something the user said.
+    SelfChecked(Option<String>),
+    /// What to know about the people on the call, from earlier meetings.
+    BriefReady(Option<String>),
+    /// The calendar's meeting for now, if it has one.
+    Calendar(Option<super::calendar::CalendarEvent>),
 }
 
 struct TranscriptionJob {
@@ -458,7 +498,6 @@ struct PendingMine {
 
 struct ActiveAnswer {
     id: u64,
-    automatic: bool,
     cancel: Arc<AtomicBool>,
     gate: Arc<RevealGate>,
 }
@@ -510,7 +549,32 @@ pub(crate) struct Engine {
     /// The follow-up email written with the notes.
     follow_up_email: Option<EmailDraft>,
     next_answer: u64,
+    /// The newest answer in progress.
     active_answer: Option<ActiveAnswer>,
+    /// Earlier answers still streaming in front of the user.
+    background: Vec<ActiveAnswer>,
+    /// What the user typed to keep, by session offset.
+    my_notes: Vec<(u64, String)>,
+    /// Things the user promised, oldest first.
+    promises: Vec<String>,
+    checklist: Vec<ChecklistItem>,
+    /// The other side's audio was heard at least once.
+    them_heard: bool,
+    hearing_problem: bool,
+    insights_failures: u8,
+    insights_problem: Option<String>,
+    /// The problem the bar shows now.
+    shown_problem: Option<String>,
+    last_mention: Option<Instant>,
+    self_check_busy: bool,
+    last_self_check: Option<Instant>,
+    /// People already covered by a brief.
+    briefed: HashSet<String>,
+    brief_busy: bool,
+    /// The calendar's meeting for this session.
+    calendar: Option<super::calendar::CalendarEvent>,
+    /// How long the notes-ready bar waits for the user.
+    notes_ready_wait: Duration,
     /// Answers shown this session, for the notes: id, title, and text.
     answers: Vec<(u64, String, String)>,
     /// The rewritten lines the user kept, by answer.
@@ -575,6 +639,22 @@ impl Engine {
             follow_up_email: None,
             next_answer: 1,
             active_answer: None,
+            background: Vec::new(),
+            my_notes: Vec::new(),
+            promises: Vec::new(),
+            checklist: Vec::new(),
+            them_heard: false,
+            hearing_problem: false,
+            insights_failures: 0,
+            insights_problem: None,
+            shown_problem: None,
+            last_mention: None,
+            self_check_busy: false,
+            last_self_check: None,
+            briefed: HashSet::new(),
+            brief_busy: false,
+            calendar: None,
+            notes_ready_wait: NOTES_READY_WAIT,
             answers: Vec::new(),
             kept: std::collections::HashMap::new(),
             rewrite_cancel: None,
@@ -601,6 +681,8 @@ impl Engine {
         self.load_knowledge();
         self.warm_up();
         self.start_audio();
+        self.rebuild_checklist();
+        self.read_calendar();
         let user_ended = loop {
             match incoming.recv_timeout(self.next_wait()) {
                 Ok(message) => {
@@ -900,6 +982,10 @@ impl Engine {
                 (self.ui)(CopilotEvent::Show);
                 self.answer(AnswerKind::Quick(QuickAction::WhatToSay))
             }
+            EngineMsg::Hotkey(HotkeyCommand::CatchUp) => {
+                (self.ui)(CopilotEvent::Show);
+                self.answer(AnswerKind::Quick(QuickAction::CatchUp))
+            }
             EngineMsg::Hotkey(HotkeyCommand::Toggle) => (self.ui)(CopilotEvent::ToggleVisibility),
             EngineMsg::Hotkey(HotkeyCommand::Ask) => {
                 (self.ui)(CopilotEvent::Show);
@@ -923,6 +1009,7 @@ impl Engine {
                 self.knowledge_loading = false;
                 (self.ui)(CopilotEvent::Knowledge(summary));
                 self.prime_answer_lanes();
+                self.maybe_brief();
             }
             EngineMsg::WindowCaptured { at_ms, shot } => {
                 self.looks.busy = false;
@@ -938,6 +1025,29 @@ impl Engine {
             EngineMsg::Rewritten { id, text } => {
                 self.kept.insert(id, text);
             }
+            EngineMsg::Translated { line, text } => {
+                if let Some(text) = text {
+                    (self.ui)(CopilotEvent::Translation { line, text });
+                }
+            }
+            EngineMsg::SelfChecked(contradiction) => {
+                self.self_check_busy = false;
+                if let Some(text) = contradiction {
+                    tracing::info!("the user's documents contradict what they said");
+                    (self.ui)(CopilotEvent::Alert(CopilotAlert {
+                        kind: AlertKind::Contradiction,
+                        text,
+                        context: String::new(),
+                    }));
+                }
+            }
+            EngineMsg::BriefReady(brief) => {
+                self.brief_busy = false;
+                if let Some(brief) = brief {
+                    (self.ui)(CopilotEvent::Brief(brief));
+                }
+            }
+            EngineMsg::Calendar(event) => self.handle_calendar(event),
             EngineMsg::ModelsLoaded(provider, models) => {
                 if provider == CopilotProvider::ChatgptSubscription {
                     self.chatgpt_models = models.iter().map(|model| model.id.clone()).collect();
@@ -970,7 +1080,9 @@ impl Engine {
             CopilotAction::Assist => self.answer(AnswerKind::Quick(QuickAction::WhatToSay)),
             CopilotAction::Quick(action) => self.answer(AnswerKind::Quick(action)),
             CopilotAction::Ask(question) => {
-                if !question.trim().is_empty() {
+                if let Some(note) = typed_note(&question) {
+                    self.add_note(note.to_owned());
+                } else if !question.trim().is_empty() {
                     self.answer(AnswerKind::Typed(question));
                 }
             }
@@ -1042,7 +1154,9 @@ impl Engine {
                 self.roster.note(voice, &name, Clue::User);
                 tracing::info!(voice, named = !name.trim().is_empty(), "speaker named");
                 self.publish_speakers();
+                self.maybe_brief();
             }
+            CopilotAction::KeepOpen => {}
             CopilotAction::End => return true,
         }
         false
@@ -1062,6 +1176,11 @@ impl Engine {
         if previous.use_past_meetings != self.settings.use_past_meetings {
             self.knowledge_fingerprint = None;
             self.load_knowledge();
+        }
+        if previous.mode != self.settings.mode
+            || previous.meeting_goal != self.settings.meeting_goal
+        {
+            self.rebuild_checklist();
         }
         if previous.capture_microphone != self.settings.capture_microphone
             || previous.capture_system_audio != self.settings.capture_system_audio
@@ -1091,6 +1210,11 @@ impl Engine {
                     self.last_heard = Instant::now();
                 }
                 if speaker == Speaker::Them {
+                    if active && !self.them_heard {
+                        self.them_heard = true;
+                        self.hearing_problem = false;
+                        self.refresh_problem();
+                    }
                     self.them_speaking = active;
                     self.looks.speech_started = active.then(Instant::now);
                     self.looks.captured = false;
@@ -1453,8 +1577,8 @@ impl Engine {
                 // Shown on the bar until a transcription succeeds again, so
                 // the user knows speech is being missed.
                 if self.transcription_problem.as_deref() != Some(error.as_str()) {
-                    self.transcription_problem = Some(error.clone());
-                    (self.ui)(CopilotEvent::Problem(Some(error)));
+                    self.transcription_problem = Some(error);
+                    self.refresh_problem();
                 }
                 if speaker == Speaker::Them {
                     self.forget_them_span(start_ms, end_ms);
@@ -1463,7 +1587,7 @@ impl Engine {
             }
         };
         if self.transcription_problem.take().is_some() {
-            (self.ui)(CopilotEvent::Problem(None));
+            self.refresh_problem();
         }
         let text = text.trim().to_owned();
         if is_noise_transcript(&text, end_ms.saturating_sub(start_ms)) {
@@ -1505,6 +1629,7 @@ impl Engine {
                 let voice = line.voice;
                 self.publish(line);
                 self.resolve_pending_mine(false);
+                self.alert_if_mentioned(&text, start_ms);
                 self.consider_turn(text, end_ms, voice);
             }
             Speaker::Me => {
@@ -1586,7 +1711,325 @@ impl Engine {
             .position(|existing| existing.at_ms > line.at_ms)
             .unwrap_or(self.transcript.len());
         self.transcript.insert(position, line.clone());
+        match line.speaker {
+            Speaker::Them => self.translate(&line),
+            Speaker::Me => self.check_my_statement(&line.text),
+        }
         (self.ui)(CopilotEvent::Transcript(line));
+    }
+
+    /// Shows the bar's most pressing lasting problem, or clears it.
+    fn refresh_problem(&mut self) {
+        let problem = self
+            .transcription_problem
+            .clone()
+            .or_else(|| self.hearing_problem.then(|| HEARING_PROBLEM.to_owned()))
+            .or_else(|| self.insights_problem.clone());
+        if problem != self.shown_problem {
+            self.shown_problem = problem.clone();
+            (self.ui)(CopilotEvent::Problem(problem));
+        }
+    }
+
+    /// Says so on the bar when the user has been talking for a while and
+    /// nothing has been heard from the other side: the call's sound is
+    /// probably going somewhere the copilot does not listen.
+    fn check_hearing(&mut self) {
+        if self.them_heard
+            || self.hearing_problem
+            || self.ending
+            || self.paused
+            || self.audio.is_none()
+            || !self.settings.capture_system_audio
+            || self.started.elapsed() < DEAF_AFTER
+        {
+            return;
+        }
+        let mine = self
+            .transcript
+            .iter()
+            .filter(|line| line.speaker == Speaker::Me)
+            .count();
+        if mine >= DEAF_MIN_MY_LINES {
+            tracing::warn!("nothing heard from the other side");
+            self.hearing_problem = true;
+            self.refresh_problem();
+        }
+    }
+
+    /// The user's name as the other side would say it.
+    fn user_name(&self) -> String {
+        let name = self.settings.user_name.trim();
+        if name.is_empty() {
+            self.services.account_name.trim().to_owned()
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// Alerts the user when the other side says their name while they are
+    /// only listening, with what was said just before.
+    fn alert_if_mentioned(&mut self, text: &str, at_ms: u64) {
+        if self.ending || !mentions_name(text, &self.user_name()) {
+            return;
+        }
+        // While the user takes part, questions to them are answered anyway.
+        let listening = !self.insights.situation.user_takes_part()
+            || only_listening(&self.transcript, self.elapsed_ms());
+        if !listening
+            || self
+                .last_mention
+                .is_some_and(|at| at.elapsed() < MENTION_COOLDOWN)
+        {
+            return;
+        }
+        self.last_mention = Some(Instant::now());
+        let labels = SpeakerLabels::new(&self.transcript, &self.roster.names());
+        let context = self
+            .transcript
+            .iter()
+            .filter(|line| line.at_ms < at_ms && line.at_ms + MENTION_CONTEXT_MS >= at_ms)
+            .map(|line| format!("{}: {}", labels.display(line), line.text.trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tracing::info!("the other side said the user's name");
+        (self.ui)(CopilotEvent::Show);
+        (self.ui)(CopilotEvent::Alert(CopilotAlert {
+            kind: AlertKind::Mention,
+            text: text.trim().to_owned(),
+            context,
+        }));
+    }
+
+    /// The quickest model, for small side jobs that must keep pace.
+    fn quick_settings(&self) -> CopilotSettings {
+        let mut settings = self.settings.clone();
+        settings.set_answer_model(self.settings.provider.default_fast_model());
+        settings
+    }
+
+    /// Translates one of the other side's lines when the user asked for it.
+    fn translate(&self, line: &TranscriptLine) {
+        let language = self.settings.translate_to.trim();
+        if language.is_empty() || self.ending {
+            return;
+        }
+        let settings = self.quick_settings();
+        let request = AnswerRequest {
+            system: translation_system_prompt(language_name(language)),
+            user: line.text.clone(),
+            image_jpeg: None,
+            model: settings.answer_model(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 400,
+            cache_key: format!("{}-translate", self.session_key),
+        };
+        let providers = Arc::clone(&self.services.providers);
+        let messages = self.messages.clone();
+        let (id, original) = (line.id, line.text.clone());
+        let _ = std::thread::Builder::new()
+            .name("copilot-translate".into())
+            .spawn(move || {
+                let cancel = AtomicBool::new(false);
+                let text = providers(&settings)
+                    .and_then(|provider| complete(provider.as_ref(), &request, &cancel))
+                    .map_err(|error| tracing::warn!(%error, "copilot translation failed"))
+                    .ok()
+                    .and_then(|text| parse_translation(&text, &original));
+                let _ = messages.send(EngineMsg::Translated { line: id, text });
+            });
+    }
+
+    /// Checks a figure the user just stated against their own documents.
+    fn check_my_statement(&mut self, line: &str) {
+        if self.ending
+            || self.self_check_busy
+            || !states_a_figure(line)
+            || self
+                .last_self_check
+                .is_some_and(|at| at.elapsed() < SELF_CHECK_GAP)
+        {
+            return;
+        }
+        let knowledge = self.knowledge.document_excerpts(line);
+        if knowledge.trim().is_empty() {
+            return;
+        }
+        self.self_check_busy = true;
+        self.last_self_check = Some(Instant::now());
+        let settings = self.quick_settings();
+        let request = AnswerRequest {
+            system: self_check_system_prompt().to_owned(),
+            user: self_check_user_prompt(line, &knowledge),
+            image_jpeg: None,
+            model: settings.answer_model(),
+            effort: CopilotEffort::Low,
+            web_search: false,
+            max_output_tokens: 200,
+            cache_key: format!("{}-selfcheck", self.session_key),
+        };
+        let providers = Arc::clone(&self.services.providers);
+        let messages = self.messages.clone();
+        let _ = std::thread::Builder::new()
+            .name("copilot-self-check".into())
+            .spawn(move || {
+                let cancel = AtomicBool::new(false);
+                let contradiction = providers(&settings)
+                    .and_then(|provider| complete(provider.as_ref(), &request, &cancel))
+                    .map_err(|error| tracing::warn!(%error, "copilot self-check failed"))
+                    .ok()
+                    .and_then(|text| parse_self_check(&text));
+                let _ = messages.send(EngineMsg::SelfChecked(contradiction));
+            });
+    }
+
+    /// Keeps something the user typed for the notes.
+    fn add_note(&mut self, note: String) {
+        let at_ms = self.elapsed_ms();
+        self.my_notes.push((at_ms, note.clone()));
+        (self.ui)(CopilotEvent::Note { at_ms, text: note });
+        (self.ui)(CopilotEvent::Notice("Note saved".into()));
+    }
+
+    /// The checklist for this meeting's type and goal, keeping what is
+    /// already ticked.
+    fn rebuild_checklist(&mut self) {
+        let done: HashSet<String> = self
+            .checklist
+            .iter()
+            .filter(|item| item.done)
+            .map(|item| item.label.clone())
+            .collect();
+        self.checklist = meeting_checklist(self.settings.mode, &self.settings.meeting_goal)
+            .into_iter()
+            .map(|label| ChecklistItem {
+                done: done.contains(&label),
+                label,
+            })
+            .collect();
+        (self.ui)(CopilotEvent::Checklist(self.checklist.clone()));
+    }
+
+    /// Takes in what insights heard: checklist items covered, and promises
+    /// the user made.
+    fn note_progress(&mut self, insights: &CopilotInsights) {
+        let mut ticked = false;
+        for number in &insights.covered {
+            if let Some(item) = number
+                .checked_sub(1)
+                .and_then(|index| self.checklist.get_mut(index))
+                .filter(|item| !item.done)
+            {
+                item.done = true;
+                ticked = true;
+            }
+        }
+        if ticked {
+            (self.ui)(CopilotEvent::Checklist(self.checklist.clone()));
+        }
+        let mut promised = false;
+        for promise in &insights.promises {
+            if !self
+                .promises
+                .iter()
+                .any(|known| utterance_similarity(known, promise) >= 0.6)
+            {
+                self.promises.push(promise.clone());
+                promised = true;
+            }
+        }
+        if promised {
+            (self.ui)(CopilotEvent::Promises(self.promises.clone()));
+        }
+    }
+
+    /// Reads the calendar feed for the meeting happening now.
+    fn read_calendar(&self) {
+        let source = self.settings.calendar_ics.trim().to_owned();
+        if source.is_empty() {
+            return;
+        }
+        let fetch = Arc::clone(&self.services.fetch);
+        let messages = self.messages.clone();
+        let _ = std::thread::Builder::new()
+            .name("copilot-calendar".into())
+            .spawn(move || {
+                let event = match fetch(&source) {
+                    Ok(feed) => super::calendar::current_event(&feed, chrono::Utc::now()),
+                    Err(error) => {
+                        tracing::warn!(%error, "the calendar could not be read");
+                        None
+                    }
+                };
+                let _ = messages.send(EngineMsg::Calendar(event));
+            });
+    }
+
+    fn handle_calendar(&mut self, event: Option<super::calendar::CalendarEvent>) {
+        let Some(event) = event else {
+            return;
+        };
+        tracing::info!(
+            attendees = event.attendees.len(),
+            "the calendar names this meeting"
+        );
+        let me = self.user_name();
+        for name in &event.attendees {
+            if !mentions_name(name, &me)
+                && !self
+                    .seen_names
+                    .iter()
+                    .any(|seen| seen.eq_ignore_ascii_case(name))
+                && self.seen_names.len() < MAX_SEEN_NAMES
+            {
+                self.seen_names.push(name.clone());
+            }
+        }
+        self.calendar = Some(event);
+        self.publish_speakers();
+        self.maybe_brief();
+    }
+
+    /// The people known to be on the call: named voices and calendar guests.
+    fn people(&self) -> Vec<String> {
+        let me = self.user_name();
+        let mut people: Vec<String> = self.roster.names().into_values().collect();
+        if let Some(event) = &self.calendar {
+            people.extend(event.attendees.iter().cloned());
+        }
+        people.retain(|name| !mentions_name(name, &me));
+        people.sort();
+        people.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        people
+    }
+
+    /// Looks up earlier meetings with people who are newly known to be on
+    /// the call, for the brief.
+    fn maybe_brief(&mut self) {
+        if self.brief_busy || self.ending || !self.settings.use_past_meetings {
+            return;
+        }
+        let people: Vec<String> = self
+            .people()
+            .into_iter()
+            .filter(|name| !self.briefed.contains(&name.to_lowercase()))
+            .collect();
+        if people.is_empty() {
+            return;
+        }
+        for name in &people {
+            self.briefed.insert(name.to_lowercase());
+        }
+        self.brief_busy = true;
+        let folder = self.services.notes_dir.clone();
+        let messages = self.messages.clone();
+        let _ = std::thread::Builder::new()
+            .name("copilot-brief".into())
+            .spawn(move || {
+                let brief = super::people::brief(&folder, &people);
+                let _ = messages.send(EngineMsg::BriefReady(brief));
+            });
     }
 
     /// Switches the saved answer and draft models to the ones that actually
@@ -1625,6 +2068,7 @@ impl Engine {
         {
             self.active_answer = None;
         }
+        self.background.retain(|answer| answer.id != id);
         if self.discarded.remove(&id) || text.trim().is_empty() {
             return;
         }
@@ -1712,7 +2156,7 @@ impl Engine {
         self.next_turn += 1;
         self.request_turn_verdict(id, &text);
         let likely = turn_likely_question(&text);
-        let draft = if likely && self.active_answer.is_none() && self.may_auto_answer(&text) {
+        let draft = if likely && self.may_auto_answer(&text) {
             self.answer_with(
                 AnswerKind::Detected {
                     question: text.clone(),
@@ -1948,18 +2392,16 @@ impl Engine {
     }
 
     /// Whether an automatic answer may start now: not a repeat of the last
-    /// one, never over an answer the user asked for, and never over an
-    /// answer still streaming in front of the user.
+    /// one. An answer still streaming in front of the user is left to
+    /// finish below the new one.
     fn may_auto_answer(&self, question: &str) -> bool {
-        if let Some((previous, at)) = &self.last_auto_question
-            && (at.elapsed() < AUTO_ANSWER_COOLDOWN
-                || utterance_similarity(previous, question) >= 0.6)
-        {
-            return false;
-        }
-        self.active_answer
+        !self
+            .last_auto_question
             .as_ref()
-            .is_none_or(|active| active.automatic && active.gate.is_hidden())
+            .is_some_and(|(previous, at)| {
+                at.elapsed() < AUTO_ANSWER_COOLDOWN
+                    || utterance_similarity(previous, question) >= 0.6
+            })
     }
 
     fn maybe_auto_answer(&mut self, question: String) {
@@ -1976,15 +2418,37 @@ impl Engine {
 
     fn cancel_answer(&mut self) {
         if let Some(active) = self.active_answer.take() {
-            active.cancel.store(true, Ordering::Relaxed);
-            if active.gate.discard() {
-                self.discarded.insert(active.id);
-            } else {
-                active.gate.send(CopilotEvent::AnswerStatus {
-                    id: active.id,
-                    status: AnswerStatus::Done,
-                });
-            }
+            self.stop(active);
+        }
+    }
+
+    fn stop(&mut self, active: ActiveAnswer) {
+        active.cancel.store(true, Ordering::Relaxed);
+        if active.gate.discard() {
+            self.discarded.insert(active.id);
+        } else {
+            active.gate.send(CopilotEvent::AnswerStatus {
+                id: active.id,
+                status: AnswerStatus::Done,
+            });
+        }
+    }
+
+    /// Makes room for a new answer. A draft nobody saw is dropped; an answer
+    /// the user is reading keeps streaming below the new one, so the first
+    /// half of a two-part question is not lost.
+    fn supersede_answer(&mut self) {
+        let Some(active) = self.active_answer.take() else {
+            return;
+        };
+        if active.gate.is_hidden() {
+            self.stop(active);
+            return;
+        }
+        self.background.push(active);
+        while self.background.len() > MAX_BACKGROUND_ANSWERS {
+            let oldest = self.background.remove(0);
+            self.stop(oldest);
         }
     }
 
@@ -1997,7 +2461,7 @@ impl Engine {
         if self.ending {
             return None;
         }
-        self.cancel_answer();
+        self.supersede_answer();
         let id = self.next_answer;
         self.next_answer += 1;
         let (title, instruction, automatic, wants_screen) = match &kind {
@@ -2024,7 +2488,14 @@ impl Engine {
             ),
         };
         let use_screen = wants_screen && self.settings.screen_context;
-        let model = self.settings.answer_model();
+        // Catching up is a summary of what was just said: the quickest
+        // model writes it at once, with nothing to look up.
+        let catch_up = matches!(kind, AnswerKind::Quick(QuickAction::CatchUp));
+        let model = if catch_up {
+            self.settings.provider.default_fast_model().to_owned()
+        } else {
+            self.settings.answer_model()
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let ui = Arc::clone(&self.ui);
         let gate = Arc::new(if hidden {
@@ -2034,7 +2505,6 @@ impl Engine {
         });
         self.active_answer = Some(ActiveAnswer {
             id,
-            automatic,
             cancel: Arc::clone(&cancel),
             gate: Arc::clone(&gate),
         });
@@ -2064,11 +2534,17 @@ impl Engine {
         };
         let known = Arc::clone(&self.knowledge);
         let brain = Arc::clone(&self.services.brain);
-        let settings = self.settings.clone();
+        let mut settings = self.settings.clone();
+        if catch_up {
+            settings.set_answer_model(model.clone());
+            settings.web_search = false;
+            settings.effort = CopilotEffort::Low;
+        }
         let fast_model = settings.fast_model();
         // The instant draft also helps when it uses the answer model: without
         // web search it starts in about a second.
-        let instant = settings.instant_answers && (fast_model != model || settings.web_search);
+        let instant =
+            !catch_up && settings.instant_answers && (fast_model != model || settings.web_search);
         let providers = Arc::clone(&self.services.providers);
         let platform = Arc::clone(&self.services.platform);
         let thread_gate = Arc::clone(&gate);
@@ -2098,6 +2574,8 @@ impl Engine {
                 } else {
                     None
                 };
+                // A brain adds to the user's own documents; it never replaces
+                // them.
                 let knowledge = if settings.brain_source == BrainSource::None {
                     knowledge
                 } else {
@@ -2105,13 +2583,17 @@ impl Engine {
                         Ok(context) => format!("{context}\n{knowledge}"),
                         Err(error) => {
                             gate.send(CopilotEvent::Notice(error.to_string()));
-                            format!("The selected {} brain is unavailable. State that you could not check it; do not invent its contents.", settings.brain_source.label())
+                            format!(
+                                "The selected {} brain is unavailable. Answer from my documents below when they cover the question; otherwise state that you could not check it, and do not invent its contents.\n{knowledge}",
+                                settings.brain_source.label()
+                            )
                         }
                     }
                 };
-                if cancel.load(Ordering::Relaxed) { return; }
-                let primer = if settings.brain_source == BrainSource::None { known.primer() } else { "" };
-                let system = answer_system_prompt(&settings, primer);
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let system = answer_system_prompt(&settings, known.primer());
                 let user =
                     answer_user_prompt(&transcript, &instruction, image.is_some(), &knowledge);
                 let instant_text = Arc::new(Mutex::new(String::new()));
@@ -2181,7 +2663,7 @@ impl Engine {
                     }
                     instant_text
                         .lock()
-                        .map(|text| text.clone())
+                        .map(|text| split_grounding(&text).0)
                         .unwrap_or_default()
                 } else {
                     String::new()
@@ -2330,23 +2812,12 @@ impl Engine {
             RewriteEngine::Quickest => (fallback, None),
         };
         let mut request = AnswerRequest {
-            system: answer_system_prompt(
-                &self.settings,
-                if self.settings.brain_source == BrainSource::None {
-                    self.knowledge.primer()
-                } else {
-                    ""
-                },
-            ),
+            system: answer_system_prompt(&self.settings, self.knowledge.primer()),
             user: answer_user_prompt(
                 &transcript,
                 &rewrite_instruction(style, line, details),
                 false,
-                if self.settings.brain_source == BrainSource::None {
-                    &knowledge
-                } else {
-                    ""
-                },
+                &knowledge,
             ),
             image_jpeg: None,
             model: settings.answer_model(),
@@ -2461,11 +2932,8 @@ impl Engine {
             AnswerKind::Typed(question) | AnswerKind::Detected { question, .. } => question.clone(),
             AnswerKind::Quick(_) => recent(2),
         };
-        self.knowledge.excerpts_with_documents(
-            &focus,
-            &recent(6),
-            self.settings.brain_source == BrainSource::None,
-        )
+        self.knowledge
+            .excerpts_with_documents(&focus, &recent(6), true)
     }
 
     /// Runs periodic work; returns true when the session should end.
@@ -2477,6 +2945,7 @@ impl Engine {
         self.evaluate_turn();
         self.maybe_request_insights();
         self.maybe_look_at_window();
+        self.check_hearing();
         match self.session_over() {
             Some(reason) => {
                 tracing::info!(reason, "copilot session ending on its own");
@@ -2731,11 +3200,18 @@ impl Engine {
         settings.set_answer_model(self.settings.provider.default_fast_model());
         let request = AnswerRequest {
             system: insights_system_prompt().to_owned(),
-            user: insights_user_prompt(&render_transcript(
-                &self.transcript,
-                &self.roster.names(),
-                INSIGHTS_TRANSCRIPT_CHARS,
-            )),
+            user: insights_user_prompt_with(
+                &render_transcript(
+                    &self.transcript,
+                    &self.roster.names(),
+                    INSIGHTS_TRANSCRIPT_CHARS,
+                ),
+                &self
+                    .checklist
+                    .iter()
+                    .map(|item| item.label.clone())
+                    .collect::<Vec<_>>(),
+            ),
             image_jpeg: None,
             model: settings.answer_model(),
             effort: CopilotEffort::Low,
@@ -2763,13 +3239,26 @@ impl Engine {
             Ok(None) => return,
             Err(error) => {
                 tracing::warn!(%error, "copilot insights failed");
+                // Said on the bar once it keeps failing, so a silent panel
+                // is not mistaken for a quiet meeting.
+                self.insights_failures = self.insights_failures.saturating_add(1);
+                if self.insights_failures >= INSIGHTS_FAILURES_SHOWN {
+                    self.insights_problem = Some(format!("Live insights are failing. {error}"));
+                    self.refresh_problem();
+                }
                 return;
             }
         };
+        self.insights_failures = 0;
+        if self.insights_problem.take().is_some() {
+            self.refresh_problem();
+        }
+        self.note_progress(&insights);
         // A detected question is offered as a click-to-answer card; only the
         // other side's own pause-confirmed questions are answered unprompted.
         let before = self.insights.situation;
         self.name_from_conversation(&insights.speakers);
+        self.maybe_brief();
         self.insights = insights.clone();
         (self.ui)(CopilotEvent::Insights(insights));
         let after = self.insights.situation;
@@ -2788,7 +3277,16 @@ impl Engine {
     fn finish(mut self, incoming: &Receiver<EngineMsg>, user_ended: bool) {
         self.ending = true;
         self.cancel_answer();
+        for answer in std::mem::take(&mut self.background) {
+            self.stop(answer);
+        }
         self.stop_audio();
+        // The goal was for this meeting only.
+        if !self.settings.meeting_goal.trim().is_empty() {
+            let mut settings = self.settings.clone();
+            settings.meeting_goal.clear();
+            self.update_settings(settings);
+        }
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut close_requested = false;
         loop {
@@ -2848,16 +3346,18 @@ impl Engine {
                 self.follow_up_email = follow_up
                     .as_deref()
                     .map(|email| EmailDraft::from_follow_up(email, &self.notes_title()));
-                if !user_ended {
-                    (self.ui)(CopilotEvent::NotesSaved {
-                        path: path.to_string_lossy().into_owned(),
-                        summary,
-                        follow_up,
-                    });
-                    self.notes_path = Some(path);
-                    if !close_requested {
-                        self.wrap_up(incoming);
-                    }
+                self.send_webhook(&path, summary.as_deref(), follow_up.as_deref());
+                // A meeting ended by hand closes at once; its notes are
+                // announced on a small bar that goes away by itself.
+                (self.ui)(CopilotEvent::NotesSaved {
+                    path: path.to_string_lossy().into_owned(),
+                    summary,
+                    follow_up,
+                    quiet: user_ended,
+                });
+                self.notes_path = Some(path);
+                if !close_requested {
+                    self.wrap_up(incoming, user_ended);
                 }
             }
             Err(error) => tracing::error!(%error, "could not save meeting notes"),
@@ -2867,8 +3367,14 @@ impl Engine {
 
     /// Keeps the wrap-up open for copying the follow-up and opening the
     /// notes, until the user is done with it.
-    fn wrap_up(&mut self, incoming: &Receiver<EngineMsg>) {
-        let mut deadline = Instant::now() + WRAP_UP_TIMEOUT;
+    fn wrap_up(&mut self, incoming: &Receiver<EngineMsg>, quiet: bool) {
+        // The notes-ready bar leaves on its own unless the user uses it.
+        let mut deadline = Instant::now()
+            + if quiet {
+                self.notes_ready_wait
+            } else {
+                WRAP_UP_TIMEOUT
+            };
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match incoming.recv_timeout(left) {
                 Ok(EngineMsg::Action(CopilotAction::End)) => return,
@@ -2877,6 +3383,7 @@ impl Engine {
                     | CopilotAction::DraftEmail
                     | CopilotAction::OpenNotes
                     | CopilotAction::OpenNotesFolder
+                    | CopilotAction::KeepOpen
                     | CopilotAction::OpenUrl(_)),
                 )) => {
                     deadline = Instant::now() + WRAP_UP_TIMEOUT;
@@ -2898,12 +3405,24 @@ impl Engine {
         }
         let mut settings = self.settings.clone();
         settings.set_answer_model(self.settings.fast_model());
+        let mut user = format!(
+            "<transcript>\n{}\n</transcript>",
+            render_transcript(&self.transcript, &self.roster.names(), 60_000)
+        );
+        if !self.my_notes.is_empty() {
+            user.push_str("\n\n<my_notes>\n");
+            for (at_ms, note) in &self.my_notes {
+                user.push_str(&format!(
+                    "[{}] {}\n",
+                    agentdictate_core::format_offset(*at_ms),
+                    note.trim()
+                ));
+            }
+            user.push_str("</my_notes>");
+        }
         let request = AnswerRequest {
-            system: notes_system_prompt().to_owned(),
-            user: format!(
-                "<transcript>\n{}\n</transcript>",
-                render_transcript(&self.transcript, &self.roster.names(), 60_000)
-            ),
+            system: notes_prompt(self.settings.mode),
+            user,
             image_jpeg: None,
             model: settings.answer_model(),
             effort: CopilotEffort::Low,
@@ -2931,14 +3450,57 @@ impl Engine {
         }
     }
 
-    /// The meeting's title: the topic insights last named.
+    /// The meeting's title: what the calendar calls it, or the topic
+    /// insights last named.
     fn notes_title(&self) -> String {
+        let calendar = self
+            .calendar
+            .as_ref()
+            .map(|event| event.title.trim())
+            .unwrap_or_default();
         let topic = self.insights.topic.trim();
-        if topic.is_empty() {
+        if !calendar.is_empty() {
+            calendar.to_owned()
+        } else if topic.is_empty() {
             "Meeting notes".to_owned()
         } else {
             topic.to_owned()
         }
+    }
+
+    /// Sends the finished meeting to the user's webhook, if one is set.
+    fn send_webhook(&self, path: &std::path::Path, summary: Option<&str>, follow_up: Option<&str>) {
+        let url = self.settings.webhook_url.trim().to_owned();
+        if url.is_empty() {
+            return;
+        }
+        let labels = SpeakerLabels::new(&self.transcript, &self.roster.names());
+        let body = serde_json::json!({
+            "title": self.notes_title(),
+            "started": (chrono::Local::now()
+                - chrono::Duration::milliseconds(self.started.elapsed().as_millis() as i64))
+            .to_rfc3339(),
+            "duration_seconds": self.elapsed_ms() / 1_000,
+            "people": self.people(),
+            "summary": summary,
+            "follow_up_email": follow_up,
+            "commitments": self.promises,
+            "notes": self.my_notes.iter().map(|(_, note)| note).collect::<Vec<_>>(),
+            "transcript": self.transcript.iter().map(|line| serde_json::json!({
+                "at_seconds": line.at_ms / 1_000,
+                "speaker": labels.display(line),
+                "text": line.text,
+            })).collect::<Vec<_>>(),
+            "file": path.to_string_lossy(),
+        })
+        .to_string();
+        let post = Arc::clone(&self.services.post);
+        let _ = std::thread::Builder::new()
+            .name("copilot-webhook".into())
+            .spawn(move || match post(&url, &body) {
+                Ok(()) => tracing::info!("meeting sent to the webhook"),
+                Err(error) => tracing::warn!(%error, "the webhook did not accept the meeting"),
+            });
     }
 
     fn write_notes(&self, summary: Option<&str>) -> std::io::Result<PathBuf> {
@@ -2977,7 +3539,13 @@ impl Engine {
                 (title.clone(), text)
             })
             .collect();
-        let markdown = meeting_notes_markdown(
+        let extras = NotesExtras {
+            promises: self.promises.clone(),
+            my_notes: self.my_notes.clone(),
+            scorecard: Scorecard::measure(&self.transcript).markdown(),
+            invited: self.people(),
+        };
+        let markdown = meeting_notes_with(
             &title,
             &started.format("%Y-%m-%d %H:%M").to_string(),
             self.elapsed_ms(),
@@ -2985,6 +3553,7 @@ impl Engine {
             &self.transcript,
             &self.roster.names(),
             &answers,
+            &extras,
         );
         std::fs::write(&path, markdown)?;
         Ok(path)
@@ -3079,9 +3648,30 @@ mod tests {
             self.requests.lock().unwrap().push(request.clone());
             if request.system.contains("monitor a live meeting") {
                 sink(StreamEvent::Text(
-                    r#"{"topic":"Pricing","summary":["Discussing plans"],"question":null,"suggestions":["Suggest a reply"]}"#.into(),
+                    r#"{"topic":"Pricing","summary":["Discussing plans"],"question":null,"suggestions":["Suggest a reply"],"promises":["Send the pricing sheet by Friday"],"covered":[2]}"#.into(),
                 ));
-            } else if request.system == notes_system_prompt() {
+            } else if request.system == self_check_system_prompt() {
+                sink(StreamEvent::Text(
+                    if request.user.contains("thirty-nine dollars") {
+                        r#"{"contradiction": "You said $39; your pricing sheet says $49 per seat."}"#
+                    } else {
+                        r#"{"contradiction": null}"#
+                    }
+                    .into(),
+                ));
+            } else if request.system.starts_with("You translate one line") {
+                sink(StreamEvent::Text(
+                    if request.user.contains("Bonjour") {
+                        "Hello, how are you?"
+                    } else {
+                        "SAME"
+                    }
+                    .into(),
+                ));
+            } else if request
+                .system
+                .starts_with(agentdictate_core::notes_system_prompt())
+            {
                 sink(StreamEvent::Text(
                     "Agreed on a pilot.\n\n**Follow-up email**\nHi Sam,\n\nThanks for today."
                         .into(),
@@ -3133,6 +3723,9 @@ mod tests {
             knowledge_dir: directory.path().join("knowledge"),
             language: String::new(),
             live: None,
+            account_name: "Jamie".into(),
+            fetch: Arc::new(|_| Err("no calendar in tests".into())),
+            post: Arc::new(|_, _| Ok(())),
         };
         let engine = Engine::new(
             services,
@@ -3161,20 +3754,352 @@ mod tests {
     }
 
     #[test]
-    fn a_new_automatic_answer_never_replaces_one_on_screen() {
-        let (mut engine, _incoming, _events, _requests, _directory) =
+    fn an_answer_on_screen_keeps_streaming_below_a_new_one() {
+        let (mut engine, incoming, _events, _requests, _directory) =
             harness(CopilotSettings::default());
         let ui = Arc::clone(&engine.ui);
-        let active = |gate: RevealGate| ActiveAnswer {
-            id: 7,
-            automatic: true,
+        let active = |id: u64, gate: RevealGate| ActiveAnswer {
+            id,
             cancel: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(gate),
         };
-        engine.active_answer = Some(active(RevealGate::shown(Arc::clone(&ui))));
-        assert!(!engine.may_auto_answer("What does onboarding include?"));
-        engine.active_answer = Some(active(RevealGate::hidden(ui)));
+        // An answer the user is reading is kept while the next one starts.
+        engine.active_answer = Some(active(7, RevealGate::shown(Arc::clone(&ui))));
         assert!(engine.may_auto_answer("What does onboarding include?"));
+        engine.handle_action(CopilotAction::Ask("And what about onboarding?".into()));
+        assert_eq!(engine.background.len(), 1);
+        assert_eq!(engine.background[0].id, 7);
+        assert!(!engine.background[0].cancel.load(Ordering::Relaxed));
+        // A draft nobody saw is dropped instead.
+        engine.cancel_answer();
+        engine.active_answer = Some(active(8, RevealGate::hidden(Arc::clone(&ui))));
+        engine.supersede_answer();
+        assert_eq!(engine.background.len(), 1);
+        assert!(engine.discarded.contains(&8));
+        // Only so many keep streaming at once: the oldest stops.
+        for id in 9..12 {
+            engine.active_answer = Some(active(id, RevealGate::shown(Arc::clone(&ui))));
+            engine.supersede_answer();
+        }
+        assert_eq!(engine.background.len(), MAX_BACKGROUND_ANSWERS);
+        assert!(engine.background.iter().all(|answer| answer.id != 7));
+        engine.background.clear();
+        drain(&mut engine, &incoming);
+    }
+
+    #[test]
+    fn a_typed_note_is_kept_for_the_notes_and_not_answered() {
+        let (mut engine, _incoming, events, requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.handle_action(CopilotAction::Ask("note: they renew in March".into()));
+        assert!(engine.active_answer.is_none());
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::Note { text, .. } if text == "they renew in March"
+        )));
+        engine.publish(TranscriptLine {
+            id: 1,
+            speaker: Speaker::Them,
+            text: "Hello there".into(),
+            at_ms: 0,
+            voice: None,
+        });
+        let notes = std::fs::read_to_string(engine.write_notes(None).unwrap()).unwrap();
+        assert!(notes.contains("## Your notes"));
+        assert!(notes.contains("they renew in March"));
+    }
+
+    #[test]
+    fn catching_up_asks_the_quickest_model_once() {
+        let (mut engine, incoming, _events, requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.handle(EngineMsg::Hotkey(HotkeyCommand::CatchUp));
+        drain(&mut engine, &incoming);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "no separate draft");
+        assert_eq!(
+            requests[0].model,
+            CopilotSettings::default().provider.default_fast_model()
+        );
+        assert!(!requests[0].web_search);
+        assert!(requests[0].user.contains("two minutes"));
+    }
+
+    #[test]
+    fn insights_tick_the_checklist_and_collect_promises_once() {
+        let (mut engine, incoming, events, _requests, _directory) = harness(CopilotSettings {
+            mode: agentdictate_core::CopilotMode::Sales,
+            meeting_goal: "get a second meeting".into(),
+            ..CopilotSettings::default()
+        });
+        engine.rebuild_checklist();
+        assert_eq!(
+            engine.checklist.last().unwrap().label,
+            "Get a second meeting"
+        );
+        for (id, text) in [
+            (1, "We have fifty thousand set aside."),
+            (2, "Great, thanks."),
+        ] {
+            engine.publish(TranscriptLine {
+                id,
+                speaker: Speaker::Them,
+                text: text.into(),
+                at_ms: id * 1_000,
+                voice: None,
+            });
+        }
+        for _ in 0..2 {
+            engine.last_insights_at = None;
+            engine.lines_at_last_insights = 0;
+            engine.maybe_request_insights();
+            drain(&mut engine, &incoming);
+        }
+        assert!(engine.checklist[1].done, "the second item was covered");
+        assert!(!engine.checklist[0].done);
+        assert_eq!(engine.promises, ["Send the pricing sheet by Friday"]);
+        let events = events.lock().unwrap();
+        let promised = events
+            .iter()
+            .filter(|event| matches!(event, CopilotEvent::Promises(_)))
+            .count();
+        assert_eq!(promised, 1, "the same promise is not announced twice");
+        drop(events);
+        let notes = std::fs::read_to_string(engine.write_notes(None).unwrap()).unwrap();
+        assert!(notes.contains("- [ ] Send the pricing sheet by Friday"));
+    }
+
+    #[test]
+    fn hearing_the_users_name_while_only_listening_raises_an_alert() {
+        let (mut engine, _incoming, events, _requests, _directory) = harness(CopilotSettings {
+            user_name: "Morgan".into(),
+            ..CopilotSettings::default()
+        });
+        engine.insights.situation = agentdictate_core::Situation::Presentation;
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("Churn went up two points last quarter.".into()),
+        );
+        engine.handle_transcribed(
+            Speaker::Them,
+            4_000,
+            6_000,
+            Ok("Morgan, can you speak to the renewal numbers?".into()),
+        );
+        engine.handle_transcribed(
+            Speaker::Them,
+            7_000,
+            9_000,
+            Ok("Morgan, are you there?".into()),
+        );
+        let events = events.lock().unwrap();
+        let alerts: Vec<&CopilotAlert> = events
+            .iter()
+            .filter_map(|event| match event {
+                CopilotEvent::Alert(alert) => Some(alert),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(alerts.len(), 1, "one alert, not one per mention");
+        assert_eq!(alerts[0].kind, AlertKind::Mention);
+        assert!(alerts[0].text.contains("renewal numbers"));
+        assert!(alerts[0].context.contains("Churn went up"));
+    }
+
+    #[test]
+    fn the_users_name_raises_no_alert_while_they_take_part() {
+        let (mut engine, _incoming, events, _requests, _directory) = harness(CopilotSettings {
+            user_name: "Morgan".into(),
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.handle_transcribed(Speaker::Me, 0, 900, Ok("Happy to walk through it.".into()));
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            3_000,
+            Ok("Thanks Morgan, go ahead.".into()),
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, CopilotEvent::Alert(_)))
+        );
+    }
+
+    #[test]
+    fn talking_with_nothing_heard_from_the_other_side_is_said_on_the_bar() {
+        let (mut engine, _incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.start_audio();
+        for id in 1..=3 {
+            engine.publish(TranscriptLine {
+                id,
+                speaker: Speaker::Me,
+                text: "Can you hear me?".into(),
+                at_ms: id * 1_000,
+                voice: None,
+            });
+        }
+        engine.check_hearing();
+        assert!(engine.shown_problem.is_none(), "too early to tell");
+        engine.started = Instant::now() - DEAF_AFTER;
+        engine.check_hearing();
+        assert_eq!(engine.shown_problem.as_deref(), Some(HEARING_PROBLEM));
+        engine.handle_audio(AudioMsg::Speaking {
+            speaker: Speaker::Them,
+            active: true,
+        });
+        assert!(engine.shown_problem.is_none());
+        let problems = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, CopilotEvent::Problem(_)))
+            .count();
+        assert_eq!(problems, 2, "shown once, cleared once");
+    }
+
+    #[test]
+    fn a_figure_the_users_documents_contradict_raises_an_alert() {
+        let (mut engine, incoming, events, _requests, directory) =
+            harness(CopilotSettings::default());
+        let folder = directory.path().join("knowledge");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("pricing.md"),
+            "Pricing sheet. The Team plan costs forty-nine dollars per seat each month.",
+        )
+        .unwrap();
+        engine.knowledge = Arc::new(Knowledge::load(&folder, None));
+        engine.handle_transcribed(
+            Speaker::Me,
+            0,
+            2_000,
+            Ok("The Team plan is thirty-nine dollars per seat.".into()),
+        );
+        assert!(engine.self_check_busy);
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(message);
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::Alert(alert)
+                if alert.kind == AlertKind::Contradiction && alert.text.contains("$49")
+        )));
+        // A question, or a line with no figure, is not checked.
+        engine.last_self_check = None;
+        engine.handle_transcribed(Speaker::Me, 3_000, 4_000, Ok("Is it per seat?".into()));
+        engine.handle_transcribed(Speaker::Me, 5_000, 6_000, Ok("Sounds good to me.".into()));
+        assert!(!engine.self_check_busy);
+    }
+
+    #[test]
+    fn the_other_sides_lines_are_translated_when_asked() {
+        let (mut engine, incoming, events, _requests, _directory) = harness(CopilotSettings {
+            translate_to: "en".into(),
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.handle_transcribed(
+            Speaker::Them,
+            0,
+            900,
+            Ok("Bonjour, comment allez-vous".into()),
+        );
+        engine.handle_transcribed(
+            Speaker::Them,
+            1_000,
+            1_900,
+            Ok("Already English here".into()),
+        );
+        for _ in 0..2 {
+            let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+            engine.handle(message);
+        }
+        let events = events.lock().unwrap();
+        let translated: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                CopilotEvent::Translation { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(translated, ["Hello, how are you?"]);
+    }
+
+    #[test]
+    fn the_calendar_names_the_meeting_and_its_guests() {
+        let (mut engine, incoming, events, _requests, _directory) = harness(CopilotSettings {
+            calendar_ics: "C:/calendar.ics".into(),
+            ..CopilotSettings::default()
+        });
+        let now = chrono::Utc::now();
+        let stamp = |time: chrono::DateTime<chrono::Utc>| time.format("%Y%m%dT%H%M%SZ").to_string();
+        let feed = format!(
+            "BEGIN:VEVENT\nSUMMARY:Acme renewal\nDTSTART:{}\nDTEND:{}\nATTENDEE;CN=Sam Lee:mailto:sam@example.com\nATTENDEE;CN=Jamie Fox:mailto:jamie@example.com\nEND:VEVENT\n",
+            stamp(now - chrono::Duration::minutes(5)),
+            stamp(now + chrono::Duration::minutes(25)),
+        );
+        engine.services.fetch = Arc::new(move |source| {
+            assert_eq!(source, "C:/calendar.ics");
+            Ok(feed.clone())
+        });
+        engine.read_calendar();
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(message);
+        assert_eq!(engine.notes_title(), "Acme renewal");
+        // The user is not offered as a name for someone else's voice.
+        assert_eq!(engine.seen_names, ["Sam Lee"]);
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::Speakers { seen, .. } if seen == &["Sam Lee".to_owned()]
+        )));
+    }
+
+    #[test]
+    fn a_finished_meeting_is_sent_to_the_webhook() {
+        let (mut engine, incoming, _events, _requests, _directory) = harness(CopilotSettings {
+            webhook_url: "https://hooks.example.com/meetings".into(),
+            ..CopilotSettings::default()
+        });
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&sent);
+        engine.services.post = Arc::new(move |address, body| {
+            seen.lock()
+                .unwrap()
+                .push((address.to_owned(), body.to_owned()));
+            Ok(())
+        });
+        engine.notes_ready_wait = Duration::ZERO;
+        for (id, text) in [
+            (1, "Can we start with a pilot?"),
+            (2, "A pilot works."),
+            (3, "Good."),
+        ] {
+            engine.publish(TranscriptLine {
+                id,
+                speaker: Speaker::Them,
+                text: text.into(),
+                at_ms: id * 1_000,
+                voice: None,
+            });
+        }
+        engine.finish(&incoming, true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sent.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "https://hooks.example.com/meetings");
+        let body: serde_json::Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(body["summary"], "Agreed on a pilot.");
+        assert_eq!(body["transcript"][0]["text"], "Can we start with a pilot?");
     }
 
     #[test]
@@ -3208,6 +4133,7 @@ mod tests {
                 }
                 Err(_)
                     if engine.active_answer.is_none()
+                        && engine.background.is_empty()
                         && !engine.insights_in_flight
                         && engine.pending_turn.is_none() =>
                 {
@@ -3936,6 +4862,7 @@ mod tests {
                 }
                 Err(_)
                     if engine.active_answer.is_none()
+                        && engine.background.is_empty()
                         && !engine.insights_in_flight
                         && engine.pending_turn.is_none() =>
                 {
@@ -4073,7 +5000,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_brains_reach_both_answer_lanes_without_local_document_context() {
+    fn selected_brains_reach_both_answer_lanes_alongside_local_documents() {
         let (mut engine, incoming, _events, requests, directory) = harness(CopilotSettings {
             brain_source: BrainSource::PersonalHq,
             ..CopilotSettings::default()
@@ -4095,7 +5022,7 @@ mod tests {
             requests
                 .iter()
                 .all(|request| request.user.contains("LIVE_HQ_OFFER_MARKER")
-                    && !request.system.contains("LEGACY_DOCUMENT_MARKER"))
+                    && request.system.contains("LEGACY_DOCUMENT_MARKER"))
         );
     }
 
@@ -4262,6 +5189,7 @@ mod tests {
                     path,
                     summary,
                     follow_up,
+                    ..
                 } => Some((path.clone(), summary.clone(), follow_up.clone())),
                 _ => None,
             })
@@ -4285,12 +5213,20 @@ mod tests {
             at_ms: 0,
             voice: None,
         });
+        engine.notes_ready_wait = Duration::ZERO;
         engine.finish(&incoming, true);
         let events = events.lock().unwrap();
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            CopilotEvent::Ending | CopilotEvent::NotesSaved { .. } | CopilotEvent::Show
-        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CopilotEvent::Ending | CopilotEvent::Show))
+        );
+        // The notes are announced quietly instead of opening the wrap-up.
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CopilotEvent::NotesSaved { quiet: true, .. }))
+        );
         assert!(matches!(events.last(), Some(CopilotEvent::Exit)));
         let saved = std::fs::read_dir(directory.path().join("meetings"))
             .unwrap()

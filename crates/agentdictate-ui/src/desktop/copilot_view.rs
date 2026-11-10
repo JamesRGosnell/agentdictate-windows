@@ -9,10 +9,10 @@ use std::{
 };
 
 use agentdictate_core::{
-    AnswerStatus, BrainSource, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode,
-    CopilotProvider, CopilotSettings, FollowUp, ListenState, ModelChoice, QuickAction,
-    RewriteEngine, RewriteStyle, Situation, Speaker, SpeakerLabels, TranscriptLine, VoiceNames,
-    combined_answer, format_offset, given_name, has_several_voices, model_pace,
+    AlertKind, AnswerStatus, BrainSource, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode,
+    CopilotProvider, CopilotSettings, FollowUp, Grounding, LANGUAGES, ListenState, ModelChoice,
+    QuickAction, RewriteEngine, RewriteStyle, Situation, Speaker, SpeakerLabels, TranscriptLine,
+    VoiceNames, combined_answer, format_offset, given_name, has_several_voices, model_pace,
     researched_follow_up,
 };
 use gpui::{
@@ -63,6 +63,8 @@ const PILL_HEIGHT: f32 = 38.0;
 const PANEL_RADIUS: f32 = 18.0;
 /// The shortest the live panel shrinks to around little content.
 const LIVE_PANEL_MIN_HEIGHT: f32 = 160.0;
+/// The compact panel: room for the line to say and nothing else.
+const COMPACT_PANEL_HEIGHT: f32 = 132.0;
 /// How long the end button waits for its confirming second click.
 const END_CONFIRM: Duration = Duration::from_secs(4);
 const NOTICE_TTL: Duration = Duration::from_secs(4);
@@ -77,6 +79,10 @@ fn problem_label(problem: &str) -> &'static str {
     let lower = problem.to_lowercase();
     if lower.contains("limit") {
         "Transcription limit reached"
+    } else if lower.contains("hear the other side") {
+        "Can't hear them"
+    } else if lower.contains("insights") {
+        "Insights failing"
     } else {
         "Not transcribing"
     }
@@ -201,6 +207,20 @@ fn short_label(labels: &SpeakerLabels, names: &VoiceNames, line: &TranscriptLine
     }
 }
 
+/// A small mark saying where a line's facts come from.
+fn grounding_mark(grounding: Grounding) -> impl IntoElement + use<> {
+    let mine = grounding == Grounding::Mine;
+    h_flex()
+        .gap(px(4.))
+        .text_color(color(if mine { ACCENT } else { DIM }))
+        .child(icon(
+            if mine { "check" } else { "globe" },
+            10.,
+            if mine { ACCENT } else { DIM },
+        ))
+        .child(grounding.label())
+}
+
 fn divider() -> impl IntoElement + use<> {
     div().w(px(1.)).h(px(16.)).mx(px(2.)).bg(color(BORDER))
 }
@@ -293,6 +313,13 @@ pub struct CopilotWindow {
     leadlord_token: Entity<InputState>,
     anthropic_key: Entity<InputState>,
     openai_key: Entity<InputState>,
+    /// What the user wants from this meeting.
+    goal: Entity<InputState>,
+    user_name: Entity<InputState>,
+    calendar: Entity<InputState>,
+    webhook: Entity<InputState>,
+    /// The brief was closed for this session.
+    brief_closed: bool,
     body_scroll: ScrollHandle,
     transcript_scroll: ScrollHandle,
     expanded: HashSet<u64>,
@@ -466,7 +493,9 @@ impl CopilotWindow {
     ) -> Self {
         let ask = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Ask about your screen or conversation\u{2026}")
+                .placeholder(
+                    "Ask anything, or type \u{201c}note: \u{2026}\u{201d} to keep something",
+                )
                 .clean_on_escape()
         });
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Their name"));
@@ -498,6 +527,21 @@ impl CopilotWindow {
         let leadlord_token = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Bitwarden Secrets Manager access token")
+                .masked(true)
+        });
+        let goal = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("e.g. Get a second meeting, ask about budget")
+        });
+        let user_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Your first name, as they say it"));
+        let calendar = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Private .ics address from Outlook or Google Calendar")
+                .masked(true)
+        });
+        let webhook = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://\u{2026} receives each finished meeting as JSON")
                 .masked(true)
         });
         let mut subscriptions = vec![cx.subscribe_in(
@@ -556,6 +600,11 @@ impl CopilotWindow {
             leadlord_token,
             anthropic_key,
             openai_key,
+            goal,
+            user_name,
+            calendar,
+            webhook,
+            brief_closed: false,
             body_scroll: ScrollHandle::new(),
             transcript_scroll: ScrollHandle::new(),
             expanded: HashSet::new(),
@@ -634,6 +683,18 @@ impl CopilotWindow {
         self.openai_key.update(cx, |input, cx| {
             input.set_value(settings.openai_api_key.clone(), window, cx)
         });
+        self.goal.update(cx, |input, cx| {
+            input.set_value(settings.meeting_goal.clone(), window, cx)
+        });
+        self.user_name.update(cx, |input, cx| {
+            input.set_value(settings.user_name.clone(), window, cx)
+        });
+        self.calendar.update(cx, |input, cx| {
+            input.set_value(settings.calendar_ics.clone(), window, cx)
+        });
+        self.webhook.update(cx, |input, cx| {
+            input.set_value(settings.webhook_url.clone(), window, cx)
+        });
     }
 
     pub fn apply(&mut self, event: CopilotEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -641,10 +702,21 @@ impl CopilotWindow {
         let settings_event = matches!(event, CopilotEvent::Settings(_));
         let answer_started = matches!(event, CopilotEvent::AnswerStarted { .. });
         let insights = matches!(event, CopilotEvent::Insights(_));
-        let ending = matches!(
-            event,
-            CopilotEvent::Ending | CopilotEvent::NotesSaved { .. }
-        );
+        let quiet = matches!(event, CopilotEvent::NotesSaved { quiet: true, .. });
+        let ending = !quiet
+            && matches!(
+                event,
+                CopilotEvent::Ending | CopilotEvent::NotesSaved { .. }
+            );
+        let alert = matches!(event, CopilotEvent::Alert(_));
+        if answer_started
+            && let Some(latest) = self.model.answers.last()
+            && (latest.status.is_active() || latest.instant_active)
+        {
+            // The answer being written keeps showing in full below the new
+            // one.
+            self.expanded.insert(latest.id);
+        }
         match self.model.apply(event) {
             CopilotEffect::None => {}
             CopilotEffect::ToggleVisibility => self.set_visible(!self.visible, cx),
@@ -671,8 +743,26 @@ impl CopilotWindow {
             self.tab = Tab::Live;
             self.body_scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
-        if insights && !self.panel_open && !self.user_collapsed {
+        if alert {
+            // An alert is worth interrupting for, hidden or collapsed.
             self.panel_open = true;
+            self.settings_open = false;
+            self.tab = Tab::Live;
+            self.body_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            self.set_visible(true, cx);
+        }
+        // Compact mode opens for a line to say, not for insights.
+        if insights && !self.panel_open && !self.user_collapsed && !self.model.settings.compact {
+            self.panel_open = true;
+        }
+        if quiet {
+            // The meeting was ended by hand: only a small bar says the notes
+            // are ready.
+            self.panel_open = false;
+            self.settings_open = false;
+            self.tab = Tab::Live;
+            self.stop_typing(false, cx);
+            self.set_visible(true, cx);
         }
         if ending {
             // The wrap-up is shown even if the copilot was hidden or collapsed.
@@ -730,6 +820,10 @@ impl CopilotWindow {
         let leadlord_token = self.leadlord_token.read(cx).value().trim().to_owned();
         let anthropic = self.anthropic_key.read(cx).value().trim().to_owned();
         let openai = self.openai_key.read(cx).value().trim().to_owned();
+        let goal = self.goal.read(cx).value().trim().to_owned();
+        let user_name = self.user_name.read(cx).value().trim().to_owned();
+        let calendar = self.calendar.read(cx).value().trim().to_owned();
+        let webhook = self.webhook.read(cx).value().trim().to_owned();
         self.update_settings(|settings| {
             settings.profile = profile;
             settings.custom_instructions = instructions;
@@ -737,6 +831,10 @@ impl CopilotWindow {
             settings.leadlord_bws_access_token = leadlord_token;
             settings.anthropic_api_key = anthropic;
             settings.openai_api_key = openai;
+            settings.meeting_goal = goal;
+            settings.user_name = user_name;
+            settings.calendar_ics = calendar;
+            settings.webhook_url = webhook;
         });
         self.model.notice = Some("Settings saved".into());
         self.notice_at = Some(Instant::now());
@@ -754,7 +852,9 @@ impl CopilotWindow {
             && insights.summary.is_empty()
             && insights.question.is_none()
             && insights.suggestions.is_empty();
-        if first_run {
+        if self.compact_shown() {
+            COMPACT_PANEL_HEIGHT
+        } else if first_run {
             220.0
         } else if self.live_body_shown() {
             self.live_fit.get().height().unwrap_or(COPILOT_PANEL_HEIGHT)
@@ -773,6 +873,23 @@ impl CopilotWindow {
             && !self.model.ending
             && self.model.notes_path.is_none()
             && self.model.answers.is_empty()
+            && !self.compact_shown()
+    }
+
+    /// Whether the panel shows only the line to say.
+    fn compact_shown(&self) -> bool {
+        self.model.settings.compact
+            && !self.settings_open
+            && self.tab == Tab::Live
+            && !self.model.ending
+            && self.model.notes_path.is_none()
+            && self.model.alert.is_none()
+    }
+
+    /// Whether only the notes-ready bar is shown: the meeting was ended by
+    /// hand and the wrap-up has not been opened.
+    fn notes_ready_shown(&self) -> bool {
+        self.model.notes_quiet && self.model.notes_path.is_some() && !self.panel_open
     }
 
     fn desired_size(&self) -> (f32, f32) {
@@ -1116,6 +1233,25 @@ impl CopilotWindow {
             )
             .child(
                 icon_button(
+                    "copilot-compact-toggle",
+                    if self.model.settings.compact {
+                        "plus"
+                    } else {
+                        "minus"
+                    },
+                    if self.model.settings.compact {
+                        ACCENT
+                    } else {
+                        MUTED
+                    },
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.update_settings(|settings| settings.compact = !settings.compact);
+                    cx.notify();
+                })),
+            )
+            .child(
+                icon_button(
                     "copilot-settings",
                     "sliders",
                     if self.settings_open { ACCENT } else { MUTED },
@@ -1166,13 +1302,287 @@ impl CopilotWindow {
             .child(pill)
     }
 
+    /// The bar after a meeting ended by hand: the notes are ready, one
+    /// click from the wrap-up or the follow-up email, and it leaves on its
+    /// own.
+    fn render_notes_ready(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let topic = self.model.insights.topic.trim().to_owned();
+        let has_email = self.model.follow_up.is_some();
+        let pill = h_flex()
+            .debug_selector(|| "copilot-notes-ready".to_owned())
+            .id("copilot-notes-ready")
+            .relative()
+            .h(px(PILL_HEIGHT))
+            .pl(px(12.))
+            .pr(px(4.))
+            .gap(px(8.))
+            .items_center()
+            .rounded(px(PILL_HEIGHT / 2.0))
+            .window_control_area(WindowControlArea::Drag)
+            .bg(color(GLASS))
+            .border_1()
+            .border_color(color(BORDER))
+            .child(icon("check", 14., ACCENT))
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Notes ready"),
+            )
+            .when(!topic.is_empty(), |pill| {
+                pill.child(
+                    div()
+                        .max_w(px(220.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(12.))
+                        .text_color(color(MUTED))
+                        .child(topic),
+                )
+            })
+            .child(divider())
+            .child(
+                bar_button("copilot-notes-ready-open")
+                    .child(icon("file-text", 12., ACCENT))
+                    .child(div().text_size(px(12.5)).child("Wrap-up"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.act(CopilotAction::KeepOpen);
+                        this.panel_open = true;
+                        this.tab = Tab::Live;
+                        cx.notify();
+                    })),
+            )
+            .when(has_email, |pill| {
+                pill.child(
+                    bar_button("copilot-notes-ready-email")
+                        .child(icon("mail", 12., ACCENT))
+                        .child(div().text_size(px(12.5)).child("Draft email"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                            this.act(CopilotAction::DraftEmail);
+                        })),
+                )
+            })
+            .child(
+                icon_button("copilot-notes-ready-close", "x", MUTED).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, _| {
+                        this.act(CopilotAction::End);
+                    },
+                )),
+            )
+            .child(shape_probe(&self.shape, &self.host, false));
+        h_flex()
+            .w_full()
+            .h(px(COPILOT_BAR_HEIGHT))
+            .pt(px(COPILOT_TOP_MARGIN))
+            .justify_center()
+            .child(pill)
+    }
+
+    /// The panel in compact mode: the line to say, large, and where it
+    /// comes from.
+    fn render_compact(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let latest = self.model.latest_answer().cloned();
+        let (line, grounding, checking) = match &latest {
+            Some(answer) => (
+                answer.line_to_say(),
+                answer.grounding.filter(|_| answer.shown == 0),
+                answer.status.is_active(),
+            ),
+            None => (String::new(), None, false),
+        };
+        let waiting = line.trim().is_empty();
+        v_flex()
+            .debug_selector(|| "copilot-compact".to_owned())
+            .id("copilot-compact-body")
+            .size_full()
+            .overflow_y_scroll()
+            .gap(px(6.))
+            .px(px(18.))
+            .py(px(14.))
+            .child(
+                div()
+                    .w_full()
+                    .text_size(px(if waiting { 13. } else { 17. }))
+                    .line_height(rems(1.4))
+                    .text_color(color(if waiting { DIM } else { TEXT }))
+                    .child(if waiting {
+                        if latest.is_some() {
+                            "Writing your line\u{2026}".to_owned()
+                        } else {
+                            "The line to say appears here when they ask you something.".to_owned()
+                        }
+                    } else {
+                        // Markdown emphasis is for the full card.
+                        line.replace("**", "")
+                    }),
+            )
+            .when(!waiting, |column| {
+                column.child(
+                    h_flex()
+                        .gap(px(10.))
+                        .text_size(px(11.))
+                        .text_color(color(DIM))
+                        .when_some(grounding, |row, grounding| {
+                            row.child(grounding_mark(grounding))
+                        })
+                        .when(checking, |row| row.child("Checking the facts"))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .debug_selector(|| "copilot-compact-more".to_owned())
+                                .id("copilot-compact-more")
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(color(TEXT)))
+                                .child("Show everything")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.update_settings(|settings| settings.compact = false);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+    }
+
+    /// Something that needs the user's eye now: their name was said, or
+    /// their documents contradict what they said.
+    fn render_alert(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let alert = self.model.alert.clone()?;
+        let mention = alert.kind == AlertKind::Mention;
+        let tint = if mention { DANGER } else { WARNING };
+        let question = alert.text.clone();
+        Some(
+            v_flex()
+                .debug_selector(|| "copilot-alert".to_owned())
+                .w_full()
+                .gap(px(8.))
+                .p(px(12.))
+                .rounded(px(12.))
+                .bg(color(tint).opacity(0.12))
+                .border_1()
+                .border_color(color(tint).opacity(0.4))
+                .child(
+                    h_flex().gap(px(6.)).child(icon("alert", 13., tint)).child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(tint))
+                            .child(if mention {
+                                "THEY SAID YOUR NAME"
+                            } else {
+                                "CHECK WHAT YOU SAID"
+                            }),
+                    ),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.5))
+                        .line_height(rems(1.4))
+                        .child(alert.text.clone()),
+                )
+                .when(!alert.context.trim().is_empty(), |card| {
+                    card.child(
+                        v_flex()
+                            .gap(px(3.))
+                            .child(section_label("Just before"))
+                            .children(alert.context.lines().map(|line| {
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(color(MUTED))
+                                    .child(line.to_owned())
+                            })),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .gap(px(6.))
+                        .when(mention, |row| {
+                            row.child(
+                                chip("copilot-alert-answer", true)
+                                    .debug_selector(|| "copilot-alert-answer".to_owned())
+                                    .child(icon("sparkles", 11., ACCENT))
+                                    .child("What should I say?")
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.model.alert = None;
+                                        this.act(CopilotAction::AnswerQuestion(question.clone()));
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(
+                            chip("copilot-alert-dismiss", false)
+                                .debug_selector(|| "copilot-alert-dismiss".to_owned())
+                                .child("Dismiss")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.model.alert = None;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    /// The meeting's checklist, ticking itself as things are covered.
+    fn render_checklist(&self) -> Option<impl IntoElement + use<>> {
+        let items = self.model.checklist.clone();
+        if items.is_empty() {
+            return None;
+        }
+        let (done, total) = self.model.checklist_progress();
+        Some(
+            v_flex()
+                .debug_selector(|| "copilot-checklist".to_owned())
+                .w_full()
+                .gap(px(6.))
+                .child(
+                    h_flex()
+                        .gap(px(6.))
+                        .child(icon("check", 12., DIM))
+                        .child(section_label("Checklist"))
+                        .child(
+                            div()
+                                .ml_auto()
+                                .text_size(px(11.))
+                                .text_color(color(DIM))
+                                .child(format!("{done} of {total}")),
+                        ),
+                )
+                .child(h_flex().flex_wrap().gap_x(px(14.)).gap_y(px(4.)).children(
+                    items.into_iter().map(|item| {
+                        h_flex()
+                            .gap(px(5.))
+                            .child(if item.done {
+                                icon("check", 12., ACCENT).into_any_element()
+                            } else {
+                                div()
+                                    .size(px(10.))
+                                    .mx(px(1.))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(color(DIM))
+                                    .into_any_element()
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(color(if item.done { DIM } else { TEXT }))
+                                    .when(item.done, |label| label.line_through())
+                                    .child(item.label),
+                            )
+                    }),
+                )),
+        )
+    }
+
     fn render_panel(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         // After the meeting, the transcript stays one tab away from the wrap-up.
-        let body: AnyElement = if self.settings_open {
+        let compact = self.compact_shown();
+        let body: AnyElement = if compact {
+            self.render_compact(cx).into_any_element()
+        } else if self.settings_open {
             self.render_settings(cx).into_any_element()
         } else if self.tab == Tab::Transcript {
             self.render_transcript(cx).into_any_element()
@@ -1181,8 +1591,10 @@ impl CopilotWindow {
         } else {
             self.render_live(window, cx).into_any_element()
         };
-        let show_footer =
-            !self.settings_open && !self.model.ending && self.model.notes_path.is_none();
+        let show_footer = !compact
+            && !self.settings_open
+            && !self.model.ending
+            && self.model.notes_path.is_none();
         let panel_height = self.panel_height();
         let fits = self.live_body_shown();
         let fit = Rc::clone(&self.live_fit);
@@ -1208,7 +1620,7 @@ impl CopilotWindow {
                         spread_radius: px(0.),
                     }])
                     .child(shape_probe(&self.shape, &self.host, true))
-                    .child(self.render_header(cx))
+                    .when(!compact, |panel| panel.child(self.render_header(cx)))
                     .child(
                         div()
                             .relative()
@@ -1386,8 +1798,74 @@ impl CopilotWindow {
                 cx.entity().downgrade(),
                 FitProbe::Content,
             ));
+        if let Some(alert) = self.render_alert(cx) {
+            content = content.child(alert);
+        }
         if let Some(answer) = latest {
             content = content.child(self.render_answer(&answer, true, window, cx));
+        }
+        if let Some(checklist) = self.render_checklist() {
+            content = content.child(checklist);
+        }
+        if let Some(brief) = self
+            .model
+            .brief
+            .clone()
+            .filter(|_| !self.brief_closed && self.model.answers.is_empty())
+        {
+            let style = TextViewStyle {
+                is_dark: true,
+                highlight_theme: HighlightTheme::default_dark(),
+                ..TextViewStyle::default()
+            }
+            .paragraph_gap(rems(0.4));
+            content = content.child(
+                v_flex()
+                    .debug_selector(|| "copilot-brief".to_owned())
+                    .w_full()
+                    .gap(px(6.))
+                    .p(px(12.))
+                    .rounded(px(12.))
+                    .bg(color(GLASS_RAISED))
+                    .border_1()
+                    .border_color(color(HAIRLINE))
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(icon("book", 12., ACCENT))
+                            .child(section_label("Before you start"))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("copilot-brief-close")
+                                    .debug_selector(|| "copilot-brief-close".to_owned())
+                                    .size(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(color(HOVER)))
+                                    .child(icon("x", 11., MUTED))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.brief_closed = true;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(13.))
+                            .line_height(rems(1.4))
+                            .text_color(color(MUTED))
+                            .child(
+                                TextView::markdown("copilot-brief-text", brief, window, cx)
+                                    .style(style)
+                                    .selectable(true),
+                            ),
+                    ),
+            );
         }
         if let Some(question) = insights.question.clone()
             && !self
@@ -1495,6 +1973,39 @@ impl CopilotWindow {
                             ),
                         )
                     }),
+            );
+        }
+        if !self.model.promises.is_empty() {
+            content = content.child(
+                v_flex()
+                    .debug_selector(|| "copilot-promises".to_owned())
+                    .w_full()
+                    .gap(px(6.))
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(icon("file-text", 12., DIM))
+                            .child(section_label("You promised")),
+                    )
+                    .children(self.model.promises.iter().map(|promise| {
+                        h_flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .mt(px(7.))
+                                    .size(px(4.))
+                                    .rounded_full()
+                                    .bg(color(ACCENT)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(13.))
+                                    .text_color(color(MUTED))
+                                    .child(promise.clone()),
+                            )
+                    })),
             );
         }
         if !self.model.settings.onboarded && self.model.answers.is_empty() && !has_insights {
@@ -1935,6 +2446,11 @@ impl CopilotWindow {
             _ => None,
         };
         let sources = answer.sources.clone();
+        // Where the line's facts come from, while the line shown is the
+        // draft that reported it.
+        let grounding = answer
+            .grounding
+            .filter(|_| has_instant && !rewritten && !corrected);
         v_flex()
             .id(("copilot-answer", id))
             .w_full()
@@ -1970,6 +2486,15 @@ impl CopilotWindow {
                                 .text_color(color(if corrected { MUTED } else { TEXT }))
                                 .child(hero_view),
                         ),
+                )
+            })
+            .when_some(grounding, |card, grounding| {
+                card.child(
+                    h_flex()
+                        .debug_selector(|| "copilot-answer-grounding".to_owned())
+                        .pl(px(15.))
+                        .text_size(px(11.))
+                        .child(grounding_mark(grounding)),
                 )
             })
             .when(rewriting_now, |card| {
@@ -2277,7 +2802,7 @@ impl CopilotWindow {
         .filter(|(_, text)| !text.trim().is_empty())
         .collect();
         let mut content = v_flex().w_full().gap(px(12.)).p(px(16.));
-        if lines.is_empty() && partials.is_empty() {
+        if lines.is_empty() && partials.is_empty() && self.model.notes.is_empty() {
             content = content.child(
                 div()
                     .pt(px(80.))
@@ -2289,7 +2814,51 @@ impl CopilotWindow {
             );
         }
         let several_voices = has_several_voices(&lines);
+        // What the user typed to keep sits where it was typed.
+        let mut notes = self.model.notes.clone().into_iter().peekable();
+        let note_row = |at_ms: u64, text: String| {
+            h_flex()
+                .debug_selector(|| "copilot-note".to_owned())
+                .w_full()
+                .items_start()
+                .gap(px(10.))
+                .child(
+                    v_flex()
+                        .w(px(64.))
+                        .flex_none()
+                        .gap(px(1.))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(color(MUTED))
+                                .child("Note"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(color(DIM))
+                                .child(format_offset(at_ms)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(px(8.))
+                        .bg(color(0xffffff0a))
+                        .text_size(px(13.))
+                        .line_height(rems(1.4))
+                        .child(text),
+                )
+        };
         for line in lines {
+            while let Some((at_ms, text)) = notes.next_if(|(at_ms, _)| *at_ms < line.at_ms) {
+                content = content.child(note_row(at_ms, text));
+            }
+            let translation = self.model.translations.get(&line.id).cloned();
             let tint = match (line.speaker, line.voice) {
                 (Speaker::Me, _) => ME,
                 (Speaker::Them, Some(voice)) if several_voices => {
@@ -2335,14 +2904,31 @@ impl CopilotWindow {
                             ),
                     )
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(13.5))
-                            .line_height(rems(1.4))
-                            .child(line.text.clone()),
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .line_height(rems(1.4))
+                                    .child(line.text.clone()),
+                            )
+                            .when_some(translation, |column, translation| {
+                                column.child(
+                                    div()
+                                        .debug_selector(|| "copilot-translation".to_owned())
+                                        .text_size(px(12.5))
+                                        .line_height(rems(1.4))
+                                        .text_color(color(ACCENT))
+                                        .child(translation),
+                                )
+                            }),
                     ),
             );
+        }
+        for (at_ms, text) in notes {
+            content = content.child(note_row(at_ms, text));
         }
         // Words still being transcribed, replaced by the final line.
         for (speaker, text) in partials {
@@ -2410,12 +2996,21 @@ impl CopilotWindow {
     }
 
     fn render_footer(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let actions: Vec<QuickAction> = QuickAction::ALL
-            .into_iter()
-            .filter(|action| {
-                *action != QuickAction::ExplainScreen || self.model.settings.screen_context
-            })
-            .collect();
+        // Catching up comes second: it is the one most needed in a hurry.
+        let actions: Vec<QuickAction> = [
+            QuickAction::WhatToSay,
+            QuickAction::CatchUp,
+            QuickAction::FollowUps,
+            QuickAction::Recap,
+            QuickAction::FactCheck,
+            QuickAction::ExplainScreen,
+        ]
+        .into_iter()
+        .filter(|action| {
+            *action != QuickAction::ExplainScreen || self.model.settings.screen_context
+        })
+        .collect();
+        let catch_up_keys = self.model.shortcuts.catch_up.clone();
         let typing = self.typing;
         v_flex()
             .flex_none()
@@ -2428,11 +3023,17 @@ impl CopilotWindow {
             .border_color(color(HAIRLINE))
             .child(
                 h_flex()
+                    .id("copilot-quick-row")
+                    .w_full()
+                    .overflow_x_scroll()
                     .gap(px(6.))
                     .children(actions.into_iter().map(|action| {
+                        let keys = (action == QuickAction::CatchUp && !catch_up_keys.is_empty())
+                            .then(|| catch_up_keys.clone());
                         chip(("copilot-quick", action as usize), false)
                             .debug_selector(move || format!("copilot-quick-{}", action as usize))
                             .child(action.label())
+                            .when_some(keys, |chip, keys| chip.child(keycaps(&keys)))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
                                 this.act(CopilotAction::Quick(action));
                             }))
@@ -2774,10 +3375,23 @@ impl CopilotWindow {
         };
         let needs_anthropic = settings.provider == CopilotProvider::AnthropicApi;
         let needs_openai = settings.provider == CopilotProvider::OpenaiApi;
+        let hint =
+            |text: &'static str| div().text_size(px(11.5)).text_color(color(DIM)).child(text);
+        let spoken = settings.language.trim().to_lowercase();
+        let translate = settings.translate_to.trim().to_lowercase();
         let content = v_flex()
             .w_full()
             .gap(px(16.))
             .p(px(16.))
+            .child(
+                v_flex()
+                    .gap(px(6.))
+                    .child(section_label("Goal for this meeting"))
+                    .child(text_area("copilot-goal", &self.goal, cx))
+                    .child(hint(
+                        "Each part becomes a checklist item that ticks itself off. Cleared when the meeting ends.",
+                    )),
+            )
             .child(
                 v_flex()
                     .gap(px(8.))
@@ -2904,8 +3518,92 @@ impl CopilotWindow {
             )
             .child(
                 v_flex()
+                    .gap(px(8.))
+                    .child(section_label("Spoken language"))
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap(px(6.))
+                            .child(
+                                chip("copilot-language-auto", spoken.is_empty())
+                                    .debug_selector(|| "copilot-language-auto".to_owned())
+                                    .child("Automatic")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.update_settings(|settings| settings.language.clear());
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(LANGUAGES.into_iter().enumerate().map(|(index, (code, name))| {
+                                chip(("copilot-language", index), spoken == code)
+                                    .debug_selector(move || format!("copilot-language-{code}"))
+                                    .child(name)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.update_settings(|settings| {
+                                            settings.language = code.to_owned();
+                                        });
+                                        cx.notify();
+                                    }))
+                            })),
+                    )
+                    .child(hint(
+                        "Automatic suits most calls. Pick one when names or accents are misheard; it applies from the next meeting.",
+                    )),
+            )
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(section_label("Translate what they say into"))
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap(px(6.))
+                            .child(
+                                chip("copilot-translate-off", translate.is_empty())
+                                    .debug_selector(|| "copilot-translate-off".to_owned())
+                                    .child("Off")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.update_settings(|settings| {
+                                            settings.translate_to.clear();
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(LANGUAGES.into_iter().enumerate().map(|(index, (code, name))| {
+                                chip(("copilot-translate", index), translate == code)
+                                    .debug_selector(move || format!("copilot-translate-{code}"))
+                                    .child(name)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.update_settings(|settings| {
+                                            settings.translate_to = code.to_owned();
+                                        });
+                                        cx.notify();
+                                    }))
+                            })),
+                    )
+                    .child(hint(
+                        "Their lines in another language get a translation under them in the transcript, and the line to say comes with its meaning.",
+                    )),
+            )
+            .child(
+                v_flex()
                     .gap(px(2.))
                     .child(section_label("Behavior"))
+                    .child(toggle(
+                        "copilot-compact-mode",
+                        "Compact panel",
+                        "Show only the line to say. The \u{2212} button on the bar switches it too.",
+                        settings.compact,
+                        cx,
+                        |settings| settings.compact = !settings.compact,
+                    ))
+                    .child(toggle(
+                        "copilot-auto-start",
+                        "Open when a meeting starts",
+                        "The copilot opens by itself when a call begins, without the shortcut.",
+                        settings.auto_start,
+                        cx,
+                        |settings| settings.auto_start = !settings.auto_start,
+                    ))
                     .child(toggle(
                         "copilot-web",
                         "Search the web",
@@ -3055,6 +3753,15 @@ impl CopilotWindow {
             .child(
                 v_flex()
                     .gap(px(6.))
+                    .child(section_label("Your name"))
+                    .child(text_area("copilot-user-name", &self.user_name, cx))
+                    .child(hint(
+                        "When you are only listening and someone says it, the copilot alerts you with what was just said.",
+                    )),
+            )
+            .child(
+                v_flex()
+                    .gap(px(6.))
                     .child(section_label("About you"))
                     .child(text_area("copilot-profile", &self.profile, cx)),
             )
@@ -3063,6 +3770,24 @@ impl CopilotWindow {
                     .gap(px(6.))
                     .child(section_label("Standing instructions"))
                     .child(text_area("copilot-instructions", &self.instructions, cx)),
+            )
+            .child(
+                v_flex()
+                    .gap(px(6.))
+                    .child(section_label("Calendar"))
+                    .child(text_area("copilot-calendar", &self.calendar, cx))
+                    .child(hint(
+                        "Names the meeting and who is in it before anyone speaks. Outlook: Settings, Calendar, Shared calendars, Publish a calendar, ICS link.",
+                    )),
+            )
+            .child(
+                v_flex()
+                    .gap(px(6.))
+                    .child(section_label("Send finished meetings to"))
+                    .child(text_area("copilot-webhook", &self.webhook, cx))
+                    .child(hint(
+                        "A webhook address for your CRM, Notion, Zapier, or Make. It receives the summary, commitments, and transcript.",
+                    )),
             )
             .child(
                 h_flex()
@@ -3102,7 +3827,11 @@ impl Render for CopilotWindow {
             self.shape.borrow_mut().panel = None;
             apply_shape(&self.shape, &self.host, cx);
         }
-        let bar = self.render_bar(cx);
+        let bar = if self.notes_ready_shown() {
+            self.render_notes_ready(cx).into_any_element()
+        } else {
+            self.render_bar(cx).into_any_element()
+        };
         let panel = self.panel_open.then(|| self.render_panel(window, cx));
         div()
             .id("copilot-root")

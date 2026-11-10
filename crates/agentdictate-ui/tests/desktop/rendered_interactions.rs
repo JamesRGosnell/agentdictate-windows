@@ -1163,6 +1163,8 @@ fn meetings_model(selected: bool) -> ShellViewModel {
         overview: "Agreed on a 25-seat pilot.".to_owned(),
         with: "Sam Lee".to_owned(),
         search_text: String::new(),
+        promises: vec![("Send the agreement".to_owned(), false)],
+        talk_share: Some(42),
     };
     let detail = selected.then(|| agentdictate_ui::MeetingDetailViewModel {
         id: note.id.clone(),
@@ -1175,6 +1177,9 @@ fn meetings_model(selected: bool) -> ShellViewModel {
         follow_up: Some("Hi Sam,\n\nThanks for today.".to_owned()),
         answers: String::new(),
         transcript: "**[0:02] Them:** Can we start small?".to_owned(),
+        promises: note.promises.clone(),
+        my_notes: "- [1:05] they renew in March".to_owned(),
+        scorecard: "- **You spoke:** 42% of the words (420 of 1000)".to_owned(),
     });
     ShellViewModel::from_snapshot(
         Route::Meetings,
@@ -1186,6 +1191,7 @@ fn meetings_model(selected: bool) -> ShellViewModel {
         meetings: agentdictate_ui::MeetingsViewModel {
             notes: vec![note],
             selected: detail,
+            answer: None,
         },
         ..WorkspaceViewModel::default()
     })
@@ -1248,6 +1254,112 @@ fn an_opened_meeting_copies_its_follow_up_and_returns_to_the_list(cx: &mut TestA
     assert_eq!(
         actions.lock().unwrap().as_slice(),
         [WorkspaceAction::CloseMeeting]
+    );
+}
+
+#[gpui::test]
+fn the_meetings_list_shows_people_what_is_owed_and_answers_questions(cx: &mut TestAppContext) {
+    let mut answered = meetings_model(false).workspace;
+    answered.meetings.answer = Some(agentdictate_ui::MeetingsAnswer {
+        question: "What did Sam agree to?".to_owned(),
+        answer: "A **25-seat pilot** (Meeting 2026-10-13 0900 Pilot planning).".to_owned(),
+    });
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&actions);
+    test_support::initialize(cx);
+    let model = meetings_model(false);
+    let shell_slot = Rc::new(RefCell::new(None));
+    let window_slot = Rc::clone(&shell_slot);
+    let window = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(1_100.), px(780.)),
+                ))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                let shell = cx.new(|cx| {
+                    SettingsShell::connected_with_workspace_actions(
+                        model,
+                        agentdictate_core::Settings::default(),
+                        false,
+                        Arc::new(|_| Ok(())),
+                        Arc::new(move |action| {
+                            captured.lock().unwrap().push(action);
+                            Ok(answered.clone())
+                        }),
+                        window,
+                        cx,
+                    )
+                });
+                *window_slot.borrow_mut() = Some(shell.clone());
+                let frame = cx.new(|_| AgentDictateWindowFrame::new(shell));
+                cx.new(|cx| Root::new(frame, window, cx))
+            },
+        )
+        .expect("headless meetings window opens")
+    });
+    let shell = shell_slot.borrow_mut().take().unwrap();
+    let visual = VisualTestContext::from_window(*window.deref(), cx).into_mut();
+    visual.run_until_parked();
+    let mut harness = Harness { shell, cx: visual };
+    assert!(harness.has("meetings-people"));
+    assert!(harness.has("meetings-open-promises"));
+    assert!(!harness.has("meetings-answer"));
+    harness.click("meetings-promise-2026-10-13 0900 Pilot planning.md-0");
+    harness.type_text("meetings-search-input", "What did Sam agree to?");
+    harness.click("meetings-ask");
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [
+            WorkspaceAction::SetMeetingPromise {
+                id: "2026-10-13 0900 Pilot planning.md".to_owned(),
+                index: 0,
+                done: true,
+            },
+            WorkspaceAction::AskMeetings {
+                question: "What did Sam agree to?".to_owned(),
+            },
+        ]
+    );
+    assert!(harness.has("meetings-answer"));
+}
+
+#[gpui::test]
+fn an_opened_meeting_shows_commitments_notes_and_how_you_spoke(cx: &mut TestAppContext) {
+    let opened = meetings_model(true).workspace;
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&actions);
+    let mut harness = Harness::open_model_with_actions(
+        cx,
+        size(px(1_100.), px(780.)),
+        meetings_model(true),
+        Arc::new(move |action| {
+            captured.lock().unwrap().push(action);
+            Ok(opened.clone())
+        }),
+    );
+    assert!(harness.has("meetings-promises"));
+    assert!(harness.has("meetings-my-notes"));
+    assert!(harness.has("meetings-scorecard"));
+    harness.click("meetings-copy-notes");
+    let copied = harness
+        .cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    assert!(copied.contains("- [ ] Send the agreement"));
+    assert!(!copied.contains("Can we start small?"), "no transcript");
+    harness.click("meetings-promise-2026-10-13 0900 Pilot planning.md-0");
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [WorkspaceAction::SetMeetingPromise {
+            id: "2026-10-13 0900 Pilot planning.md".to_owned(),
+            index: 0,
+            done: true,
+        }]
     );
 }
 
@@ -1928,6 +2040,7 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
             *store.lock().unwrap() = settings.clone();
             Ok(())
         }),
+        ask_documents: Arc::new(|question| Ok(format!("Asked: {question}"))),
     });
     let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
     assert!(harness.has("settings-group-copilot"));
@@ -1946,6 +2059,23 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
     assert!(harness.has("copilot-settings-key"));
     assert!(harness.has("copilot-settings-feedback"));
     let auto_answer = saved.lock().unwrap().auto_answer;
+    let top = harness.bounds("copilot-settings-toggle-0").top();
+    harness.scroll_route_by(-(f32::from(top) - 300.));
     harness.click("copilot-settings-toggle-0");
     assert_eq!(saved.lock().unwrap().auto_answer, !auto_answer);
+    // What the in-call sheet offers is here too.
+    for selector in [
+        "copilot-settings-brain-0",
+        "copilot-settings-effort-0",
+        "copilot-settings-rewrite-0",
+        "copilot-settings-language-auto",
+        "copilot-settings-translate-off",
+        "copilot-settings-docs-ask",
+    ] {
+        assert!(harness.has(selector), "{selector}");
+    }
+    let top = harness.bounds("copilot-settings-language-fr").top();
+    harness.scroll_route_by(-(f32::from(top) - 300.));
+    harness.click("copilot-settings-language-fr");
+    assert_eq!(saved.lock().unwrap().language, "fr");
 }

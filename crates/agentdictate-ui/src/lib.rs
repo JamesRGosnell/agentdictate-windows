@@ -42,7 +42,10 @@ pub use desktop::{
 pub use history::{
     HistoryViewModel, RecoveryItemViewModel, RecoveryStage, RecoveryViewModel, TranscriptViewModel,
 };
-pub use meetings::{MeetingDetailViewModel, MeetingNoteViewModel, MeetingsViewModel};
+pub use meetings::{
+    MeetingDetailViewModel, MeetingNoteViewModel, MeetingsAnswer, MeetingsViewModel,
+    OpenPromiseViewModel, PersonViewModel,
+};
 pub use model_catalog::{
     ModelCatalogOptionViewModel, ModelCatalogStatusSource, ModelCatalogStatusViewModel,
     ModelCatalogViewModel, ReasoningOptionViewModel,

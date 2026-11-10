@@ -291,6 +291,10 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
                             };
                             match ask(&base, &chatgpt, &request) {
                                 Ok((text, elapsed_ms)) => {
+                                    // Graded as the user sees it, without
+                                    // the marker that says where its facts
+                                    // come from.
+                                    let text = agentdictate_core::split_grounding(&text).0;
                                     let draft = Draft { text, elapsed_ms };
                                     cache
                                         .lock()

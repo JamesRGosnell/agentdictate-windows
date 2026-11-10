@@ -232,7 +232,9 @@ fn run() -> anyhow::Result<()> {
     };
     let runtime = paths.runtime.clone();
     let workspace_client = Arc::new(
-        WorkspaceClient::new(runtime.clone(), *workspace).with_meetings_dir(paths.meetings_dir()),
+        WorkspaceClient::new(runtime.clone(), *workspace)
+            .with_meetings_dir(paths.meetings_dir())
+            .with_copilot(paths.clone()),
     );
     let mut workspace_model = workspace_client.view_model()?;
     let workspace_updates = match workspace_client

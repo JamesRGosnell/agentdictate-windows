@@ -10,8 +10,8 @@ use gpui_component::{
 
 use crate::action::action_button;
 use crate::{
-    MeetingDetailViewModel, MeetingNoteViewModel, MeetingsViewModel, Route, ThemeTokens,
-    WorkspaceAction,
+    MeetingDetailViewModel, MeetingNoteViewModel, MeetingsAnswer, MeetingsViewModel,
+    OpenPromiseViewModel, PersonViewModel, Route, ThemeTokens, WorkspaceAction,
 };
 
 use super::{SettingsShell, gpui_color, single_line::single_line_clip};
@@ -46,19 +46,240 @@ pub(super) fn surface(
         None => {
             let total = meetings.notes.len();
             let found = meetings.search(&state.query);
-            list_view(found, total, &state.query, state.search_input, theme, cx)
+            let extras = ListExtras {
+                people: meetings.people(),
+                open: meetings.open_promises(),
+                trend: meetings.talk_trend(),
+                answer: meetings.answer.clone(),
+                feedback: state.feedback,
+            };
+            list_view(
+                found,
+                total,
+                &state.query,
+                state.search_input,
+                extras,
+                theme,
+                window,
+                cx,
+            )
         }
     }
 }
 
+impl SettingsShell {
+    /// Asks the question in the search box across every saved meeting.
+    pub(super) fn ask_meetings(&mut self, cx: &mut Context<Self>) {
+        let question = self.routes.meetings_query.trim().to_owned();
+        if question.is_empty() {
+            self.set_route_feedback_for(
+                Route::Meetings,
+                "Type a question about your meetings first.".to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        self.set_route_feedback_for(Route::Meetings, "Reading your meetings\u{2026}".to_owned());
+        self.emit_workspace_action(WorkspaceAction::AskMeetings { question }, cx);
+        cx.notify();
+    }
+}
+
+/// What the list shows besides the meetings: who they were with, what is
+/// still owed, how the user has been speaking, and the latest answer.
+struct ListExtras {
+    people: Vec<PersonViewModel>,
+    open: Vec<OpenPromiseViewModel>,
+    trend: Option<String>,
+    answer: Option<MeetingsAnswer>,
+    feedback: Option<String>,
+}
+
+/// People shown as chips before the rest are left to search.
+const MAX_PEOPLE_CHIPS: usize = 10;
+/// Open commitments listed before the rest are left to their meetings.
+const MAX_OPEN_PROMISES: usize = 8;
+
+#[allow(clippy::too_many_arguments)]
 fn list_view(
     notes: Vec<MeetingNoteViewModel>,
     total: usize,
     query: &str,
     search_input: Option<Entity<InputState>>,
+    extras: ListExtras,
     theme: ThemeTokens,
+    window: &mut Window,
     cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
+    let ListExtras {
+        people,
+        open,
+        trend,
+        answer,
+        feedback,
+    } = extras;
+    let section = |title: &'static str| {
+        gpui::div()
+            .pt_2()
+            .text_xs()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(gpui_color(theme.text_muted))
+            .child(title)
+    };
+    let people_input = search_input.clone();
+    let people_row =
+        (!people.is_empty()).then(|| {
+            v_flex()
+                .debug_selector(|| "meetings-people".to_owned())
+                .w_full()
+                .gap_2()
+                .child(section("PEOPLE"))
+                .child(
+                    h_flex().flex_wrap().gap_2().children(
+                        people.into_iter().take(MAX_PEOPLE_CHIPS).enumerate().map(
+                            |(index, person)| {
+                                let name = person.name.clone();
+                                let input = people_input.clone();
+                                let mut label = format!(
+                                    "{} \u{00b7} {}",
+                                    person.name,
+                                    if person.meetings == 1 {
+                                        "1 meeting".to_owned()
+                                    } else {
+                                        format!("{} meetings", person.meetings)
+                                    }
+                                );
+                                if person.open > 0 {
+                                    label.push_str(&format!(" \u{00b7} {} open", person.open));
+                                }
+                                action_button(("meetings-person", index))
+                                    .debug_selector(move || format!("meetings-person-{index}"))
+                                    .small()
+                                    .label(label)
+                                    .on_click(cx.listener(move |shell, _, window, cx| {
+                                        // A person's page is the list filtered
+                                        // to the meetings with them.
+                                        shell.routes.meetings_query = name.clone();
+                                        if let Some(input) = &input {
+                                            input.update(cx, |input, cx| {
+                                                input.set_value(name.clone(), window, cx);
+                                            });
+                                        }
+                                        cx.notify();
+                                    }))
+                            },
+                        ),
+                    ),
+                )
+        });
+    let more_open = open.len().saturating_sub(MAX_OPEN_PROMISES);
+    let open_rows = (!open.is_empty()).then(|| {
+        v_flex()
+            .debug_selector(|| "meetings-open-promises".to_owned())
+            .w_full()
+            .gap_1()
+            .child(section("YOU STILL OWE"))
+            .children(open.into_iter().take(MAX_OPEN_PROMISES).map(|promise| {
+                let done = WorkspaceAction::SetMeetingPromise {
+                    id: promise.meeting_id.clone(),
+                    index: promise.index,
+                    done: true,
+                };
+                let selector = done.selector();
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_3()
+                    .py_1()
+                    .child(
+                        action_button(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector)
+                            .small()
+                            .label("Done")
+                            .on_click(cx.listener(move |shell, _, _, cx| {
+                                shell.emit_workspace_action(done.clone(), cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(gpui::div().text_sm().child(promise.text))
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(gpui_color(theme.text_muted))
+                                    .child(promise.meeting),
+                            ),
+                    )
+            }))
+            .when(more_open > 0, |column| {
+                column.child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(gpui_color(theme.text_muted))
+                        .child(format!("And {more_open} more, in their meetings.")),
+                )
+            })
+    });
+    let answer_card = answer.map(|answer| {
+        let style = TextViewStyle {
+            is_dark: true,
+            highlight_theme: HighlightTheme::default_dark(),
+            ..TextViewStyle::default()
+        }
+        .paragraph_gap(rems(0.6));
+        let copy = answer.answer.clone();
+        v_flex()
+            .debug_selector(|| "meetings-answer".to_owned())
+            .w_full()
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .bg(gpui_color(theme.surface))
+            .border_1()
+            .border_color(gpui_color(theme.border))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_3()
+                    .child(
+                        gpui::div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(answer.question),
+                    )
+                    .child(
+                        action_button("meetings-answer-copy")
+                            .debug_selector(|| "meetings-answer-copy".to_owned())
+                            .small()
+                            .label("Copy")
+                            .on_click(cx.listener(move |shell, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                                shell.set_route_feedback_for(
+                                    Route::Meetings,
+                                    "Copied the answer.".to_owned(),
+                                );
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                gpui::div()
+                    .w_full()
+                    .text_sm()
+                    .line_height(rems(1.5))
+                    .text_color(gpui_color(theme.text))
+                    .child(
+                        TextView::markdown("meetings-answer-text", answer.answer, window, cx)
+                            .style(style)
+                            .selectable(true),
+                    ),
+            )
+    });
     let searching = !query.trim().is_empty();
     let count = match (searching, notes.len(), total) {
         (true, 1, _) => "1 matching meeting".to_owned(),
@@ -122,13 +343,50 @@ fn list_view(
         .when(total > 0, |page| {
             page.when_some(search_input, |page, input| {
                 page.child(
-                    gpui::div()
-                        .debug_selector(|| "meetings-search-input".to_owned())
+                    h_flex()
                         .w_full()
                         .min_w_0()
-                        .child(Input::new(&input).small().w_full()),
+                        .gap_2()
+                        .child(
+                            gpui::div()
+                                .debug_selector(|| "meetings-search-input".to_owned())
+                                .min_w_0()
+                                .flex_1()
+                                .child(Input::new(&input).small().w_full()),
+                        )
+                        .child(
+                            action_button("meetings-ask")
+                                .debug_selector(|| "meetings-ask".to_owned())
+                                .small()
+                                .label("Ask")
+                                .on_click(cx.listener(|shell, _, _, cx| shell.ask_meetings(cx))),
+                        ),
                 )
             })
+        })
+        .when_some(feedback, |page, feedback| {
+            page.child(
+                gpui::div()
+                    .debug_selector(|| "meetings-feedback".to_owned())
+                    .text_xs()
+                    .text_color(gpui_color(theme.text_muted))
+                    .child(feedback),
+            )
+        })
+        .when_some(answer_card, |page, card| page.child(card))
+        .when(!searching, |page| {
+            page.when_some(open_rows, |page, rows| page.child(rows))
+                .when_some(people_row, |page, row| page.child(row))
+                .when_some(trend, |page, trend| {
+                    page.child(
+                        gpui::div()
+                            .debug_selector(|| "meetings-talk-trend".to_owned())
+                            .pt_1()
+                            .text_xs()
+                            .text_color(gpui_color(theme.text_muted))
+                            .child(trend),
+                    )
+                })
         })
         .when(no_matches, |page| {
             page.child(
@@ -290,6 +548,9 @@ fn detail_view(
     let draft = follow_up
         .as_deref()
         .map(|email| EmailDraft::from_follow_up(email, &detail.title));
+    let export = detail.export_markdown();
+    let promises = detail.promises.clone();
+    let promise_id = detail.id.clone();
     let mut page = v_flex()
         .debug_selector(|| "meetings-detail".to_owned())
         .w_full()
@@ -356,6 +617,21 @@ fn detail_view(
                     )
                 })
                 .child(
+                    action_button("meetings-copy-notes")
+                        .debug_selector(|| "meetings-copy-notes".to_owned())
+                        .small()
+                        .label("Copy notes")
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(export.clone()));
+                            shell.set_route_feedback_for(
+                                Route::Meetings,
+                                "Copied the notes without the transcript. Paste them into a document, your CRM, or a chat."
+                                    .to_owned(),
+                            );
+                            cx.notify();
+                        })),
+                )
+                .child(
                     action_button(SharedString::from(open_file_selector.clone()))
                         .debug_selector(move || open_file_selector)
                         .small()
@@ -410,6 +686,66 @@ fn detail_view(
         page = page.child(
             markdown("meetings-summary", detail.summary, window, cx)
                 .debug_selector(|| "meetings-summary".to_owned()),
+        );
+    }
+    if !promises.is_empty() {
+        page = page.child(
+            v_flex()
+                .debug_selector(|| "meetings-promises".to_owned())
+                .w_full()
+                .gap_1()
+                .child(section("YOUR COMMITMENTS"))
+                .children(
+                    promises
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (text, done))| {
+                            let toggle = WorkspaceAction::SetMeetingPromise {
+                                id: promise_id.clone(),
+                                index,
+                                done: !done,
+                            };
+                            let selector = toggle.selector();
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_3()
+                                .py_1()
+                                .child(
+                                    action_button(SharedString::from(selector.clone()))
+                                        .debug_selector(move || selector)
+                                        .small()
+                                        .label(if done { "Undo" } else { "Done" })
+                                        .on_click(cx.listener(move |shell, _, _, cx| {
+                                            shell.emit_workspace_action(toggle.clone(), cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .text_sm()
+                                        .when(done, |text| {
+                                            text.line_through()
+                                                .text_color(gpui_color(theme.text_muted))
+                                        })
+                                        .child(text),
+                                )
+                        }),
+                ),
+        );
+    }
+    if !detail.my_notes.is_empty() {
+        page = page.child(section("YOUR NOTES")).child(
+            markdown("meetings-my-notes", detail.my_notes, window, cx)
+                .debug_selector(|| "meetings-my-notes".to_owned()),
+        );
+    }
+    if !detail.scorecard.is_empty() {
+        page = page.child(section("HOW YOU SPOKE")).child(
+            markdown("meetings-scorecard", detail.scorecard, window, cx)
+                .debug_selector(|| "meetings-scorecard".to_owned()),
         );
     }
     if let Some(email) = follow_up {

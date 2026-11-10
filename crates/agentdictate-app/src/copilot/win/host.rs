@@ -2,7 +2,7 @@
 //! always on top, never stealing focus unless the user is typing, and
 //! clickable only where the bar and panel are drawn.
 
-use std::cell::Cell;
+use std::{cell::Cell, path::PathBuf};
 
 use agentdictate_ui::{CopilotShape, CopilotWindowHost};
 use windows_sys::Win32::{
@@ -16,16 +16,29 @@ pub(crate) struct Win32CopilotHost {
     hwnd: usize,
     placed: Cell<bool>,
     previous_foreground: Cell<usize>,
+    /// Where the window's position is kept between meetings.
+    place_file: PathBuf,
+    /// The position last written to `place_file`.
+    remembered: Cell<Option<(i32, i32)>>,
+}
+
+/// Reads a remembered window position: `{"x": .., "y": ..}` in screen pixels.
+fn read_place(text: &str) -> Option<(i32, i32)> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let coordinate = |name: &str| i32::try_from(value.get(name)?.as_i64()?).ok();
+    Some((coordinate("x")?, coordinate("y")?))
 }
 
 impl Win32CopilotHost {
     /// Applies capture exclusion and overlay styles. Placement waits for the
     /// first resize, which runs after GPUI finishes creating the window.
-    pub(crate) fn attach(hwnd: usize, exclude_from_capture: bool) -> Self {
+    pub(crate) fn attach(hwnd: usize, exclude_from_capture: bool, place_file: PathBuf) -> Self {
         let host = Self {
             hwnd,
             placed: Cell::new(false),
             previous_foreground: Cell::new(0),
+            place_file,
+            remembered: Cell::new(None),
         };
         host.set_capture_excluded(exclude_from_capture);
         unsafe {
@@ -51,8 +64,53 @@ impl Win32CopilotHost {
         (unsafe { GetDpiForWindow(self.handle()) }.max(96) as f32) / 96.0
     }
 
-    /// Centers the window at the top of the primary monitor's work area.
+    /// Where the user left the window last time, if the bar would still be
+    /// on a monitor there.
+    fn remembered_place(&self, width: i32) -> Option<(i32, i32)> {
+        let (x, y) = read_place(&std::fs::read_to_string(&self.place_file).ok()?)?;
+        let bar = POINT {
+            x: x + width / 2,
+            y: y + 24,
+        };
+        let on_screen = unsafe { !MonitorFromPoint(bar, MONITOR_DEFAULTTONULL).is_null() };
+        on_screen.then_some((x, y))
+    }
+
+    /// Writes the window's position down when it has moved.
+    fn remember_place(&self) {
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(self.handle(), &mut rect) } == 0 {
+            return;
+        }
+        let place = (rect.left, rect.top);
+        if self.remembered.replace(Some(place)) == Some(place) {
+            return;
+        }
+        let contents = format!("{{\"x\": {}, \"y\": {}}}\n", place.0, place.1);
+        if let Err(error) = std::fs::write(&self.place_file, contents) {
+            tracing::debug!(%error, "the copilot window's position was not saved");
+        }
+    }
+
+    /// Puts the window where the user left it, or centers it at the top of
+    /// the primary monitor's work area.
     fn place(&self, width: i32, height: i32) {
+        if let Some((x, y)) = self.remembered_place(width) {
+            self.remembered.set(Some((x, y)));
+            unsafe {
+                SetWindowPos(
+                    self.handle(),
+                    HWND_TOPMOST,
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+            self.keep_on_screen();
+            return;
+        }
         unsafe {
             let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
             let mut info: MONITORINFO = std::mem::zeroed();
@@ -159,7 +217,8 @@ impl CopilotWindowHost for Win32CopilotHost {
                 SWP_NOMOVE | SWP_NOACTIVATE,
             );
         }
-        // The window keeps wherever the user dragged it.
+        // The window keeps wherever the user dragged it, now and next time.
+        self.remember_place();
         self.keep_on_screen();
     }
 
@@ -180,6 +239,9 @@ impl CopilotWindowHost for Win32CopilotHost {
             } else {
                 ShowWindow(self.handle(), SW_HIDE);
             }
+        }
+        if !visible {
+            self.remember_place();
         }
     }
 
@@ -263,5 +325,18 @@ impl CopilotWindowHost for Win32CopilotHost {
                 tracing::info!(excluded, "copilot screen-capture visibility applied");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_place;
+
+    #[test]
+    fn a_remembered_place_is_read_and_a_damaged_one_ignored() {
+        assert_eq!(read_place("{\"x\": -1200, \"y\": 40}\n"), Some((-1200, 40)));
+        assert_eq!(read_place("{\"x\": 12}"), None);
+        assert_eq!(read_place("not json"), None);
+        assert_eq!(read_place("{\"x\": 99999999999, \"y\": 0}"), None);
     }
 }

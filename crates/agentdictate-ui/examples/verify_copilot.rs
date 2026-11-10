@@ -185,6 +185,7 @@ fn main() {
             path: "C:/Users/me/AppData/Local/AgentDictate/meetings/2026-10-13 0900 Enterprise pricing.md".into(),
             summary: Some("Acme is evaluating dictation for about 200 engineers and asked for annual pricing.\n\n**Key points**\n- Needs strong technical vocabulary and terminal support\n- 200 seats on annual billing: **$18 per seat per month**\n\n**Decisions**\n- Start with a 30-day pilot for 25 engineers\n\n**Action items**\n- Me: send the pilot agreement and pricing by Friday\n- Them: name a pilot lead".into()),
             follow_up: Some("Hi Sam,\n\nThanks for the time today. As discussed, we'll start with a **30-day pilot for 25 engineers**, then move to annual billing at $18 per seat per month.\n\nNext steps:\n- I'll send the pilot agreement and pricing by Friday\n- You'll name a pilot lead\n\nBest,\nJames".into()),
+            quiet: false,
         });
     }
     if state == "overview" || state == "meetings" {
@@ -220,6 +221,8 @@ fn main() {
                         overview: "Acme is evaluating dictation for about 200 engineers.".into(),
                         with: "Dana Ruiz, Priya Shah".into(),
                         search_text: String::new(),
+                        promises: vec![("Send the pilot agreement by Friday".into(), false)],
+                        talk_share: Some(44),
                     };
                     let earlier = [
                         ("2026-10-12 1500 Hiring sync.md", "Hiring sync", "2026-10-12 15:00", "24:02", "Two backend roles open; offers by Friday.", "Marcus Webb"),
@@ -233,6 +236,8 @@ fn main() {
                         overview: overview.into(),
                         with: with.into(),
                         search_text: String::new(),
+                        promises: Vec::new(),
+                        talk_share: None,
                     });
                     let mut notes = vec![note.clone()];
                     notes.extend(earlier);
@@ -247,9 +252,13 @@ fn main() {
                                 summary: "Acme is evaluating dictation for about 200 engineers and asked for annual pricing.\n\n**Key points**\n- Needs strong technical vocabulary and terminal support\n- 200 seats on annual billing: **$18 per seat per month**\n\n**Decisions**\n- Start with a 30-day pilot for 25 engineers\n\n**Action items**\n- Me: send the pilot agreement by Friday\n- Them: name a pilot lead".into(),
                                 follow_up: Some("Hi Sam,\n\nThanks for the time today. As discussed, we'll start with a **30-day pilot for 25 engineers**.\n\nBest,\nJames".into()),
                                 answers: String::new(),
+                                promises: note.promises.clone(),
+                                my_notes: String::new(),
+                                scorecard: "- **You spoke:** 44% of the words (880 of 2000)".into(),
                                 transcript: "**[0:04] Dana Ruiz:** Thanks for making time. We're evaluating dictation tools for about two hundred engineers.\n\n**[0:11] You:** Great, happy to walk you through it.".into(),
                             }),
                             notes,
+                            answer: None,
                         },
                         ..WorkspaceViewModel::default()
                     });

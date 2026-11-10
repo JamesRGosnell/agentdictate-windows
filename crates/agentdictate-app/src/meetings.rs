@@ -48,6 +48,51 @@ pub(crate) fn email_draft(folder: &Path, id: &str) -> Option<EmailDraft> {
     Some(EmailDraft::from_follow_up(&email, &notes.title))
 }
 
+/// Ticks or unticks the `index`th thing the user promised in a meeting, in
+/// its notes file.
+pub(crate) fn set_promise(
+    folder: &Path,
+    id: &str,
+    index: usize,
+    done: bool,
+) -> std::io::Result<()> {
+    let missing = || std::io::Error::new(std::io::ErrorKind::NotFound, "no such commitment");
+    let path = note_path(folder, id).ok_or_else(missing)?;
+    let markdown = std::fs::read_to_string(&path)?;
+    let mut in_section = false;
+    let mut seen = 0;
+    let mut changed = false;
+    let lines: Vec<String> = markdown
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("## ") {
+                in_section = trimmed == agentdictate_core::PROMISES_HEADING;
+                return line.to_owned();
+            }
+            let is_item = ["- [ ]", "- [x]", "- [X]"]
+                .iter()
+                .any(|mark| trimmed.starts_with(mark));
+            if !in_section || !is_item {
+                return line.to_owned();
+            }
+            seen += 1;
+            if seen - 1 != index {
+                return line.to_owned();
+            }
+            changed = true;
+            let rest = &trimmed[5..];
+            format!("- [{}]{rest}", if done { 'x' } else { ' ' })
+        })
+        .collect();
+    if !changed {
+        return Err(missing());
+    }
+    let mut contents = lines.join("\n");
+    contents.push('\n');
+    std::fs::write(path, contents)
+}
+
 /// The notes file for a meeting id. Ids are plain file names in the folder,
 /// never paths, so a crafted id cannot reach other files.
 pub(crate) fn note_path(folder: &Path, id: &str) -> Option<PathBuf> {
@@ -228,5 +273,43 @@ mod tests {
         assert!(note_path(folder, "..\\secrets.md").is_none());
         assert!(note_path(folder, "C:secrets.md").is_none());
         assert!(note_path(folder, "notes.txt").is_none());
+    }
+
+    #[test]
+    fn a_commitment_is_ticked_off_in_its_notes_file() {
+        use agentdictate_core::{NotesExtras, meeting_notes_with};
+
+        let folder = tempfile::tempdir().unwrap();
+        let markdown = meeting_notes_with(
+            "Renewal",
+            "2026-11-03 09:00",
+            60_000,
+            Some("They will renew.\n\n**Action items**\n- [ ] not a commitment of yours"),
+            &[],
+            &agentdictate_core::VoiceNames::new(),
+            &[],
+            &NotesExtras {
+                promises: vec!["Send the contract".into(), "Share the deck".into()],
+                ..NotesExtras::default()
+            },
+        );
+        let id = "2026-11-03 0900 Renewal.md";
+        std::fs::write(folder.path().join(id), markdown).unwrap();
+        set_promise(folder.path(), id, 1, true).unwrap();
+        let notes = scan(folder.path());
+        assert_eq!(
+            notes[0].promises,
+            [
+                ("Send the contract".to_owned(), false),
+                ("Share the deck".to_owned(), true)
+            ]
+        );
+        // The summary's own checkbox is left alone.
+        let saved = std::fs::read_to_string(folder.path().join(id)).unwrap();
+        assert!(saved.contains("- [ ] not a commitment of yours"));
+        set_promise(folder.path(), id, 1, false).unwrap();
+        assert!(!scan(folder.path())[0].promises[1].1);
+        assert!(set_promise(folder.path(), id, 5, true).is_err());
+        assert!(set_promise(folder.path(), "../other.md", 0, true).is_err());
     }
 }

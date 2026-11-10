@@ -104,6 +104,9 @@ fn run_daemon(paths: AppPaths) -> anyhow::Result<()> {
     if let Err(error) = start_signal_listener(runtime.clone()) {
         tracing::warn!(%error, "signal listener is unavailable; daemon will continue");
     }
+    // Opens the meeting copilot when a call starts, if the user asked for it.
+    #[cfg(windows)]
+    agentdictate_app::watch_for_meetings();
     let _tray_handle = if show_tray_icon {
         match settings_executable_for_current_process() {
             Ok(executable) => match start_system_tray(runtime, executable) {

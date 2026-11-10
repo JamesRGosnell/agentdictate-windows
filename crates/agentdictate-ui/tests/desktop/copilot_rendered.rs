@@ -11,8 +11,9 @@ use std::{
 };
 
 use agentdictate_core::{
-    AnswerStatus, CopilotAction, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings,
-    KnowledgeSummary, ListenState, QuickAction, RewriteStyle, Situation, Speaker, TranscriptLine,
+    AlertKind, AnswerStatus, ChecklistItem, CopilotAction, CopilotAlert, CopilotEvent,
+    CopilotInsights, CopilotProvider, CopilotSettings, KnowledgeSummary, ListenState, QuickAction,
+    RewriteStyle, Situation, Speaker, TranscriptLine,
 };
 use agentdictate_ui::{
     CopilotShape, CopilotViewModel, CopilotWindow, CopilotWindowHost, test_support,
@@ -281,6 +282,7 @@ fn ending_shows_a_wrap_up_with_the_follow_up_ready_to_copy(cx: &mut TestAppConte
         path: "C:/notes/2026-10-13 0900 Pilot.md".into(),
         summary: Some("Agreed on a **30-day pilot**.".into()),
         follow_up: Some("Hi Sam,\n\nThanks for today.".into()),
+        quiet: false,
     });
     assert!(harness.has("copilot-wrap-up"));
     assert!(harness.has("copilot-wrap-up-summary"));
@@ -306,6 +308,7 @@ fn the_wrap_up_drafts_the_follow_up_email(cx: &mut TestAppContext) {
         path: "C:/notes/meeting.md".into(),
         summary: Some("Agreed on a pilot.".into()),
         follow_up: Some("Subject: Pilot\n\nHi Sam,".into()),
+        quiet: false,
     });
     harness.click("copilot-draft-email");
     harness.click("copilot-copy-follow-up");
@@ -790,4 +793,149 @@ fn words_heard_so_far_show_until_the_final_line_replaces_them(cx: &mut TestAppCo
         0,
     )));
     assert!(!harness.has("copilot-partial-them"));
+}
+
+#[gpui::test]
+fn a_meeting_ended_by_hand_says_its_notes_are_ready_on_the_bar_alone(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::NotesSaved {
+        path: "C:/notes/meeting.md".into(),
+        summary: Some("Agreed on a pilot.".into()),
+        follow_up: Some("Subject: Pilot\n\nHi Sam,".into()),
+        quiet: true,
+    });
+    assert!(harness.has("copilot-notes-ready"));
+    assert!(!harness.has("copilot-wrap-up"), "nothing covers the screen");
+    harness.click("copilot-notes-ready-email");
+    harness.click("copilot-notes-ready-open");
+    // Headless debug bounds can outlive their frame, so check what
+    // replaced the bar instead of its absence.
+    assert!(harness.has("copilot-wrap-up"));
+    assert!(harness.has("copilot-bar"));
+    assert_eq!(
+        harness.actions(),
+        vec![CopilotAction::DraftEmail, CopilotAction::KeepOpen]
+    );
+}
+
+#[gpui::test]
+fn compact_mode_shows_only_the_line_to_say(cx: &mut TestAppContext) {
+    let mut harness = Harness::open_with(
+        cx,
+        CopilotSettings {
+            onboarded: true,
+            compact: true,
+            ..CopilotSettings::default()
+        },
+    );
+    // Insights alone do not open the compact panel.
+    harness.send(CopilotEvent::Insights(CopilotInsights {
+        topic: "Pricing".into(),
+        summary: vec!["Discussing seats".into()],
+        ..CopilotInsights::default()
+    }));
+    assert!(!harness.has("copilot-compact"));
+    harness.send(CopilotEvent::AnswerStarted {
+        id: 7,
+        title: "What does it cost?".into(),
+        used_screen: false,
+        model: "gpt-6-sol".into(),
+        automatic: true,
+    });
+    harness.send(CopilotEvent::InstantDelta {
+        id: 7,
+        text: "It's $49 per seat.\n[from: mine]".into(),
+    });
+    assert!(harness.has("copilot-compact"));
+    assert!(!harness.has("copilot-ask"), "no footer in compact mode");
+    assert!(!harness.has("copilot-insights"));
+    harness.click("copilot-compact-more");
+    assert!(harness.has("copilot-ask"));
+    assert!(harness.has("copilot-answer-grounding"));
+    assert!(matches!(
+        harness.actions().last(),
+        Some(CopilotAction::UpdateSettings(settings)) if !settings.compact
+    ));
+}
+
+#[gpui::test]
+fn hearing_your_name_raises_an_alert_you_can_answer_from(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Alert(CopilotAlert {
+        kind: AlertKind::Mention,
+        text: "James, can you speak to the renewal numbers?".into(),
+        context: "Them: Churn went up two points.".into(),
+    }));
+    assert!(harness.has("copilot-alert"));
+    harness.click("copilot-alert-answer");
+    assert_eq!(
+        harness.actions(),
+        vec![CopilotAction::AnswerQuestion(
+            "James, can you speak to the renewal numbers?".into()
+        )]
+    );
+    // A contradiction has nothing to answer, only to dismiss.
+    harness.send(CopilotEvent::Alert(CopilotAlert {
+        kind: AlertKind::Contradiction,
+        text: "You said $39; your pricing sheet says $49.".into(),
+        context: String::new(),
+    }));
+    assert!(harness.has("copilot-alert"));
+    harness.click("copilot-alert-dismiss");
+    assert_eq!(harness.actions().len(), 1, "dismissing asks for nothing");
+}
+
+#[gpui::test]
+fn the_live_panel_shows_the_checklist_the_brief_and_promises(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness.send(CopilotEvent::Checklist(vec![
+        ChecklistItem {
+            label: "Budget".into(),
+            done: true,
+        },
+        ChecklistItem {
+            label: "Next step agreed".into(),
+            done: false,
+        },
+    ]));
+    harness.send(CopilotEvent::Brief(
+        "**Last time with Sam Lee** \u{00b7} 2026-11-03 \u{00b7} Pricing review".into(),
+    ));
+    harness.send(CopilotEvent::Promises(vec![
+        "Send the pricing sheet by Friday".into(),
+    ]));
+    harness.send(CopilotEvent::Insights(CopilotInsights {
+        topic: "Pricing".into(),
+        summary: vec!["Discussing seats".into()],
+        ..CopilotInsights::default()
+    }));
+    assert!(harness.has("copilot-checklist"));
+    assert!(harness.has("copilot-brief"));
+    assert!(harness.has("copilot-promises"));
+    harness.click("copilot-brief-close");
+}
+
+#[gpui::test]
+fn typed_notes_and_translations_show_in_the_transcript(cx: &mut TestAppContext) {
+    let mut harness = Harness::open(cx);
+    harness
+        .view
+        .update(harness.cx, |view, cx| view.show_transcript(cx));
+    harness.send(CopilotEvent::Transcript(them(
+        1,
+        0,
+        "Bonjour, comment allez-vous",
+        1_000,
+    )));
+    assert!(!harness.has("copilot-translation"));
+    harness.send(CopilotEvent::Translation {
+        line: 1,
+        text: "Hello, how are you?".into(),
+    });
+    harness.send(CopilotEvent::Note {
+        at_ms: 4_000,
+        text: "they renew in March".into(),
+    });
+    assert!(harness.has("copilot-translation"));
+    assert!(harness.has("copilot-note"));
 }

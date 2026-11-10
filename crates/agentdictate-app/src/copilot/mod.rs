@@ -10,7 +10,9 @@
 
 #[cfg(windows)]
 mod answer_eval;
+mod ask;
 mod brain;
+mod calendar;
 #[cfg(windows)]
 mod check;
 mod engine;
@@ -18,6 +20,7 @@ mod knowledge;
 mod live;
 mod meeting;
 mod names;
+mod people;
 mod providers;
 #[cfg(windows)]
 mod question_eval;
@@ -122,13 +125,35 @@ pub fn install_copilot_settings_store() -> anyhow::Result<()> {
     let paths = crate::AppPaths::from_environment()?;
     let path = std::sync::Arc::new(store::settings_path(&paths.config_file));
     let load_path = std::sync::Arc::clone(&path);
+    let ask_paths = paths.clone();
     agentdictate_ui::set_copilot_settings_store(agentdictate_ui::CopilotSettingsStore {
         load: std::sync::Arc::new(move || store::load(&load_path)),
         save: std::sync::Arc::new(move |settings| {
             store::save(&path, settings).map_err(|error| error.to_string())
         }),
+        ask_documents: std::sync::Arc::new(move |question| {
+            ask::answer(
+                &ask_paths.config_file,
+                &ask_paths.knowledge_dir(),
+                &ask_paths.meetings_dir(),
+                question,
+                ask::Source::Documents,
+            )
+        }),
     });
     Ok(())
+}
+
+/// Answers a question from the notes of the user's saved meetings, for the
+/// Meetings page.
+pub(crate) fn ask_meetings(paths: &crate::AppPaths, question: &str) -> Result<String, String> {
+    ask::answer(
+        &paths.config_file,
+        &paths.knowledge_dir(),
+        &paths.meetings_dir(),
+        question,
+        ask::Source::Meetings,
+    )
 }
 
 /// The OpenAI API key saved in the copilot's settings beside
@@ -270,6 +295,70 @@ pub fn copilot_launch_reason(config_file: &std::path::Path) -> Option<String> {
         let _ = std::fs::remove_file(&marker);
     }
     launch.then_some(signal.reason)
+}
+
+/// How often the background app looks for a meeting to open the copilot for.
+#[cfg(windows)]
+const AUTO_START_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the copilot opens by itself now: a meeting has just begun, the
+/// copilot is not running, and the user did not end it during this meeting.
+fn should_auto_start(
+    in_meeting: bool,
+    was_in_meeting: bool,
+    running: bool,
+    dismissed_at: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> bool {
+    // Only the start of a meeting opens it, so ending the copilot mid-call
+    // is respected for the rest of that call.
+    in_meeting && !was_in_meeting && !running && launch_decision(true, dismissed_at, now).0
+}
+
+/// Opens the copilot when a meeting starts, for users who turned that on.
+/// Runs for the life of the background app; the setting is read each time,
+/// so switching it takes effect without a restart.
+#[cfg(windows)]
+pub fn watch_for_meetings() {
+    let Ok(paths) = crate::AppPaths::from_environment() else {
+        return;
+    };
+    let settings_path = store::settings_path(&paths.config_file);
+    let spawned = std::thread::Builder::new()
+        .name("copilot-auto-start".into())
+        .spawn(move || {
+            let mut was_in_meeting = false;
+            loop {
+                std::thread::sleep(AUTO_START_POLL);
+                if !store::load(&settings_path).auto_start {
+                    was_in_meeting = false;
+                    continue;
+                }
+                let signal = meeting::classify(
+                    &win::signals::active_microphone_apps(),
+                    &win::signals::window_titles(),
+                );
+                let dismissed_at = std::fs::metadata(dismissed_marker(&settings_path))
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                if should_auto_start(
+                    signal.in_meeting,
+                    was_in_meeting,
+                    win::instance::is_running(),
+                    dismissed_at,
+                    std::time::SystemTime::now(),
+                ) {
+                    tracing::info!(reason = %signal.reason, "a meeting started; opening the copilot");
+                    if let Err(error) = launch_copilot() {
+                        tracing::warn!(%error, "the copilot could not be opened for the meeting");
+                    }
+                }
+                was_in_meeting = signal.in_meeting;
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "the meeting watcher could not start");
+    }
 }
 
 /// After the user ends the copilot, the dictation shortcut dictates for the
@@ -463,7 +552,81 @@ fn session_services(
         knowledge_dir: paths.knowledge_dir(),
         language,
         live: live_factory,
+        account_name: account_name(),
+        fetch: Arc::new(fetch_text),
+        post: Arc::new(post_json),
     })
+}
+
+/// The user's given name as the computer's account has it.
+#[cfg(windows)]
+fn account_name() -> String {
+    let name = std::env::var("USERNAME").unwrap_or_default();
+    let name = name
+        .split(['.', '_', ' ', '-'])
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let mut letters = name.chars();
+    match letters.next() {
+        Some(first) if first.is_alphabetic() => first.to_uppercase().chain(letters).collect(),
+        _ => String::new(),
+    }
+}
+
+#[cfg(windows)]
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// Reads a calendar feed from a web address or a file.
+#[cfg(windows)]
+fn fetch_text(source: &str) -> Result<String, String> {
+    let source = source.trim();
+    // Calendars hand out "webcal" addresses for the same feed.
+    let address = match source.strip_prefix("webcal://") {
+        Some(rest) => format!("https://{rest}"),
+        None => source.to_owned(),
+    };
+    if address.starts_with("https://") || address.starts_with("http://") {
+        let response = http_client()?
+            .get(&address)
+            .send()
+            .map_err(|error| error.without_url().to_string())?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "the calendar returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        response
+            .text()
+            .map_err(|error| error.without_url().to_string())
+    } else {
+        std::fs::read_to_string(&address).map_err(|error| error.to_string())
+    }
+}
+
+/// Sends a finished meeting to the user's webhook.
+#[cfg(windows)]
+fn post_json(address: &str, body: &str) -> Result<(), String> {
+    if !(address.starts_with("https://") || address.starts_with("http://")) {
+        return Err("the webhook address must start with https://".into());
+    }
+    let response = http_client()?
+        .post(address)
+        .header("content-type", "application/json")
+        .body(body.to_owned())
+        .send()
+        .map_err(|error| error.without_url().to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", response.status().as_u16()))
+    }
 }
 
 /// Runs the copilot process until the user ends the session.
@@ -489,6 +652,7 @@ pub fn run_copilot() -> anyhow::Result<()> {
     let settings_path = store::settings_path(&paths.config_file);
     let settings = store::load(&settings_path);
     let marker = dismissed_marker(&settings_path);
+    let window_place = settings_path.with_file_name("copilot-window.json");
     let (ui_sender, ui_events) = mpsc::channel::<CopilotEvent>();
     let ui: UiSink = Arc::new(move |event| {
         let _ = ui_sender.send(event);
@@ -561,6 +725,7 @@ pub fn run_copilot() -> anyhow::Result<()> {
         Rc::new(win::host::Win32CopilotHost::attach(
             hwnd,
             hide_from_screen_share,
+            window_place.clone(),
         )) as Rc<dyn CopilotWindowHost>
     });
     tracing::info!("meeting copilot window closed");
@@ -591,6 +756,19 @@ mod tests {
         assert_eq!(launch_decision(false, ended, now), (false, true));
         let long_ago = Some(now - DISMISSED_FOR - std::time::Duration::from_secs(1));
         assert_eq!(launch_decision(true, long_ago, now), (true, true));
+    }
+
+    #[test]
+    fn the_copilot_opens_itself_only_as_a_meeting_begins() {
+        let now = std::time::SystemTime::now();
+        let ended = Some(now - std::time::Duration::from_secs(60));
+        assert!(should_auto_start(true, false, false, None, now));
+        // Already in the meeting, already open, or no meeting: nothing.
+        assert!(!should_auto_start(true, true, false, None, now));
+        assert!(!should_auto_start(true, false, true, None, now));
+        assert!(!should_auto_start(false, false, false, None, now));
+        // Ended by hand a minute ago: a blip in detection does not reopen it.
+        assert!(!should_auto_start(true, false, false, ended, now));
     }
 
     #[test]

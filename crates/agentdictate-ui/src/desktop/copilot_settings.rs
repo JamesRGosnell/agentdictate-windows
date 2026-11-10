@@ -5,13 +5,18 @@
 
 use std::{cell::RefCell, sync::Arc};
 
-use agentdictate_core::{CopilotMode, CopilotProvider, CopilotSettings, ModelChoice};
+use agentdictate_core::{
+    BrainSource, CopilotEffort, CopilotMode, CopilotProvider, CopilotSettings, LANGUAGES,
+    ModelChoice, RewriteEngine,
+};
 use gpui::{AppContext, Context, Entity, Window, prelude::*, px};
 use gpui_component::{
     Selectable, Sizable,
     button::ButtonVariants,
     h_flex,
+    highlighter::HighlightTheme,
     input::{Input, InputState},
+    text::{TextView, TextViewStyle},
     v_flex,
 };
 
@@ -22,12 +27,15 @@ use super::{SettingsShell, enabled_label, gpui_color};
 
 type LoadCopilotSettings = dyn Fn() -> CopilotSettings + Send + Sync;
 type SaveCopilotSettings = dyn Fn(&CopilotSettings) -> Result<(), String> + Send + Sync;
+type AskDocuments = dyn Fn(&str) -> Result<String, String> + Send + Sync;
 
 /// Reads and writes the copilot's settings file for the main window.
 #[derive(Clone)]
 pub struct CopilotSettingsStore {
     pub load: Arc<LoadCopilotSettings>,
     pub save: Arc<SaveCopilotSettings>,
+    /// Answers a question from the knowledge folder alone, in Markdown.
+    pub ask_documents: Arc<AskDocuments>,
 }
 
 thread_local! {
@@ -57,6 +65,15 @@ pub(super) struct CopilotSettingsState {
     anthropic_key: Option<Entity<InputState>>,
     profile: Option<Entity<InputState>>,
     instructions: Option<Entity<InputState>>,
+    goal: Option<Entity<InputState>>,
+    user_name: Option<Entity<InputState>>,
+    calendar: Option<Entity<InputState>>,
+    webhook: Option<Entity<InputState>>,
+    /// A question to try against the knowledge folder.
+    docs_question: Option<Entity<InputState>>,
+    /// The answer to it, or why there is none, in Markdown.
+    docs_answer: Option<String>,
+    docs_asking: bool,
     feedback: Option<String>,
 }
 
@@ -93,12 +110,44 @@ impl CopilotSettingsState {
                 .placeholder("e.g. Keep answers under 50 words. Use metric units.")
                 .default_value(settings.custom_instructions.clone())
         });
+        let goal = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("e.g. Get a second meeting, ask about budget")
+                .default_value(settings.meeting_goal.clone())
+        });
+        let user_name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Your first name, as people say it")
+                .default_value(settings.user_name.clone())
+        });
+        let calendar = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Private .ics address from Outlook or Google Calendar")
+                .masked(true)
+                .default_value(settings.calendar_ics.clone())
+        });
+        let webhook = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://\u{2026}")
+                .masked(true)
+                .default_value(settings.webhook_url.clone())
+        });
+        let docs_question = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("e.g. What does the Team plan cost per seat?")
+        });
         Self {
             settings: Some(settings),
             openai_key: Some(openai_key),
             anthropic_key: Some(anthropic_key),
             profile: Some(profile),
             instructions: Some(instructions),
+            goal: Some(goal),
+            user_name: Some(user_name),
+            calendar: Some(calendar),
+            webhook: Some(webhook),
+            docs_question: Some(docs_question),
+            docs_answer: None,
+            docs_asking: false,
             feedback: None,
         }
     }
@@ -110,6 +159,13 @@ impl CopilotSettingsState {
             anthropic_key: self.anthropic_key.clone()?,
             profile: self.profile.clone()?,
             instructions: self.instructions.clone()?,
+            goal: self.goal.clone()?,
+            user_name: self.user_name.clone()?,
+            calendar: self.calendar.clone()?,
+            webhook: self.webhook.clone()?,
+            docs_question: self.docs_question.clone()?,
+            docs_answer: self.docs_answer.clone(),
+            docs_asking: self.docs_asking,
             feedback: self.feedback.clone(),
         })
     }
@@ -121,6 +177,13 @@ pub(super) struct CopilotSectionModel {
     anthropic_key: Entity<InputState>,
     profile: Entity<InputState>,
     instructions: Entity<InputState>,
+    goal: Entity<InputState>,
+    user_name: Entity<InputState>,
+    calendar: Entity<InputState>,
+    webhook: Entity<InputState>,
+    docs_question: Entity<InputState>,
+    docs_answer: Option<String>,
+    docs_asking: bool,
     feedback: Option<String>,
 }
 
@@ -150,7 +213,23 @@ impl SettingsShell {
         let anthropic = read(&self.copilot.anthropic_key, cx);
         let profile = read(&self.copilot.profile, cx);
         let instructions = read(&self.copilot.instructions, cx);
+        let goal = read(&self.copilot.goal, cx);
+        let user_name = read(&self.copilot.user_name, cx);
+        let calendar = read(&self.copilot.calendar, cx);
+        let webhook = read(&self.copilot.webhook, cx);
         self.update_copilot(cx, |settings| {
+            if let Some(goal) = goal {
+                settings.meeting_goal = goal;
+            }
+            if let Some(user_name) = user_name {
+                settings.user_name = user_name;
+            }
+            if let Some(calendar) = calendar {
+                settings.calendar_ics = calendar;
+            }
+            if let Some(webhook) = webhook {
+                settings.webhook_url = webhook;
+            }
             if let Some(key) = openai {
                 settings.openai_api_key = key;
             }
@@ -164,6 +243,45 @@ impl SettingsShell {
                 settings.custom_instructions = instructions;
             }
         });
+    }
+}
+
+impl SettingsShell {
+    /// Tries a question against the knowledge folder, so the user sees what
+    /// the copilot would say, and from which document, before a call.
+    fn ask_copilot_documents(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = store() else {
+            return;
+        };
+        let question = self
+            .copilot
+            .docs_question
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_owned())
+            .unwrap_or_default();
+        if question.is_empty() || self.copilot.docs_asking {
+            return;
+        }
+        self.copilot.docs_asking = true;
+        self.copilot.docs_answer = None;
+        cx.notify();
+        let task = cx.background_spawn(async move { (store.ask_documents)(&question) });
+        cx.spawn(async move |shell, cx| {
+            let result = task.await;
+            if let Some(shell) = shell.upgrade() {
+                shell
+                    .update(cx, |shell, cx| {
+                        shell.copilot.docs_asking = false;
+                        shell.copilot.docs_answer = Some(match result {
+                            Ok(answer) => answer,
+                            Err(error) => format!("Could not answer: {error}"),
+                        });
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
     }
 }
 
@@ -189,6 +307,7 @@ fn models(provider: CopilotProvider, current: &str) -> Vec<ModelChoice> {
 pub(super) fn section(
     model: CopilotSectionModel,
     theme: ThemeTokens,
+    window: &mut Window,
     cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
     let CopilotSectionModel {
@@ -197,6 +316,13 @@ pub(super) fn section(
         anthropic_key,
         profile,
         instructions,
+        goal,
+        user_name,
+        calendar,
+        webhook,
+        docs_question,
+        docs_answer,
+        docs_asking,
         feedback,
     } = model;
     let provider = settings.provider;
@@ -282,7 +408,80 @@ pub(super) fn section(
         })
         .collect::<Vec<_>>();
 
-    let toggles: [Toggle; 8] = [
+    let effort_chips = CopilotEffort::ALL
+        .into_iter()
+        .map(|effort| {
+            chip(
+                format!("copilot-settings-effort-{}", effort as usize),
+                effort.label(),
+                effort == settings.effort,
+                cx,
+                move |settings| settings.effort = effort,
+            )
+        })
+        .collect::<Vec<_>>();
+    let rewrite_chips = RewriteEngine::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(index, engine)| {
+            chip(
+                format!("copilot-settings-rewrite-{index}"),
+                engine.label(),
+                engine == settings.rewrite_engine,
+                cx,
+                move |settings| settings.rewrite_engine = engine,
+            )
+        })
+        .collect::<Vec<_>>();
+    let brain_chips = BrainSource::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(index, source)| {
+            chip(
+                format!("copilot-settings-brain-{index}"),
+                source.label(),
+                source == settings.brain_source,
+                cx,
+                move |settings| settings.brain_source = source,
+            )
+        })
+        .collect::<Vec<_>>();
+    let spoken = settings.language.trim().to_lowercase();
+    let mut language_chips = vec![chip(
+        "copilot-settings-language-auto".to_owned(),
+        "Automatic",
+        spoken.is_empty(),
+        cx,
+        |settings| settings.language.clear(),
+    )];
+    language_chips.extend(LANGUAGES.into_iter().map(|(code, name)| {
+        chip(
+            format!("copilot-settings-language-{code}"),
+            name,
+            spoken == code,
+            cx,
+            move |settings| settings.language = code.to_owned(),
+        )
+    }));
+    let translate = settings.translate_to.trim().to_lowercase();
+    let mut translate_chips = vec![chip(
+        "copilot-settings-translate-off".to_owned(),
+        "Off",
+        translate.is_empty(),
+        cx,
+        |settings| settings.translate_to.clear(),
+    )];
+    translate_chips.extend(LANGUAGES.into_iter().map(|(code, name)| {
+        chip(
+            format!("copilot-settings-translate-{code}"),
+            name,
+            translate == code,
+            cx,
+            move |settings| settings.translate_to = code.to_owned(),
+        )
+    }));
+
+    let toggles: [Toggle; 13] = [
         (
             "Answer questions automatically",
             "Show an answer when someone asks you something",
@@ -330,6 +529,36 @@ pub(super) fn section(
             "Hear the other side of the call",
             settings.capture_system_audio,
             |s| s.capture_system_audio = !s.capture_system_audio,
+        ),
+        (
+            "Open when a meeting starts",
+            "The copilot opens by itself when a call begins, without the shortcut",
+            settings.auto_start,
+            |s| s.auto_start = !s.auto_start,
+        ),
+        (
+            "Compact panel",
+            "Show only the line to say",
+            settings.compact,
+            |s| s.compact = !s.compact,
+        ),
+        (
+            "Live insights",
+            "Rolling topic, checklist, and what you promised",
+            settings.live_insights,
+            |s| s.live_insights = !s.live_insights,
+        ),
+        (
+            "Use my screen",
+            "Typed questions include a screenshot; the copilot never appears in it",
+            settings.screen_context,
+            |s| s.screen_context = !s.screen_context,
+        ),
+        (
+            "Remember past meetings",
+            "Answers and the pre-call brief draw on your earlier meetings",
+            settings.use_past_meetings,
+            |s| s.use_past_meetings = !s.use_past_meetings,
         ),
     ];
 
@@ -393,9 +622,45 @@ pub(super) fn section(
             theme,
         ))
         .child(chip_row(
+            "Rewrites",
+            "What rewrites the line to say",
+            rewrite_chips,
+            theme,
+        ))
+        .child(chip_row(
+            "Speed",
+            "How long full answers may think",
+            effort_chips,
+            theme,
+        ))
+        .child(chip_row(
             "Meeting type",
-            "Shapes how answers are written",
+            "Shapes answers, the checklist, and the notes",
             mode_chips,
+            theme,
+        ))
+        .child(text_block(
+            "Goal for your next meeting",
+            "Each part becomes a checklist item that ticks itself off; cleared when the meeting ends",
+            goal,
+            theme,
+        ))
+        .child(chip_row(
+            "Spoken language",
+            "Automatic suits most calls; pick one when names or accents are misheard",
+            language_chips,
+            theme,
+        ))
+        .child(chip_row(
+            "Translate what they say into",
+            "Their lines in another language get a translation in the transcript",
+            translate_chips,
+            theme,
+        ))
+        .child(chip_row(
+            "Brain",
+            "Company knowledge used alongside your knowledge folder",
+            brain_chips,
             theme,
         ));
     for (index, (label, detail, enabled, toggle)) in toggles.into_iter().enumerate() {
@@ -412,7 +677,78 @@ pub(super) fn section(
             ),
         );
     }
+    let asked = docs_answer.map(|answer| {
+        let style = TextViewStyle {
+            is_dark: true,
+            highlight_theme: HighlightTheme::default_dark(),
+            ..TextViewStyle::default()
+        };
+        gpui::div()
+            .debug_selector(|| "copilot-settings-docs-answer".to_owned())
+            .w_full()
+            .text_sm()
+            .text_color(gpui_color(theme.text))
+            .child(
+                TextView::markdown("copilot-settings-docs-answer-text", answer, window, cx)
+                    .style(style)
+                    .selectable(true),
+            )
+    });
     column
+        .child(
+            v_flex()
+                .w_full()
+                .gap_2()
+                .border_b_1()
+                .border_color(gpui_color(theme.border))
+                .py_3()
+                .child(label_block(
+                    "Ask your documents",
+                    "Try a question before a call: see the answer and which document it comes from",
+                    theme,
+                ))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            gpui::div()
+                                .debug_selector(|| "copilot-settings-docs-question".to_owned())
+                                .min_w_0()
+                                .flex_1()
+                                .child(Input::new(&docs_question).small().w_full()),
+                        )
+                        .child(
+                            action_button("copilot-settings-docs-ask")
+                                .debug_selector(|| "copilot-settings-docs-ask".to_owned())
+                                .small()
+                                .primary()
+                                .label(if docs_asking { "Asking\u{2026}" } else { "Ask" })
+                                .on_click(cx.listener(|shell, _, _, cx| {
+                                    shell.ask_copilot_documents(cx);
+                                })),
+                        ),
+                )
+                .when_some(asked, |column, answer| column.child(answer)),
+        )
+        .child(text_block(
+            "Your name",
+            "When you are only listening and someone says it, the copilot alerts you",
+            user_name,
+            theme,
+        ))
+        .child(text_block(
+            "Calendar",
+            "A private .ics address names the meeting and who is in it before anyone speaks",
+            calendar,
+            theme,
+        ))
+        .child(text_block(
+            "Send finished meetings to",
+            "A webhook for your CRM, Notion, Zapier, or Make; it receives the summary, commitments, and transcript",
+            webhook,
+            theme,
+        ))
         .child(text_block(
             "About you",
             "Background answers can draw on",

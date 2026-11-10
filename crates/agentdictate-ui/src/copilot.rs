@@ -1,9 +1,12 @@
 //! Toolkit-free state for the meeting copilot window.
 
+use std::collections::HashMap;
+
 use agentdictate_core::{
-    AnswerSource, AnswerStatus, CopilotEvent, CopilotInsights, CopilotSettings, CopilotShortcuts,
-    FollowUp, KnowledgeSummary, ListenState, ModelChoice, RewriteStyle, Speaker, SpeakerLabels,
-    TranscriptLine, VoiceNames, researched_follow_up,
+    AnswerSource, AnswerStatus, ChecklistItem, CopilotAlert, CopilotEvent, CopilotInsights,
+    CopilotSettings, CopilotShortcuts, FollowUp, Grounding, KnowledgeSummary, ListenState,
+    ModelChoice, RewriteStyle, Speaker, SpeakerLabels, TranscriptLine, VoiceNames,
+    researched_follow_up, split_grounding,
 };
 
 /// Logical window metrics. The window resizes between the bar alone and the
@@ -51,6 +54,11 @@ pub struct AnswerCardModel {
     pub body: String,
     /// The fast model's draft, shown above the researched answer.
     pub instant: String,
+    /// The draft as it arrived, with the marker that says where its facts
+    /// come from.
+    pub instant_raw: String,
+    /// Where the draft says its facts come from.
+    pub grounding: Option<Grounding>,
     pub instant_active: bool,
     pub status: AnswerStatus,
     pub sources: Vec<AnswerSource>,
@@ -159,6 +167,20 @@ pub struct CopilotViewModel {
     /// Names the meeting window showed, offered when naming a voice.
     pub seen_names: Vec<String>,
     pub session_started_unix_ms: i64,
+    /// What the user typed to keep, by session offset.
+    pub notes: Vec<(u64, String)>,
+    /// The other side's lines in the user's language, by line.
+    pub translations: HashMap<u64, String>,
+    /// Things the user has promised during the meeting.
+    pub promises: Vec<String>,
+    pub checklist: Vec<ChecklistItem>,
+    /// Something that needs the user's eye, until dismissed.
+    pub alert: Option<CopilotAlert>,
+    /// What earlier meetings say about the people on the call.
+    pub brief: Option<String>,
+    /// The meeting was ended by hand: its notes are announced on the bar
+    /// alone until the user opens the wrap-up.
+    pub notes_quiet: bool,
 }
 
 impl CopilotViewModel {
@@ -196,7 +218,36 @@ impl CopilotViewModel {
             speaker_names: VoiceNames::new(),
             seen_names: Vec::new(),
             session_started_unix_ms,
+            notes: Vec::new(),
+            translations: HashMap::new(),
+            promises: Vec::new(),
+            checklist: Vec::new(),
+            alert: None,
+            brief: None,
+            notes_quiet: false,
         }
+    }
+
+    /// How many checklist items are done, and how many there are.
+    #[must_use]
+    pub fn checklist_progress(&self) -> (usize, usize) {
+        (
+            self.checklist.iter().filter(|item| item.done).count(),
+            self.checklist.len(),
+        )
+    }
+
+    /// Answers still being written, other than the newest.
+    #[must_use]
+    pub fn streaming_earlier(&self) -> Vec<u64> {
+        let newest = self.answers.last().map(|answer| answer.id);
+        self.answers
+            .iter()
+            .filter(|answer| {
+                Some(answer.id) != newest && (answer.status.is_active() || answer.instant_active)
+            })
+            .map(|answer| answer.id)
+            .collect()
     }
 
     /// How the transcript names who spoke.
@@ -349,6 +400,8 @@ impl CopilotViewModel {
                     title,
                     body: String::new(),
                     instant: String::new(),
+                    instant_raw: String::new(),
+                    grounding: None,
                     instant_active: false,
                     status: AnswerStatus::Thinking,
                     sources: Vec::new(),
@@ -387,7 +440,10 @@ impl CopilotViewModel {
             }
             CopilotEvent::InstantDelta { id, text } => {
                 if let Some(answer) = self.answer_mut(id) {
-                    answer.instant.push_str(&text);
+                    answer.instant_raw.push_str(&text);
+                    let (shown, grounding) = split_grounding(&answer.instant_raw);
+                    answer.instant = shown;
+                    answer.grounding = grounding;
                     answer.instant_active = true;
                 }
             }
@@ -459,11 +515,21 @@ impl CopilotViewModel {
                 path,
                 summary,
                 follow_up,
+                quiet,
             } => {
                 self.notes_path = Some(path);
                 self.wrap_up = summary;
                 self.follow_up = follow_up;
+                self.notes_quiet = quiet;
             }
+            CopilotEvent::Note { at_ms, text } => self.notes.push((at_ms, text)),
+            CopilotEvent::Translation { line, text } => {
+                self.translations.insert(line, text);
+            }
+            CopilotEvent::Promises(promises) => self.promises = promises,
+            CopilotEvent::Checklist(checklist) => self.checklist = checklist,
+            CopilotEvent::Alert(alert) => self.alert = Some(alert),
+            CopilotEvent::Brief(brief) => self.brief = Some(brief),
             CopilotEvent::Exit => return CopilotEffect::Exit,
         }
         CopilotEffect::None

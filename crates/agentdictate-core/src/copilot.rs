@@ -279,6 +279,90 @@ impl CopilotMode {
             }
         }
     }
+
+    /// What a meeting of this type should cover, ticked off as it is heard.
+    #[must_use]
+    pub const fn checklist(self) -> &'static [&'static str] {
+        match self {
+            Self::General | Self::Lecture => &[],
+            Self::Sales => &[
+                "Their problem",
+                "Budget",
+                "Decision maker",
+                "Timeline",
+                "Next step agreed",
+            ],
+            Self::Interview => &[
+                "Why this role",
+                "Your strongest example",
+                "Your questions for them",
+                "Next steps",
+            ],
+            Self::Recruiting => &[
+                "Relevant experience",
+                "A concrete example",
+                "Motivation",
+                "Availability and pay",
+                "Their questions",
+            ],
+            Self::Negotiation => &[
+                "Their priorities",
+                "Your anchor stated",
+                "What you would trade",
+                "Next step agreed",
+            ],
+        }
+    }
+
+    /// An extra section the meeting notes carry for this type, placed
+    /// before the follow-up email.
+    #[must_use]
+    pub const fn notes_section(self) -> &'static str {
+        match self {
+            Self::General => "",
+            Self::Sales => {
+                "**Deal notes**: one bullet each for their problem, budget, decision maker, timeline, competitors mentioned, and the agreed next step, writing \"Not discussed\" where the transcript says nothing"
+            }
+            Self::Interview => {
+                "**Interview review**: each question they asked with one line on how you answered, then up to three things to do better next time"
+            }
+            Self::Recruiting => {
+                "**Candidate notes**: strengths and concerns, each with the evidence from what they said; leave the hiring decision to the user"
+            }
+            Self::Lecture => {
+                "**Concepts**: each term or idea introduced with a one-line definition, then what the speaker stressed as important"
+            }
+            Self::Negotiation => {
+                "**Positions**: what they want, what you asked for, concessions made by each side, and what is still open"
+            }
+        }
+    }
+}
+
+/// Languages offered for transcription and translation: ISO-639-1 code and
+/// name.
+pub const LANGUAGES: [(&str, &str); 12] = [
+    ("en", "English"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("de", "German"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+    ("nl", "Dutch"),
+    ("ja", "Japanese"),
+    ("zh", "Chinese"),
+    ("ko", "Korean"),
+    ("hi", "Hindi"),
+    ("ar", "Arabic"),
+];
+
+/// A language's name from its code, or the code itself when unknown.
+#[must_use]
+pub fn language_name(code: &str) -> &str {
+    LANGUAGES
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(code.trim()))
+        .map_or(code.trim(), |(_, name)| name)
 }
 
 /// One-click requests offered under the copilot bar.
@@ -289,15 +373,18 @@ pub enum QuickAction {
     Recap,
     FactCheck,
     ExplainScreen,
+    /// What the last two minutes covered, for someone who looked away.
+    CatchUp,
 }
 
 impl QuickAction {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::WhatToSay,
         Self::FollowUps,
         Self::Recap,
         Self::FactCheck,
         Self::ExplainScreen,
+        Self::CatchUp,
     ];
 
     #[must_use]
@@ -308,6 +395,7 @@ impl QuickAction {
             Self::Recap => "Recap so far",
             Self::FactCheck => "Fact-check",
             Self::ExplainScreen => "Explain my screen",
+            Self::CatchUp => "Catch me up",
         }
     }
 
@@ -329,6 +417,9 @@ impl QuickAction {
             }
             Self::ExplainScreen => {
                 "Look at my screen and explain what matters for this conversation: the key information, what it means, and anything I should mention."
+            }
+            Self::CatchUp => {
+                "I looked away. Catch me up on only the two minutes before the last transcript line, going by the timestamps: at most three short bullets of what was said or decided, then one line that starts \"Waiting on you:\" with anything I am expected to answer or do now, or \"Nothing is waiting on you.\" Do not write a line for me to say."
             }
         }
     }
@@ -495,6 +586,23 @@ pub struct CopilotSettings {
     pub rewrite_engine: RewriteEngine,
     /// Optional ISO-639-1 transcription language; empty means automatic.
     pub language: String,
+    /// The panel shows only the line to say.
+    pub compact: bool,
+    /// Language the other side's speech is translated into; empty for none.
+    pub translate_to: String,
+    /// The user's name as the other side says it, for the mention alert;
+    /// empty uses the Windows account name.
+    pub user_name: String,
+    /// What the user wants from the meeting about to start. It becomes the
+    /// checklist and is cleared when the meeting ends.
+    pub meeting_goal: String,
+    /// The copilot opens by itself when a meeting starts.
+    pub auto_start: bool,
+    /// Address that receives each finished meeting as JSON; empty for none.
+    pub webhook_url: String,
+    /// A calendar feed (an .ics address or file) that names the meeting and
+    /// who is in it; empty for none.
+    pub calendar_ics: String,
 }
 
 impl Default for CopilotSettings {
@@ -527,6 +635,13 @@ impl Default for CopilotSettings {
             onboarded: false,
             rewrite_engine: RewriteEngine::default(),
             language: String::new(),
+            compact: false,
+            translate_to: String::new(),
+            user_name: String::new(),
+            meeting_goal: String::new(),
+            auto_start: false,
+            webhook_url: String::new(),
+            calendar_ics: String::new(),
         }
     }
 }
@@ -572,6 +687,13 @@ impl CopilotSettings {
         }
         if !copy.openai_api_key.is_empty() {
             copy.openai_api_key = "<set>".into();
+        }
+        // Both addresses carry a secret in their path.
+        if !copy.webhook_url.is_empty() {
+            copy.webhook_url = "<set>".into();
+        }
+        if !copy.calendar_ics.is_empty() {
+            copy.calendar_ics = "<set>".into();
         }
         copy
     }
@@ -904,6 +1026,12 @@ pub struct CopilotInsights {
     /// such as "Them B".
     #[serde(deserialize_with = "lenient_speakers")]
     pub speakers: BTreeMap<String, String>,
+    /// Things the user promised to do, in the user's words.
+    #[serde(deserialize_with = "lenient_strings")]
+    pub promises: Vec<String>,
+    /// Checklist items the conversation has covered, by 1-based number.
+    #[serde(deserialize_with = "lenient_numbers")]
+    pub covered: Vec<usize>,
 }
 
 /// What the copilot is listening to, judged from the transcript.
@@ -959,6 +1087,37 @@ fn lenient_situation<'de, D: serde::Deserializer<'de>>(
     })
 }
 
+/// Reads a model-written list of text, skipping anything else.
+fn lenient_strings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Array(items)) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|item| item.trim().to_owned())
+        .filter(|item| !item.is_empty())
+        .collect())
+}
+
+/// Reads a model-written list of item numbers, skipping anything else.
+fn lenient_numbers<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<usize>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Array(items)) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .map(|number| number as usize)
+        .collect())
+}
+
 /// Reads model-written speaker names, skipping entries that are not text.
 fn lenient_speakers<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -979,6 +1138,8 @@ pub struct CopilotShortcuts {
     pub assist: Vec<String>,
     pub toggle: Vec<String>,
     pub ask: Vec<String>,
+    /// Empty when the shortcut could not be registered.
+    pub catch_up: Vec<String>,
 }
 
 impl Default for CopilotShortcuts {
@@ -987,6 +1148,7 @@ impl Default for CopilotShortcuts {
             assist: vec!["Ctrl".into(), "\u{21b5}".into()],
             toggle: vec!["Ctrl".into(), "\\".into()],
             ask: vec!["Ctrl".into(), "Shift".into(), "\u{21b5}".into()],
+            catch_up: vec!["Ctrl".into(), "Shift".into(), "\u{232b}".into()],
         }
     }
 }
@@ -1072,8 +1234,112 @@ pub enum CopilotEvent {
         /// Overview, key points, decisions, and action items, in Markdown.
         summary: Option<String>,
         follow_up: Option<String>,
+        /// The user ended the meeting by hand: say the notes are ready
+        /// without opening the wrap-up over their work.
+        quiet: bool,
     },
+    /// Something the user typed to keep, at this session offset.
+    Note {
+        at_ms: u64,
+        text: String,
+    },
+    /// A transcript line in the user's language.
+    Translation {
+        line: u64,
+        text: String,
+    },
+    /// Things the user has promised during the meeting, oldest first.
+    Promises(Vec<String>),
+    /// The meeting's checklist as it stands.
+    Checklist(Vec<ChecklistItem>),
+    /// Something that needs the user's eye now.
+    Alert(CopilotAlert),
+    /// What to know going in: the last meeting with these people and what
+    /// is still owed, in Markdown.
+    Brief(String),
     Exit,
+}
+
+/// One thing a meeting should cover.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecklistItem {
+    pub label: String,
+    pub done: bool,
+}
+
+/// The meeting's checklist: what its type calls for, then each part of the
+/// user's goal.
+#[must_use]
+pub fn meeting_checklist(mode: CopilotMode, goal: &str) -> Vec<String> {
+    let mut items: Vec<String> = mode
+        .checklist()
+        .iter()
+        .map(|item| (*item).to_owned())
+        .collect();
+    for part in goal.split([',', ';', '\n']) {
+        for part in part.split(" and ") {
+            let part = part.trim().trim_end_matches('.');
+            if part.is_empty() {
+                continue;
+            }
+            let mut label = part.to_owned();
+            if let Some(first) = label.get(..1) {
+                let upper = first.to_uppercase();
+                label.replace_range(..1, &upper);
+            }
+            if !items
+                .iter()
+                .any(|item| utterance_similarity(item, &label) >= 0.6)
+            {
+                items.push(label);
+            }
+        }
+    }
+    items.truncate(8);
+    items
+}
+
+/// Why an alert is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlertKind {
+    /// The other side said the user's name while the user only listened.
+    Mention,
+    /// The user stated something their own documents contradict.
+    Contradiction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopilotAlert {
+    pub kind: AlertKind,
+    /// The line that raised it, or the correction.
+    pub text: String,
+    /// What was said just before, for a mention.
+    pub context: String,
+}
+
+/// Whether a line says the user's name as a word of its own.
+#[must_use]
+pub fn mentions_name(text: &str, name: &str) -> bool {
+    let name = given_name(name.trim()).to_lowercase();
+    if name.chars().count() < 2 {
+        return false;
+    }
+    text.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word == name)
+}
+
+/// The note in a typed line that starts with "note:", if it is one.
+#[must_use]
+pub fn typed_note(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let rest = ["note:", "note -", "n:"].iter().find_map(|prefix| {
+        text.get(..prefix.len())
+            .filter(|start| start.eq_ignore_ascii_case(prefix))
+            .and_then(|_| text.get(prefix.len()..))
+    })?;
+    let rest = rest.trim();
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// UI -> engine requests.
@@ -1112,6 +1378,8 @@ pub enum CopilotAction {
         voice: u8,
         name: String,
     },
+    /// The user opened the wrap-up from the notes-ready bar.
+    KeepOpen,
     End,
 }
 
@@ -1201,6 +1469,15 @@ my profile supplies them.\n\
         prompt.push_str(custom);
         prompt.push('\n');
     }
+    let translate = settings.translate_to.trim();
+    if !translate.is_empty() {
+        let language = language_name(translate);
+        prompt.push_str(&format!(
+            "\nThe other side may speak a language other than {language}. Write the line to say in the language \
+they are speaking, then its meaning in {language} in parentheses on the next line. Write everything else in \
+{language}.\n"
+        ));
+    }
     let primer = primer.trim();
     if !primer.is_empty() {
         prompt.push_str(
@@ -1253,7 +1530,63 @@ my profile.\n\n"
 
 /// Added to the instant draft's request: the fast model has no web access and
 /// must not guess facts the researched answer will verify.
-pub const INSTANT_GUIDANCE: &str = "Start with the line I can say right now: one or two short sentences, at most 40 words. Add at most two short bullets, and only when each carries a fact or option the line does not; usually none are needed. I read this draft aloud, so state facts plainly and never say where they come from: in this draft, do not mention or name my documents, notes, or handbook anywhere, bullets included, even though you rely on them. Never make up my own experiences, projects, or what my team did: put [brackets] where my specifics go. You have no web access: answer from what you reliably know and from my knowledge excerpts. For anything that changes or that you are unsure of, such as current prices, recent events, the latest versions, or exact figures, never guess: give a natural line that buys a moment while the details are confirmed.";
+pub const INSTANT_GUIDANCE: &str = "Start with the line I can say right now: one or two short sentences, at most 40 words. Add at most two short bullets, and only when each carries a fact or option the line does not; usually none are needed. I read this draft aloud, so state facts plainly and never say where they come from: in this draft, do not mention or name my documents, notes, or handbook anywhere, bullets included, even though you rely on them. Never make up my own experiences, projects, or what my team did: put [brackets] where my specifics go. You have no web access: answer from what you reliably know and from my knowledge excerpts. For anything that changes or that you are unsure of, such as current prices, recent events, the latest versions, or exact figures, never guess: give a natural line that buys a moment while the details are confirmed. End with one last line on its own that is exactly [from: mine] when the facts in your line come from my knowledge, my profile, or the conversation, [from: general] when they come from general knowledge, or [from: none] when your line states no facts.";
+
+/// Where the facts in a line to say come from, as the draft reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grounding {
+    /// The user's documents, profile, or the conversation.
+    Mine,
+    /// What the model knows in general.
+    General,
+}
+
+impl Grounding {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mine => "From your docs",
+            Self::General => "General knowledge",
+        }
+    }
+}
+
+/// Separates an instant draft from the marker that ends it, which says where
+/// its facts come from. While the draft streams, a marker still arriving is
+/// held back so it never shows.
+#[must_use]
+pub fn split_grounding(draft: &str) -> (String, Option<Grounding>) {
+    const MARKER: &str = "[from:";
+    // ASCII lowercasing keeps byte offsets valid in the draft itself.
+    let lower = draft.to_ascii_lowercase();
+    if let Some(start) = lower.rfind(MARKER) {
+        let rest = &lower[start + MARKER.len()..];
+        let (value, after) = match rest.find(']') {
+            Some(end) => (rest[..end].trim(), rest[end + 1..].trim()),
+            None => (rest.trim(), ""),
+        };
+        // Text after the marker means it was not the last line: leave it.
+        if after.is_empty() {
+            let grounding = match value {
+                "mine" => Some(Grounding::Mine),
+                "general" => Some(Grounding::General),
+                _ => None,
+            };
+            return (draft[..start].trim_end().to_owned(), grounding);
+        }
+    }
+    // The start of a marker at the very end is still arriving.
+    let trimmed = lower.trim_end();
+    for length in (1..MARKER.len()).rev() {
+        if trimmed.ends_with(&MARKER[..length]) {
+            let cut = trimmed.len() - length;
+            if trimmed[..cut].ends_with('\n') || cut == 0 {
+                return (draft[..cut].trim_end().to_owned(), None);
+            }
+        }
+    }
+    (draft.to_owned(), None)
+}
 
 /// What the researched answer says when the instant draft needs nothing more.
 pub const NOTHING_TO_ADD: &str = "Nothing to add.";
@@ -1318,6 +1651,7 @@ pub fn researched_follow_up(text: &str) -> FollowUp {
 /// researched answer added, or the correction that replaced it.
 #[must_use]
 pub fn combined_answer(instant: &str, researched: &str) -> String {
+    let (instant, _) = split_grounding(instant);
     let instant = instant.trim();
     if instant.is_empty() {
         return researched.trim().to_owned();
@@ -1365,13 +1699,30 @@ null for advice, opinions, instructions, statements, rhetorical questions, quest
 or \"unclear\",\n\
  \"speakers\": object mapping the other side's transcript labels, such as \"Them\" or \"Them B\", to that person's name, only when the transcript makes it certain: \
 they introduce themselves (\"Hi, I'm Sam\"), they answer right after being addressed by name (\"Sam, what do you think?\"), or Me thanks or addresses them by name right after they spoke. \
-Use {} when unsure, and never guess a name from a role or company. Labels with a name in parentheses are already named; include one only to correct a name the transcript clearly contradicts.}"
+Use {} when unsure, and never guess a name from a role or company. Labels with a name in parentheses are already named; include one only to correct a name the transcript clearly contradicts,\n\
+ \"promises\": array of things Me explicitly committed to do after this conversation, each a short line starting with a verb and keeping any deadline (\"Send the pricing sheet by Friday\"); \
+only Me's own firm commitments, never Them's tasks, offers Me only floated, or things already done; [] when there are none,\n\
+ \"covered\": array of the numbers of the checklist items, when a checklist follows the transcript, that the conversation has clearly covered so far; [] when there is no checklist or nothing is covered.}"
 }
 
 /// User turn for rolling insights.
 #[must_use]
 pub fn insights_user_prompt(transcript: &str) -> String {
-    format!("<transcript>\n{transcript}\n</transcript>")
+    insights_user_prompt_with(transcript, &[])
+}
+
+/// User turn for rolling insights, with the meeting's checklist.
+#[must_use]
+pub fn insights_user_prompt_with(transcript: &str, checklist: &[String]) -> String {
+    let mut prompt = format!("<transcript>\n{transcript}\n</transcript>");
+    if !checklist.is_empty() {
+        prompt.push_str("\n\n<checklist>\n");
+        for (index, item) in checklist.iter().enumerate() {
+            prompt.push_str(&format!("{}. {}\n", index + 1, item.trim()));
+        }
+        prompt.push_str("</checklist>");
+    }
+    prompt
 }
 
 /// Extracts insights JSON from a model response that may wrap it in prose
@@ -1409,6 +1760,7 @@ pub fn parse_insights(response: &str) -> Option<CopilotInsights> {
         .filter_map(|(label, name)| Some((label, clean_person_name(&name)?)))
         .take(6)
         .collect();
+    insights.promises.truncate(8);
     Some(insights)
 }
 
@@ -1642,6 +1994,19 @@ pub fn parse_turn_verdict(response: &str) -> Option<bool> {
     value.get("answer").and_then(serde_json::Value::as_bool)
 }
 
+/// What a meeting's notes carry beyond the summary, answers, and transcript.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NotesExtras {
+    /// Things the user promised during the meeting.
+    pub promises: Vec<String>,
+    /// What the user typed to keep, with its session offset.
+    pub my_notes: Vec<(u64, String)>,
+    /// How the user spoke, as Markdown bullets.
+    pub scorecard: Option<String>,
+    /// Who the calendar says was invited.
+    pub invited: Vec<String>,
+}
+
 /// Builds the Markdown meeting notes file.
 #[must_use]
 pub fn meeting_notes_markdown(
@@ -1652,6 +2017,35 @@ pub fn meeting_notes_markdown(
     transcript: &[TranscriptLine],
     names: &VoiceNames,
     answers: &[(String, String)],
+) -> String {
+    meeting_notes_with(
+        title,
+        started,
+        duration_ms,
+        summary,
+        transcript,
+        names,
+        answers,
+        &NotesExtras::default(),
+    )
+}
+
+pub const PROMISES_HEADING: &str = "## Your commitments";
+pub const MY_NOTES_HEADING: &str = "## Your notes";
+pub const SCORECARD_HEADING: &str = "## Scorecard";
+
+/// Builds the Markdown meeting notes file with its extra sections.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn meeting_notes_with(
+    title: &str,
+    started: &str,
+    duration_ms: u64,
+    summary: Option<&str>,
+    transcript: &[TranscriptLine],
+    names: &VoiceNames,
+    answers: &[(String, String)],
+    extras: &NotesExtras,
 ) -> String {
     let labels = SpeakerLabels::new(transcript, names);
     let mut notes = format!(
@@ -1667,6 +2061,16 @@ pub fn meeting_notes_markdown(
             people.push(name);
         }
     }
+    // People the calendar invited are listed even when their voice was
+    // never matched to a name.
+    for name in &extras.invited {
+        if !people
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(name.as_str()))
+        {
+            people.push(name);
+        }
+    }
     if !people.is_empty() {
         notes.push_str(&format!("- **With:** {}\n", people.join(", ")));
     }
@@ -1674,6 +2078,33 @@ pub fn meeting_notes_markdown(
     if let Some(summary) = summary.map(str::trim).filter(|summary| !summary.is_empty()) {
         notes.push_str("## Summary\n\n");
         notes.push_str(summary);
+        notes.push_str("\n\n");
+    }
+    if !extras.promises.is_empty() {
+        notes.push_str(PROMISES_HEADING);
+        notes.push_str("\n\n");
+        for promise in &extras.promises {
+            notes.push_str(&format!("- [ ] {}\n", promise.trim()));
+        }
+        notes.push('\n');
+    }
+    if !extras.my_notes.is_empty() {
+        notes.push_str(MY_NOTES_HEADING);
+        notes.push_str("\n\n");
+        for (at_ms, note) in &extras.my_notes {
+            notes.push_str(&format!("- [{}] {}\n", format_offset(*at_ms), note.trim()));
+        }
+        notes.push('\n');
+    }
+    if let Some(scorecard) = extras
+        .scorecard
+        .as_deref()
+        .map(str::trim)
+        .filter(|scorecard| !scorecard.is_empty())
+    {
+        notes.push_str(SCORECARD_HEADING);
+        notes.push_str("\n\n");
+        notes.push_str(scorecard);
         notes.push_str("\n\n");
     }
     if !answers.is_empty() {
@@ -1717,6 +2148,23 @@ pub struct MeetingNotes {
     pub answers: String,
     /// The transcript, in Markdown.
     pub transcript: String,
+    /// What the user promised: the text and whether it is ticked off.
+    pub promises: Vec<(String, bool)>,
+    /// What the user typed during the meeting, in Markdown.
+    pub my_notes: String,
+    /// How the user spoke, in Markdown.
+    pub scorecard: String,
+}
+
+impl MeetingNotes {
+    /// The share of the words the user spoke, from the scorecard.
+    #[must_use]
+    pub fn talk_share(&self) -> Option<u8> {
+        self.scorecard.lines().find_map(|line| {
+            let rest = line.split("**You spoke:**").nth(1)?;
+            rest.trim().split('%').next()?.trim().parse().ok()
+        })
+    }
 }
 
 impl MeetingNotes {
@@ -1766,6 +2214,9 @@ pub fn parse_meeting_notes(markdown: &str) -> MeetingNotes {
     }
     let heading = |name: &str| lines.iter().position(|line| line.trim() == name);
     let summary = heading("## Summary");
+    let promises = heading(PROMISES_HEADING);
+    let my_notes = heading(MY_NOTES_HEADING);
+    let scorecard = heading(SCORECARD_HEADING);
     let answers = heading("## Copilot answers");
     let transcript = heading("## Transcript");
     let section = |start: Option<usize>, ends: &[Option<usize>]| -> String {
@@ -1781,9 +2232,30 @@ pub fn parse_meeting_notes(markdown: &str) -> MeetingNotes {
             .unwrap_or(lines.len());
         lines[start + 1..end].join("\n").trim().to_owned()
     };
-    let (summary, follow_up) = split_follow_up(&section(summary, &[answers, transcript]));
+    let after_summary = [promises, my_notes, scorecard, answers, transcript];
+    let (summary, follow_up) = split_follow_up(&section(summary, &after_summary));
     notes.summary = summary;
     notes.follow_up = follow_up;
+    notes.promises = section(promises, &after_summary)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (done, text) = if let Some(text) = line.strip_prefix("- [ ]") {
+                (false, text)
+            } else if let Some(text) = line
+                .strip_prefix("- [x]")
+                .or_else(|| line.strip_prefix("- [X]"))
+            {
+                (true, text)
+            } else {
+                return None;
+            };
+            let text = text.trim();
+            (!text.is_empty()).then(|| (text.to_owned(), done))
+        })
+        .collect();
+    notes.my_notes = section(my_notes, &after_summary);
+    notes.scorecard = section(scorecard, &after_summary);
     notes.answers = section(answers, &[transcript]);
     notes.transcript = section(transcript, &[]);
     notes
@@ -1800,6 +2272,186 @@ finish with **Follow-up email**: a line \"Subject: ...\", then a short, ready-to
 that greets them by name when known, thanks them, recaps what was agreed, and lists next steps; omit it for presentations \
 or recordings Me only listened to. \
 Be factual and brief; do not invent details."
+}
+
+/// System prompt for end-of-meeting notes of one meeting type.
+#[must_use]
+pub fn notes_prompt(mode: CopilotMode) -> String {
+    let extra = mode.notes_section();
+    let mut prompt = notes_system_prompt().to_owned();
+    prompt.push_str(
+        " After **Action items**, add **Open questions**: questions they asked that you did not answer, \
+or \"None\".",
+    );
+    if !extra.is_empty() {
+        prompt.push_str(" Then add ");
+        prompt.push_str(extra);
+        prompt.push('.');
+    }
+    prompt.push_str(
+        " The follow-up email, when there is one, always comes last. Notes the user typed during the meeting, \
+when given, are things the user wanted kept: work them into the notes.",
+    );
+    prompt
+}
+
+/// How the user spoke in a meeting, measured from the transcript.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Scorecard {
+    pub my_words: usize,
+    pub total_words: usize,
+    /// The most words the user said without the other side speaking.
+    pub longest_run_words: usize,
+    pub my_questions: usize,
+    pub their_questions: usize,
+    pub fillers: usize,
+}
+
+impl Scorecard {
+    #[must_use]
+    pub fn measure(transcript: &[TranscriptLine]) -> Self {
+        const FILLERS: [&str; 6] = ["um", "uh", "erm", "like", "basically", "actually"];
+        const PHRASES: [&str; 3] = ["you know", "sort of", "kind of"];
+        let mut card = Self::default();
+        let mut run = 0;
+        for line in transcript {
+            let words = line.text.split_whitespace().count();
+            card.total_words += words;
+            let question = line.text.contains('?');
+            match line.speaker {
+                Speaker::Me => {
+                    card.my_words += words;
+                    run += words;
+                    card.longest_run_words = card.longest_run_words.max(run);
+                    card.my_questions += usize::from(question);
+                    let lower = line.text.to_lowercase();
+                    card.fillers += lower
+                        .split(|character: char| !character.is_alphanumeric())
+                        .filter(|word| FILLERS.contains(word))
+                        .count();
+                    card.fillers += PHRASES
+                        .iter()
+                        .map(|phrase| lower.matches(phrase).count())
+                        .sum::<usize>();
+                }
+                Speaker::Them => {
+                    run = 0;
+                    card.their_questions += usize::from(question);
+                }
+            }
+        }
+        card
+    }
+
+    /// The user's share of the words spoken, in percent.
+    #[must_use]
+    pub fn talk_share(&self) -> u8 {
+        if self.total_words == 0 {
+            return 0;
+        }
+        ((self.my_words * 100 + self.total_words / 2) / self.total_words) as u8
+    }
+
+    /// Markdown bullets, or `None` when the user barely spoke.
+    #[must_use]
+    pub fn markdown(&self) -> Option<String> {
+        if self.my_words < 20 || self.total_words == self.my_words {
+            return None;
+        }
+        // Conversational speech runs at about 150 words a minute.
+        let seconds = self.longest_run_words * 60 / 150;
+        let stretch = if seconds >= 60 {
+            format!("about {} min {} s", seconds / 60, seconds % 60 / 10 * 10)
+        } else {
+            format!("about {} s", (seconds / 5 * 5).max(5))
+        };
+        Some(format!(
+            "- **You spoke:** {}% of the words ({} of {})\n\
+- **Longest stretch without them speaking:** {stretch}\n\
+- **Questions you asked:** {}\n\
+- **Questions they asked:** {}\n\
+- **Filler words:** {:.1} per 100 words",
+            self.talk_share(),
+            self.my_words,
+            self.total_words,
+            self.my_questions,
+            self.their_questions,
+            self.fillers as f32 * 100.0 / self.my_words as f32,
+        ))
+    }
+}
+
+/// System prompt for translating one line of a call.
+#[must_use]
+pub fn translation_system_prompt(language: &str) -> String {
+    format!(
+        "You translate one line from a live call into {language}. Reply with only the translation, natural and \
+brief. If the line is already in {language}, reply with exactly SAME."
+    )
+}
+
+/// The translation a model gave, or `None` when the line needed none.
+#[must_use]
+pub fn parse_translation(response: &str, original: &str) -> Option<String> {
+    let text = response.trim().trim_matches('"').trim();
+    if text.is_empty()
+        || text.eq_ignore_ascii_case("same")
+        || utterance_similarity(text, original) >= 0.9
+    {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+/// Whether one of the user's lines states something checkable: a figure,
+/// a price, a date, or a length of time.
+#[must_use]
+pub fn states_a_figure(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if text.contains('?') {
+        return false;
+    }
+    let has_digit = text.chars().any(|character| character.is_ascii_digit());
+    const NUMBER_WORDS: [&str; 14] = [
+        "hundred", "thousand", "million", "percent", "dollars", "euros", "half", "double", "twice",
+        "weeks", "months", "days", "hours", "years",
+    ];
+    has_digit
+        || lower
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|word| NUMBER_WORDS.contains(&word))
+}
+
+/// System prompt for checking one of the user's own statements against
+/// their documents.
+#[must_use]
+pub const fn self_check_system_prompt() -> &'static str {
+    "During a live call the user (\"Me\") just said a line. You are given excerpts from Me's own documents. Decide \
+whether the line states a specific fact about Me's business, such as a price, a figure, a date, a limit, or a policy, \
+that the excerpts clearly contradict. Speech recognition makes small errors, and rounding, estimates, and ranges that \
+include the documented value are not contradictions. When the excerpts do not cover the fact, or you are not sure, \
+there is no contradiction. Respond with ONLY one JSON object: {\"contradiction\": null} or {\"contradiction\": \"<at \
+most 22 words addressed to Me as you: what you said, then what your document says, naming the document>\"}."
+}
+
+/// User turn for the self-check.
+#[must_use]
+pub fn self_check_user_prompt(line: &str, knowledge: &str) -> String {
+    format!(
+        "<my_documents>\n{}\n</my_documents>\n\nMe just said: \"{}\"",
+        knowledge.trim(),
+        line.trim()
+    )
+}
+
+/// Reads the self-check's verdict.
+#[must_use]
+pub fn parse_self_check(response: &str) -> Option<String> {
+    let start = response.find('{')?;
+    let end = response.rfind('}')?;
+    let value: serde_json::Value = serde_json::from_str(response.get(start..=end)?).ok()?;
+    let text = value.get("contradiction")?.as_str()?.trim();
+    (!text.is_empty() && !text.eq_ignore_ascii_case("null")).then(|| text.to_owned())
 }
 
 /// A follow-up email ready for the user's mail app.
@@ -2477,5 +3129,195 @@ mod tests {
         assert!(notes.contains("## Summary\n\nOverview"));
         assert!(notes.contains("### What should I say?"));
         assert!(notes.contains("**[0:00] Them:** Hi"));
+    }
+
+    #[test]
+    fn a_drafts_source_marker_is_read_and_never_shown() {
+        assert_eq!(
+            split_grounding("We charge **$49** per seat.\n[from: mine]"),
+            (
+                "We charge **$49** per seat.".to_owned(),
+                Some(Grounding::Mine)
+            )
+        );
+        assert_eq!(
+            split_grounding("Paris is the capital.\n\n[From: General]\n"),
+            ("Paris is the capital.".to_owned(), Some(Grounding::General))
+        );
+        // A line that states no facts carries no mark.
+        assert_eq!(
+            split_grounding("Let me check that for you.\n[from: none]"),
+            ("Let me check that for you.".to_owned(), None)
+        );
+        // While it streams, the marker is held back from its first character.
+        for partial in [
+            "Sure.\n[",
+            "Sure.\n[fr",
+            "Sure.\n[from:",
+            "Sure.\n[from: mi",
+        ] {
+            assert_eq!(
+                split_grounding(partial),
+                ("Sure.".to_owned(), None),
+                "{partial}"
+            );
+        }
+        // Brackets for the user's own specifics are part of the line.
+        let line = "At [company] we cut costs by [figure].";
+        assert_eq!(split_grounding(line), (line.to_owned(), None));
+        // The notes never carry the marker.
+        assert_eq!(
+            combined_answer("Yes, we do.\n[from: mine]", NOTHING_TO_ADD),
+            "Yes, we do."
+        );
+    }
+
+    #[test]
+    fn typed_notes_are_told_from_questions() {
+        assert_eq!(typed_note("note: renews in March"), Some("renews in March"));
+        assert_eq!(typed_note("  Note:budget is 50k "), Some("budget is 50k"));
+        assert_eq!(typed_note("n: call Sam"), Some("call Sam"));
+        assert_eq!(typed_note("note:"), None);
+        assert_eq!(typed_note("notes on pricing?"), None);
+        assert_eq!(typed_note("What is a noteworthy point?"), None);
+    }
+
+    #[test]
+    fn a_name_is_heard_only_as_a_word_of_its_own() {
+        assert!(mentions_name(
+            "James, can you take that one?",
+            "James Gosnell"
+        ));
+        assert!(mentions_name("what does james think", "James"));
+        assert!(!mentions_name("That was the Jameson account.", "James"));
+        assert!(!mentions_name("Anything else?", ""));
+        assert!(!mentions_name("A plan B", "A"));
+    }
+
+    #[test]
+    fn the_checklist_joins_the_meeting_type_and_the_goal() {
+        let items = meeting_checklist(
+            CopilotMode::Sales,
+            "get a second meeting, ask about budget and meet their CTO",
+        );
+        assert_eq!(items[0], "Their problem");
+        assert!(items.contains(&"Get a second meeting".to_owned()));
+        assert!(items.contains(&"Meet their CTO".to_owned()));
+        assert!(items.len() <= 8);
+        assert_eq!(
+            meeting_checklist(CopilotMode::General, "agree on a launch date"),
+            ["Agree on a launch date"]
+        );
+        assert!(meeting_checklist(CopilotMode::General, "  ").is_empty());
+    }
+
+    #[test]
+    fn the_scorecard_measures_how_the_user_spoke() {
+        let lines = [
+            line(1, Speaker::Them, "How does pricing work?", 0),
+            line(
+                2,
+                Speaker::Me,
+                "So um basically it is forty nine dollars per seat you know and it scales down as you add seats to the plan.",
+                2_000,
+            ),
+            line(3, Speaker::Me, "Does that fit your budget?", 9_000),
+            line(
+                4,
+                Speaker::Them,
+                "It might, we need to check with finance first.",
+                12_000,
+            ),
+        ];
+        let card = Scorecard::measure(&lines);
+        assert_eq!(card.my_questions, 1);
+        assert_eq!(card.their_questions, 1);
+        assert_eq!(card.fillers, 3);
+        assert_eq!(card.longest_run_words, card.my_words);
+        let markdown = card.markdown().unwrap();
+        assert!(markdown.contains(&format!("**You spoke:** {}%", card.talk_share())));
+        // A meeting the user only listened to has no scorecard.
+        assert!(Scorecard::measure(&lines[..1]).markdown().is_none());
+    }
+
+    #[test]
+    fn notes_keep_promises_typed_notes_and_the_scorecard_apart_from_the_email() {
+        let extras = NotesExtras {
+            promises: vec!["Send the pricing sheet by Friday".into()],
+            my_notes: vec![(65_000, "they renew in March".into())],
+            scorecard: Some("- **You spoke:** 42% of the words (420 of 1000)".into()),
+            invited: vec!["Sam Lee".into()],
+        };
+        let markdown = meeting_notes_with(
+            "Pricing",
+            "2026-11-10 09:00",
+            60_000,
+            Some("Overview.\n\n**Follow-up email**\nSubject: Thanks\n\nHi Sam, thanks."),
+            &[line(1, Speaker::Them, "Hi", 0)],
+            &VoiceNames::new(),
+            &[],
+            &extras,
+        );
+        let notes = parse_meeting_notes(&markdown);
+        assert_eq!(notes.with, "Sam Lee");
+        assert_eq!(notes.summary, "Overview.");
+        assert_eq!(
+            notes.follow_up.as_deref(),
+            Some("Subject: Thanks\n\nHi Sam, thanks.")
+        );
+        assert_eq!(
+            notes.promises,
+            [("Send the pricing sheet by Friday".to_owned(), false)]
+        );
+        assert!(notes.my_notes.contains("[1:05] they renew in March"));
+        assert_eq!(notes.talk_share(), Some(42));
+        assert!(notes.transcript.contains("Hi"));
+        // A promise ticked off in the file reads as done.
+        let ticked = parse_meeting_notes(&markdown.replace("- [ ] Send", "- [x] Send"));
+        assert!(ticked.promises[0].1);
+    }
+
+    #[test]
+    fn side_jobs_read_their_models_replies() {
+        assert_eq!(parse_translation("SAME", "Hello"), None);
+        assert_eq!(parse_translation("Hello there.", "Hello there"), None);
+        assert_eq!(
+            parse_translation("\"Hello, how are you?\"", "Bonjour, comment allez-vous"),
+            Some("Hello, how are you?".to_owned())
+        );
+        assert_eq!(parse_self_check(r#"{"contradiction": null}"#), None);
+        assert_eq!(
+            parse_self_check(r#"Sure: {"contradiction": "You said $39; pricing.md says $49."}"#),
+            Some("You said $39; pricing.md says $49.".to_owned())
+        );
+        assert!(states_a_figure("It is 39 dollars per seat."));
+        assert!(states_a_figure("Onboarding takes two weeks."));
+        assert!(!states_a_figure("Is it 39 dollars?"));
+        assert!(!states_a_figure("Happy to walk you through it."));
+    }
+
+    #[test]
+    fn notes_prompts_add_the_meeting_types_section_before_the_email() {
+        let sales = notes_prompt(CopilotMode::Sales);
+        assert!(sales.starts_with(notes_system_prompt()));
+        assert!(sales.contains("**Deal notes**"));
+        assert!(sales.contains("**Open questions**"));
+        assert!(!notes_prompt(CopilotMode::General).contains("**Deal notes**"));
+    }
+
+    #[test]
+    fn insights_read_promises_and_covered_items_leniently() {
+        let insights = parse_insights(
+            r#"{"topic":"Pricing","promises":["Send the sheet", 4, ""],"covered":[2,"x",1]}"#,
+        )
+        .unwrap();
+        assert_eq!(insights.promises, ["Send the sheet"]);
+        assert_eq!(insights.covered, [2, 1]);
+        let plain = parse_insights(r#"{"topic":"Pricing"}"#).unwrap();
+        assert!(plain.promises.is_empty() && plain.covered.is_empty());
+        assert!(
+            insights_user_prompt_with("Them: hi", &["Budget".to_owned()])
+                .ends_with("<checklist>\n1. Budget\n</checklist>")
+        );
     }
 }

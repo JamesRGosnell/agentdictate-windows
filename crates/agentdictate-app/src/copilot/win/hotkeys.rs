@@ -53,7 +53,21 @@ const ASK: [Candidate; 1] = [Candidate {
     labels: &["Ctrl", "Shift", "\u{21b5}"],
 }];
 
+const CATCH_UP: [Candidate; 2] = [
+    Candidate {
+        modifiers: MOD_CONTROL | MOD_SHIFT,
+        key: Key::Fixed(VK_BACK),
+        labels: &["Ctrl", "Shift", "\u{232b}"],
+    },
+    Candidate {
+        modifiers: MOD_CONTROL | MOD_ALT,
+        key: Key::Fixed(VK_BACK),
+        labels: &["Ctrl", "Alt", "\u{232b}"],
+    },
+];
+
 const TOGGLE_ID: i32 = 2;
+const CATCH_UP_ID: i32 = 4;
 /// How often the foreground keyboard layout is checked for changes.
 const LAYOUT_POLL_MS: u32 = 500;
 
@@ -150,11 +164,17 @@ pub(crate) fn start(
                 assist: Vec::new(),
                 toggle: Vec::new(),
                 ask: Vec::new(),
+                catch_up: Vec::new(),
             };
             let mut layout = foreground_layout();
             // The show/hide modifiers in use, re-registered on layout changes.
             let mut toggle_modifiers = None;
-            for (id, candidates) in [(1, &ASSIST[..]), (TOGGLE_ID, &TOGGLE[..]), (3, &ASK[..])] {
+            for (id, candidates) in [
+                (1, &ASSIST[..]),
+                (TOGGLE_ID, &TOGGLE[..]),
+                (3, &ASK[..]),
+                (CATCH_UP_ID, &CATCH_UP[..]),
+            ] {
                 for candidate in candidates {
                     let resolved = resolve(candidate.modifiers, candidate.key, layout);
                     if register(id, resolved) {
@@ -166,6 +186,7 @@ pub(crate) fn start(
                                 shortcuts.toggle = labels;
                                 toggle_modifiers = Some(candidate.modifiers);
                             }
+                            CATCH_UP_ID => shortcuts.catch_up = labels,
                             _ => shortcuts.ask = labels,
                         }
                         break;
@@ -181,6 +202,7 @@ pub(crate) fn start(
                         1 => on_command(HotkeyCommand::Assist),
                         2 => on_command(HotkeyCommand::Toggle),
                         3 => on_command(HotkeyCommand::Ask),
+                        4 => on_command(HotkeyCommand::CatchUp),
                         _ => {}
                     },
                     WM_TIMER => {
@@ -213,7 +235,7 @@ pub(crate) fn start(
             if timer != 0 {
                 KillTimer(std::ptr::null_mut(), timer);
             }
-            for id in 1..=3 {
+            for id in 1..=CATCH_UP_ID {
                 UnregisterHotKey(std::ptr::null_mut(), id);
             }
         })

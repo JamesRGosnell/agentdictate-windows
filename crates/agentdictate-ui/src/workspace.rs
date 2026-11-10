@@ -62,6 +62,16 @@ pub enum WorkspaceAction {
     DeleteMeeting {
         id: String,
     },
+    /// Answers a question from the notes of every saved meeting.
+    AskMeetings {
+        question: String,
+    },
+    /// Ticks or unticks something the user promised in a meeting.
+    SetMeetingPromise {
+        id: String,
+        index: usize,
+        done: bool,
+    },
 }
 
 impl WorkspaceAction {
@@ -86,6 +96,8 @@ impl WorkspaceAction {
             Self::OpenMeetingFile { id } => format!("meetings-open-file-{id}"),
             Self::DraftMeetingEmail { id } => format!("meetings-draft-email-{id}"),
             Self::DeleteMeeting { id } => format!("meetings-delete-{id}"),
+            Self::AskMeetings { .. } => "meetings-ask".to_owned(),
+            Self::SetMeetingPromise { id, index, .. } => format!("meetings-promise-{id}-{index}"),
         }
     }
 }

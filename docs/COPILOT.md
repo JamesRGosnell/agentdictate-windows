@@ -12,6 +12,9 @@ web when facts matter, and stays invisible to screen sharing.
   dictates as usual, so you can still dictate into the meeting chat.
 - **From the tray**, choose **Meeting Copilot**.
 - **From a terminal**, run `agentdictate copilot`.
+- **By itself**, when you turn on **Open when a meeting starts**. The copilot
+  then opens as a call begins. If you end it during that call, it stays closed
+  for the rest of the call.
 
 A meeting is detected when a call app or browser (Zoom, Teams, Meet, Webex,
 Slack, Discord, and others) is using the microphone, or when a meeting window
@@ -19,8 +22,9 @@ is open. Turn this off with **Open with the dictation shortcut in meetings** in
 the copilot settings.
 
 The copilot appears as a small bar at the top center of the primary monitor.
-Drag any empty part of the bar to move it; it stays where you put it, and the
-panel moves up if it would open past the bottom of the screen. Clicks beside
+Drag any empty part of the bar to move it; it stays where you put it, in this
+meeting and the next, and the panel moves up if it would open past the bottom
+of the screen. Clicks beside
 the bar and panel reach the window underneath. The copilot starts listening
 immediately; the timer shows the session length and the meter shows audio from
 both sides.
@@ -38,6 +42,7 @@ or after 15 minutes in which no one speaks.
 | <kbd>Ctrl</kbd> + <kbd>Enter</kbd> | **Ask AI**: what should I say right now, using the conversation and your screen |
 | <kbd>Ctrl</kbd> + <kbd>\\</kbd> | Show or hide the copilot |
 | <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>Enter</kbd> | Type a question |
+| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>Backspace</kbd> | **Catch me up**: what the last two minutes covered and what is waiting on you |
 | <kbd>Esc</kbd> | Stop typing and return focus to your meeting |
 
 These shortcuts exist only while the copilot runs. If another app already owns
@@ -95,9 +100,47 @@ does not reach other apps, including chat apps that use it to send.
   name or **Them B** in the transcript, or a chip in its **People** row, to
   type a name or pick one shown on screen; your names always win, and
   **Forget** clears one.
-- **Wrap-up.** When you end the session with **✕**, the copilot writes notes
-  with a summary, key points, decisions, action items, and, when you took part
-  in a conversation, a ready-to-send follow-up email with its subject line.
+- **Where a line comes from.** Under the line to say, a small mark reads
+  **From your docs** when its facts come from your documents, profile, or the
+  conversation, and **General knowledge** when they do not.
+- **Several answers at once.** A new answer no longer stops the one being
+  written: the earlier one keeps streaming just below it, so the first half of
+  a two-part question is not lost.
+- **Compact panel.** The **−** button on the bar, or **Compact panel** in
+  settings, shows only the line to say. **Show everything** brings the full
+  panel back.
+- **Goal and checklist.** Each meeting type has a short checklist (a sales
+  call: their problem, budget, decision maker, timeline, next step). Type a
+  **Goal for this meeting** in settings, such as "get a second meeting, ask
+  about budget", and each part joins the list. Items tick themselves off as
+  the conversation covers them. The goal is cleared when the meeting ends.
+- **You promised.** When you commit to something ("I'll send that Friday"),
+  it appears under **You promised** and is saved with the notes as a
+  commitment you can tick off later.
+- **Alerts.** While you are only listening, the copilot alerts you when
+  someone says your name, with what was said in the 30 seconds before and
+  **What should I say?**. Set **Your name** in settings; it defaults to your
+  Windows account name. It also flags a figure you state that your own
+  documents contradict.
+- **Notes.** Type `note: they renew in March` in the ask box to keep
+  something. Notes appear in the transcript and are worked into the summary.
+- **Before you start.** Once the copilot knows who is on the call, from a
+  name in the conversation or your calendar, it shows the last meeting with
+  them and what you still owe them.
+- **Calendar.** Paste a private `.ics` address into **Calendar** (Outlook:
+  Settings, Calendar, Shared calendars, Publish a calendar). The meeting under
+  way then names the notes and offers its guests as names for the voices.
+- **Translation.** Choose a language under **Translate what they say into**.
+  Lines in another language get a translation under them in the transcript,
+  and the line to say comes with its meaning. **Spoken language** fixes the
+  language transcription expects; it applies from the next meeting.
+- **Wrap-up.** When a session ends on its own, the copilot writes notes
+  with a summary, key points, decisions, action items, open questions, a
+  section for the meeting type, and, when you took part in a conversation, a
+  ready-to-send follow-up email with its subject line. When you end it
+  yourself with **✕**, the bar closes at once and a small **Notes ready** bar
+  appears when the notes are saved, with **Wrap-up** and **Draft email**; it
+  leaves by itself after 25 seconds.
   The wrap-up shows them with **Draft email**, which opens the email as a
   draft in your mail app (Outlook, when it handles email links) and never sends
   it, **Copy email**, **Open notes**, and the full transcript one tab away. An
@@ -112,7 +155,17 @@ does not reach other apps, including chat apps that use it to send.
   by every word you type, across titles, people, summaries, and transcripts.
   Open a meeting to read its summary and transcript, draft or copy its
   follow-up email, or delete it: **Delete**, then **Confirm delete**, moves its
-  notes to the Recycle Bin, where they can be restored.
+  notes to the Recycle Bin, where they can be restored. Type a question in the
+  search box and press <kbd>Enter</kbd> or **Ask** to have it answered from
+  every saved meeting, with the meeting each fact comes from. **You still
+  owe** lists unticked commitments across meetings; **People** filters the
+  list to one person. An opened meeting also shows your commitments, your
+  notes, and **How you spoke** (your share of the words, longest stretch,
+  questions, filler words); **Copy notes** copies everything but the
+  transcript.
+- **Webhook.** Paste an address into **Send finished meetings to** and each
+  finished meeting is posted there as JSON (title, people, summary,
+  commitments, notes, transcript), for a CRM, Notion, Zapier, or Make.
 
 The panel opens when there is something to show and collapses to the bar with
 the chevron. While collapsed, new answers reopen it.
@@ -122,9 +175,14 @@ the chevron. While collapsed, new answers reopen it.
 Choose **Brain** in copilot settings: **Personal HQ**, **Leadlord**, or **None**.
 With a brain selected, each answer reads up to two relevant live pages, retaining
 their source and revision. Both the instant and researched answers receive those
-excerpts. Local documents are used only with **None**; the separate **Remember past
+excerpts, alongside your own documents. The separate **Remember past
 meetings** preference still controls retrieval from earlier meetings. A failed
 brain connection is reported and never treated as an empty brain.
+
+To see what the copilot would say before a call, type a question under **Ask
+your documents** in the AgentDictate window's Settings. The answer comes from
+your knowledge folder alone and names the document each fact is from; when
+nothing covers the question, it says so.
 
 Personal HQ uses a separately approved, read-only HQ CLI profile named
 `agentdictate`. Enroll it with `hq auth login --local --profile agentdictate
@@ -264,6 +322,8 @@ agentdictate copilot --check path\to\speech.wav --latency
 `--latency` also times each model with and without web search. The copilot
 logs to `%LOCALAPPDATA%\AgentDictate\logs\copilot.log*`.
 
+- **"Can't hear them" on the bar:** you have been speaking for a while and no
+  sound has come from the other side. The cause is the next item.
 - **"Them" stays silent:** the copilot records the default playback device and,
   when it differs, the default communications device. If your call app plays
   through a third device, make it the Windows default.

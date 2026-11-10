@@ -59,6 +59,8 @@ pub enum WorkspaceError {
     MeetingNotFound,
     #[error("could not open the meeting notes: {0}")]
     MeetingsUnavailable(std::io::Error),
+    #[error("{0}")]
+    MeetingsAsk(String),
     #[error(transparent)]
     DeliveryFocus(#[from] agentdictate_runtime::ExternalError),
     #[error("daemon returned unrelated data for a history request")]
@@ -72,10 +74,14 @@ pub enum WorkspaceError {
 /// Removes a saved meeting's notes file.
 type NoteRemover = fn(&std::path::Path) -> std::io::Result<()>;
 
+/// Answers a question from the notes of every saved meeting.
+pub type MeetingsAsker = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
 pub struct WorkspaceClient {
     runtime_directory: PathBuf,
     meetings_dir: Option<PathBuf>,
     remove_note: NoteRemover,
+    asker: Option<MeetingsAsker>,
     next_request_id: AtomicU64,
     request_gate: Mutex<()>,
     state: Mutex<WorkspaceClientState>,
@@ -96,6 +102,7 @@ impl WorkspaceClient {
             runtime_directory,
             meetings_dir: None,
             remove_note: crate::meetings::recycle,
+            asker: None,
             next_request_id: AtomicU64::new(10_000),
             request_gate: Mutex::new(()),
             state: Mutex::new(WorkspaceClientState {
@@ -115,6 +122,23 @@ impl WorkspaceClient {
             state.meetings.notes = crate::meetings::scan(&folder);
         }
         self.meetings_dir = Some(folder);
+        self
+    }
+
+    /// Lets the Meetings page ask questions across the saved meetings, with
+    /// the copilot's own engine and settings.
+    #[must_use]
+    pub fn with_copilot(mut self, paths: crate::AppPaths) -> Self {
+        self.asker = Some(Arc::new(move |question| {
+            crate::copilot::ask_meetings(&paths, question)
+        }));
+        self
+    }
+
+    /// Answers questions across the saved meetings with `asker`.
+    #[must_use]
+    pub fn with_meetings_asker(mut self, asker: MeetingsAsker) -> Self {
+        self.asker = Some(asker);
         self
     }
 
@@ -179,6 +203,31 @@ impl WorkspaceClient {
                 let (link, _) = draft.mailto();
                 crate::meetings::open_link(&link).map_err(WorkspaceError::MeetingsUnavailable)?;
             }
+            WorkspaceAction::AskMeetings { question } => {
+                let question = question.trim().to_owned();
+                let asker = self.asker.as_ref().ok_or_else(|| {
+                    WorkspaceError::MeetingsAsk("Asking is not available here".to_owned())
+                })?;
+                let answer = asker(&question).map_err(WorkspaceError::MeetingsAsk)?;
+                self.lock_state()?.meetings.answer =
+                    Some(agentdictate_ui::MeetingsAnswer { question, answer });
+            }
+            WorkspaceAction::SetMeetingPromise { id, index, done } => {
+                let folder = folder.ok_or(WorkspaceError::MeetingNotFound)?;
+                crate::meetings::set_promise(&folder, &id, index, done)
+                    .map_err(WorkspaceError::MeetingsUnavailable)?;
+                self.rescan_meetings()?;
+                let detail = crate::meetings::open(&folder, &id);
+                let mut state = self.lock_state()?;
+                if state
+                    .meetings
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.id == id)
+                {
+                    state.meetings.selected = detail;
+                }
+            }
             WorkspaceAction::DeleteMeeting { id } => {
                 let file = folder
                     .as_deref()
@@ -228,6 +277,8 @@ impl WorkspaceClient {
                 | WorkspaceAction::OpenMeetingFile { .. }
                 | WorkspaceAction::DraftMeetingEmail { .. }
                 | WorkspaceAction::DeleteMeeting { .. }
+                | WorkspaceAction::AskMeetings { .. }
+                | WorkspaceAction::SetMeetingPromise { .. }
         ) {
             return self.perform_meetings(action);
         }
@@ -354,7 +405,9 @@ impl WorkspaceClient {
             | WorkspaceAction::OpenMeetingsFolder
             | WorkspaceAction::OpenMeetingFile { .. }
             | WorkspaceAction::DraftMeetingEmail { .. }
-            | WorkspaceAction::DeleteMeeting { .. } => {
+            | WorkspaceAction::DeleteMeeting { .. }
+            | WorkspaceAction::AskMeetings { .. }
+            | WorkspaceAction::SetMeetingPromise { .. } => {
                 unreachable!("handled above")
             }
         };

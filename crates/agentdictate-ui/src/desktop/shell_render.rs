@@ -51,7 +51,7 @@ enum RoutePageModel {
         pending_destructive_action: Option<WorkspaceAction>,
     },
     Meetings {
-        meetings: MeetingsViewModel,
+        meetings: Box<MeetingsViewModel>,
         feedback: Option<String>,
         search_input: Option<Entity<InputState>>,
         query: String,
@@ -83,7 +83,7 @@ impl RoutePageModel {
                 pending_destructive_action: shell.routes.pending_destructive_action.clone(),
             },
             Route::Meetings => Self::Meetings {
-                meetings: workspace.meetings.clone(),
+                meetings: Box::new(workspace.meetings.clone()),
                 feedback: shell.routes.entry(Route::Meetings).feedback.clone(),
                 search_input: shell.routes.meetings_search_input.clone(),
                 query: shell.routes.meetings_query.clone(),
@@ -168,7 +168,7 @@ impl RoutePageModel {
                 query,
                 pending_destructive_action,
             } => meetings_page::surface(
-                meetings,
+                *meetings,
                 meetings_page::MeetingsPageState {
                     feedback,
                     search_input,
@@ -192,7 +192,7 @@ impl RoutePageModel {
                 theme,
                 cx,
             ),
-            Self::Settings(settings) => settings_page::surface(*settings, theme, cx),
+            Self::Settings(settings) => settings_page::surface(*settings, theme, window, cx),
         }
     }
 }

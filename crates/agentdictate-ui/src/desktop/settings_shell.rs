@@ -221,7 +221,8 @@ impl SettingsShell {
                 .default_value(initial_history_search)
         });
         let meetings_search_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search meetings, people, and transcripts")
+            InputState::new(window, cx)
+                .placeholder("Search meetings, or type a question and press Enter to ask")
         });
         let applied_model_catalog = model.workspace.model_catalog.clone();
         let form = SettingsFormState::new(&settings, &applied_model_catalog, window, cx);
@@ -240,6 +241,10 @@ impl SettingsShell {
                 if matches!(event, InputEvent::Change) {
                     shell.routes.meetings_query = input.read(cx).value().to_string();
                     cx.notify();
+                }
+                // Enter asks the question across every saved meeting.
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    shell.ask_meetings(cx);
                 }
             },
         ));

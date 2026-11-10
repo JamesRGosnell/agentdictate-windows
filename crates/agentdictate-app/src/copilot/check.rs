@@ -1512,7 +1512,8 @@ and annual billing saves you a fair bit compared with paying monthly.";
                         if !facts.iter().any(|fact| run.text.contains(fact)) {
                             Some(format!("missing {}", facts[0]))
                         } else {
-                            plain_line(&run.text)
+                            // Checked as shown, without the source marker.
+                            plain_line(&agentdictate_core::split_grounding(&run.text).0)
                         }
                     },
                 );

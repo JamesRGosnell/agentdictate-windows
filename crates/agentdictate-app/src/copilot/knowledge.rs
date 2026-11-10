@@ -27,6 +27,10 @@ const CHUNK_CHARS: usize = 1_200;
 const PRIMER_CHARS: usize = 100_000;
 /// Document excerpts added to one answer when the set is larger.
 const DOCUMENT_BUDGET_CHARS: usize = 8_000;
+/// Document excerpts given to a check of one statement or question.
+const CHECK_BUDGET_CHARS: usize = 4_000;
+/// Meeting excerpts given to a question asked across all meetings.
+const ASK_MEETINGS_BUDGET_CHARS: usize = 14_000;
 /// Excerpts from earlier meetings added to one answer.
 const MEETING_BUDGET_CHARS: usize = 3_000;
 /// A meeting excerpt must share this many distinct words with the question.
@@ -243,8 +247,46 @@ impl Knowledge {
         rendered
     }
 
+    /// Excerpts from the user's documents about `text`, including documents
+    /// every answer already knows whole: for checking one statement, or one
+    /// question, against the documents alone.
+    pub(crate) fn document_excerpts(&self, text: &str) -> String {
+        self.labeled(text, Origin::Document, CHECK_BUDGET_CHARS)
+    }
+
+    /// Excerpts from the notes of earlier meetings about `text`, for a
+    /// question asked across all of them.
+    pub(crate) fn meeting_excerpts(&self, text: &str) -> String {
+        self.labeled(text, Origin::Meeting, ASK_MEETINGS_BUDGET_CHARS)
+    }
+
+    fn labeled(&self, text: &str, origin: Origin, budget: usize) -> String {
+        let mut query: HashMap<String, f32> = HashMap::new();
+        for token in tokens(text) {
+            *query.entry(token).or_insert(0.0) += 1.0;
+        }
+        let picked = self.ranked(&query, origin, budget, 2, true);
+        let mut rendered = String::new();
+        let mut last_source = "";
+        for chunk in picked {
+            if chunk.source != last_source {
+                if !rendered.is_empty() {
+                    rendered.push_str("\n\n");
+                }
+                rendered.push('[');
+                rendered.push_str(&chunk.source);
+                rendered.push_str("]\n");
+                last_source = &chunk.source;
+            } else {
+                rendered.push_str("\n\u{2026}\n");
+            }
+            rendered.push_str(chunk.text.trim());
+        }
+        rendered
+    }
+
     /// The highest-scoring chunks of one origin that fit the budget, grouped
-    /// by source in ranked order.
+    /// by source in ranked order, from what the primer left out.
     fn best(
         &self,
         query: &HashMap<String, f32>,
@@ -252,12 +294,23 @@ impl Knowledge {
         budget: usize,
         min_shared: usize,
     ) -> Vec<&Chunk> {
+        self.ranked(query, origin, budget, min_shared, false)
+    }
+
+    fn ranked(
+        &self,
+        query: &HashMap<String, f32>,
+        origin: Origin,
+        budget: usize,
+        min_shared: usize,
+        primed_too: bool,
+    ) -> Vec<&Chunk> {
         let total = self.chunks.len() as f32;
         let mut scored: Vec<(f32, usize)> = self
             .chunks
             .iter()
             .enumerate()
-            .filter(|(_, chunk)| chunk.origin == origin && !chunk.primed)
+            .filter(|(_, chunk)| chunk.origin == origin && (primed_too || !chunk.primed))
             .filter_map(|(index, chunk)| {
                 let mut shared = 0;
                 let mut score = 0.0;

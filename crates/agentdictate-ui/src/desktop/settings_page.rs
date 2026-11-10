@@ -71,6 +71,7 @@ fn prompt_control_slot(selector: &'static str) -> gpui::Div {
 pub(super) fn surface(
     model: SettingsPageModel,
     theme: ThemeTokens,
+    window: &mut gpui::Window,
     cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
     let SettingsPageModel {
@@ -152,7 +153,7 @@ pub(super) fn surface(
                 cx,
             ))
             .when_some(copilot, |page, copilot| {
-                page.child(super::copilot_settings::section(copilot, theme, cx))
+                page.child(super::copilot_settings::section(copilot, theme, window, cx))
             }),
     )
 }
