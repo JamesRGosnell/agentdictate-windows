@@ -1207,7 +1207,7 @@ fn median(values: &[u128]) -> String {
 pub(crate) fn bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize> {
     use std::collections::BTreeMap;
 
-    use agentdictate_core::{CopilotProvider, RewriteStyle, rewrite_instruction};
+    use agentdictate_core::{CopilotProvider, Grounding, RewriteStyle, rewrite_instruction};
 
     let mut report = Report { failures: 0 };
     let paths = crate::AppPaths::from_environment()?;
@@ -1328,26 +1328,64 @@ and is included in the Growth and Enterprise plans. Customers in retail and logi
             None,
         ),
     ];
-    // The instant line: the question and a fact the answer must carry.
-    let questions: [(&str, &[&str]); 5] = [
+    // The instant line: the question, a fact the answer must carry, and
+    // where the draft should say its facts come from.
+    let questions: [(&str, &[&str], Grounding); 6] = [
         (
             "What would forty seats on the Growth plan cost us per year?",
             &["18,800", "18800"],
+            Grounding::Mine,
         ),
-        ("Do you have SOC 2?", &["Type II", "Type 2"]),
+        (
+            "Do you have SOC 2?",
+            &["Type II", "Type 2"],
+            Grounding::Mine,
+        ),
         (
             "Where would our data live? We're based in Toronto.",
             &["Canada", "Montreal", "ca-central"],
+            Grounding::Mine,
         ),
         (
             "Honestly, Acme is cheaper. Why would we pay more?",
             &["warehouse"],
+            Grounding::Mine,
         ),
         (
             "Can you do anything on price if we sign for two years?",
             &["15"],
+            Grounding::Mine,
+        ),
+        (
+            "Quick one, remind me what FIFO stands for in inventory?",
+            &["irst"],
+            Grounding::General,
         ),
     ];
+    // Live insights: what the user promised and what the checklist covers.
+    let insights_call = vec![
+        line(
+            1,
+            Speaker::Them,
+            "We have about fifty thousand dollars budgeted for this, and stockouts are costing us every week.",
+        ),
+        line(
+            2,
+            Speaker::Me,
+            "That fits. I'll send you the pricing sheet by Friday.",
+        ),
+        line(
+            3,
+            Speaker::Them,
+            "Sounds good. Maybe we could look at a trial at some point.",
+        ),
+    ];
+    let insights_transcript = render_transcript(&insights_call, &VoiceNames::new(), 8_000);
+    let checklist: Vec<String> = agentdictate_core::CopilotMode::Sales
+        .checklist()
+        .iter()
+        .map(|item| (*item).to_owned())
+        .collect();
     // Rewrites of a drafted line.
     let long_line = "For forty seats on the growth plan, it comes to about twenty thousand a year, \
 and annual billing saves you a fair bit compared with paying monthly.";
@@ -1479,7 +1517,56 @@ and annual billing saves you a fair bit compared with paying monthly.";
                     },
                 );
             }
-            for (question, facts) in questions {
+            {
+                let request = AnswerRequest {
+                    system: insights_system_prompt().to_owned(),
+                    user: agentdictate_core::insights_user_prompt_with(
+                        &insights_transcript,
+                        &checklist,
+                    ),
+                    image_jpeg: None,
+                    model: id.clone(),
+                    effort: CopilotEffort::Low,
+                    web_search: false,
+                    max_output_tokens: 800,
+                    cache_key: format!("{key}-insights"),
+                };
+                record(
+                    &mut report,
+                    "insights",
+                    model,
+                    "promise and checklist",
+                    timed(provider.as_ref(), &request),
+                    &|run| {
+                        let Some(insights) = parse_insights(&run.text) else {
+                            return Some("not readable".to_owned());
+                        };
+                        let promised = insights
+                            .promises
+                            .iter()
+                            .any(|promise| promise.to_lowercase().contains("pricing"));
+                        // Budget is the second item; the decision maker and
+                        // the timeline, third and fourth, never came up.
+                        // Sending the pricing sheet is a next step, so the
+                        // fifth may be ticked. A trial was only floated.
+                        if !promised {
+                            Some("missed the promise".to_owned())
+                        } else if insights.promises.len() > 1 {
+                            Some(format!("invented promises: {:?}", insights.promises))
+                        } else if !insights.covered.contains(&2) {
+                            Some("did not tick Budget".to_owned())
+                        } else if insights.covered.contains(&3) || insights.covered.contains(&4) {
+                            Some(format!(
+                                "ticked what was not covered: {:?}",
+                                insights.covered
+                            ))
+                        } else {
+                            None
+                        }
+                    },
+                );
+            }
+            for (question, facts, expected) in questions {
                 let request = AnswerRequest {
                     system: system.clone(),
                     // As the engine asks for an instant draft.
@@ -1509,11 +1596,16 @@ and annual billing saves you a fair bit compared with paying monthly.";
                     question,
                     timed(provider.as_ref(), &request),
                     &|run| {
+                        // Checked as shown, without the source marker.
+                        let (shown, grounding) = agentdictate_core::split_grounding(&run.text);
                         if !facts.iter().any(|fact| run.text.contains(fact)) {
                             Some(format!("missing {}", facts[0]))
+                        } else if shown.trim_end().len() == run.text.trim_end().len() {
+                            Some("no source marker".to_owned())
+                        } else if grounding != Some(expected) {
+                            Some(format!("marked {grounding:?}, expected {expected:?}"))
                         } else {
-                            // Checked as shown, without the source marker.
-                            plain_line(&agentdictate_core::split_grounding(&run.text).0)
+                            plain_line(&shown)
                         }
                     },
                 );
