@@ -20,14 +20,14 @@ use agentdictate_core::{
     AlertKind, AnswerStatus, BrainSource, CallView, ChecklistItem, CopilotAction, CopilotAlert,
     CopilotEffort, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft,
     HeardSpan, INSTANT_GUIDANCE, JUDGE_TRANSCRIPT_CHARS, ListenState, ModelChoice, NotesExtras,
-    QUESTION_PAUSE_MS, QuickAction, RewriteEngine, RewriteStyle, Scorecard, Speaker, SpeakerLabels,
-    TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt, call_view_system_prompt,
+    QuickAction, RewriteEngine, RewriteStyle, Scorecard, Speaker, SpeakerLabels, TranscriptLine,
+    TurnContext, answer_system_prompt, answer_user_prompt, call_view_system_prompt,
     call_view_user_prompt, combined_answer, detected_question_instruction, insights_system_prompt,
     insights_user_prompt_with, is_echo_of, judge_transcript, kept_talking, language_name,
     meeting_checklist, meeting_notes_with, mentions_name, notes_prompt, only_listening,
-    parse_call_view, parse_insights, parse_self_check, parse_translation, render_transcript,
-    researched_guidance, rewrite_instruction, self_check_system_prompt, self_check_user_prompt,
-    since_user_spoke_ms, split_follow_up, split_grounding, states_a_figure,
+    parse_call_view, parse_insights, parse_self_check, parse_translation, question_pause_ms,
+    render_transcript, researched_guidance, rewrite_instruction, self_check_system_prompt,
+    self_check_user_prompt, since_user_spoke_ms, split_follow_up, split_grounding, states_a_figure,
     translation_system_prompt, turn_candidate, turn_judge_system_prompt, turn_judge_user_prompt,
     turn_likely_question, typed_note, typed_question_instruction, utterance_similarity,
 };
@@ -160,6 +160,10 @@ pub(crate) enum AudioMsg {
         speaker: Speaker,
         utterance: Utterance,
     },
+    /// Speech went on after a provisional pause.
+    Resumed {
+        speaker: Speaker,
+    },
     Utterance {
         speaker: Speaker,
         utterance: Utterance,
@@ -192,6 +196,7 @@ impl AudioMsg {
                 samples,
             }],
             SegmentEvent::Provisional(utterance) => vec![Self::Provisional { speaker, utterance }],
+            SegmentEvent::Resumed => vec![Self::Resumed { speaker }],
             SegmentEvent::Utterance(utterance) => vec![
                 Self::Utterance { speaker, utterance },
                 Self::Speaking {
@@ -535,6 +540,9 @@ pub(crate) struct Engine {
     last_heard: Instant,
     pending_mine: Vec<PendingMine>,
     them_speaking: bool,
+    /// When the other side's speech stopped, on the session clock, while a
+    /// pause that may end it is under way.
+    them_pause: Option<u64>,
     pending_turn: Option<PendingTurn>,
     next_turn: u64,
     /// Drafts discarded unseen, kept out of the meeting notes.
@@ -627,6 +635,7 @@ impl Engine {
             last_heard: Instant::now(),
             pending_mine: Vec::new(),
             them_speaking: false,
+            them_pause: None,
             pending_turn: None,
             next_turn: 1,
             discarded: HashSet::new(),
@@ -821,19 +830,23 @@ impl Engine {
         }
         self.primed = true;
         let system = answer_system_prompt(&self.settings, self.knowledge.primer());
+        // Each lane is primed as its answers are asked for, so the same
+        // prefix is found again.
         let lanes = [
             (
                 self.settings.fast_model(),
                 false,
                 format!("{}-instant", self.session_key),
+                CopilotEffort::None,
             ),
             (
                 self.settings.answer_model(),
                 self.settings.web_search,
                 self.session_key.clone(),
+                self.settings.effort,
             ),
         ];
-        for (model, web_search, cache_key) in lanes {
+        for (model, web_search, cache_key, effort) in lanes {
             let mut settings = self.settings.clone();
             settings.set_answer_model(model.clone());
             let request = AnswerRequest {
@@ -841,7 +854,7 @@ impl Engine {
                 user: "Reply with OK.".to_owned(),
                 image_jpeg: None,
                 model,
-                effort: CopilotEffort::Low,
+                effort,
                 web_search,
                 max_output_tokens: 16,
                 cache_key,
@@ -1216,6 +1229,9 @@ impl Engine {
                         self.refresh_problem();
                     }
                     self.them_speaking = active;
+                    if active {
+                        self.them_pause = None;
+                    }
                     self.looks.speech_started = active.then(Instant::now);
                     self.looks.captured = false;
                     if !active {
@@ -1230,7 +1246,18 @@ impl Engine {
                 samples,
             } => self.stream_speech(speaker, start_sample, samples),
             AudioMsg::Provisional { speaker, utterance } => {
+                if speaker == Speaker::Them {
+                    self.them_pause = Some(self.speech_times(&utterance).1);
+                }
                 self.transcribe_early(speaker, &utterance);
+                if speaker == Speaker::Them {
+                    self.evaluate_turn();
+                }
+            }
+            AudioMsg::Resumed { speaker } => {
+                if speaker == Speaker::Them {
+                    self.them_pause = None;
+                }
             }
             AudioMsg::Utterance { speaker, utterance } => self.queue_utterance(speaker, utterance),
             AudioMsg::Problem(problem) => {
@@ -1467,6 +1494,13 @@ impl Engine {
                     text: text.clone(),
                 });
                 if speaker == Speaker::Them {
+                    tracing::debug!(
+                        words = text.split_whitespace().count(),
+                        ends_question = text.trim_end().ends_with('?'),
+                        speaking = self.them_speaking,
+                        paused = self.them_pause.is_some(),
+                        "partial words from the other side"
+                    );
                     self.consider_partial_turn(&text);
                 }
             }
@@ -2100,6 +2134,12 @@ impl Engine {
             }
             return;
         }
+        // Its answer already shows, drafted from the partial words.
+        if self.last_auto_question.as_ref().is_some_and(|(shown, at)| {
+            at.elapsed() < AUTO_ANSWER_COOLDOWN && same_question(shown, &text)
+        }) {
+            return;
+        }
         // The question was already being judged and drafted from the words
         // heard so far: keep that work when the final line says the same.
         if let Some(turn) = self
@@ -2272,15 +2312,25 @@ impl Engine {
     /// Wake at the question's actual confirmation deadline when audio goes
     /// quiet, rather than rounding it up to the next 250 ms maintenance tick.
     fn next_wait(&self) -> Duration {
-        let Some(turn) = self
+        // A question judged from partial words shows once its pause is long
+        // enough.
+        if let Some(turn) = self
             .pending_turn
             .as_ref()
-            .filter(|turn| !self.them_speaking && !turn.awaiting_final)
-        else {
+            .filter(|turn| turn.awaiting_final)
+        {
+            return self.them_pause.map_or(IDLE_TICK, |ended| {
+                let left = (ended + question_pause_ms(&turn.text))
+                    .saturating_sub(self.elapsed_ms())
+                    .max(1);
+                IDLE_TICK.min(Duration::from_millis(left))
+            });
+        }
+        let Some(turn) = self.pending_turn.as_ref().filter(|_| !self.them_speaking) else {
             return IDLE_TICK;
         };
         let pause_left = Duration::from_millis(
-            (turn.end_ms + QUESTION_PAUSE_MS).saturating_sub(self.elapsed_ms()),
+            (turn.end_ms + question_pause_ms(&turn.text)).saturating_sub(self.elapsed_ms()),
         );
         let verdict_left = if turn.verdict.is_some() {
             Duration::ZERO
@@ -2302,6 +2352,16 @@ impl Engine {
             // to answer.
             if turn.heard.elapsed() > TURN_EXPIRY {
                 self.drop_turn();
+                return;
+            }
+            // The words so far end a question, the judge agrees, and the
+            // speaker has paused: the answer shows without waiting for the
+            // final line.
+            let paused = self
+                .them_pause
+                .is_some_and(|ended| self.elapsed_ms() >= ended + question_pause_ms(&turn.text));
+            if paused && turn.verdict == Some(true) && turn.draft.is_some() {
+                self.reveal_partial_turn();
             }
             return;
         }
@@ -2327,7 +2387,7 @@ impl Engine {
             return;
         }
         // A brief sound may be the start of more speech; wait to find out.
-        if self.them_speaking || self.elapsed_ms() < turn.end_ms + QUESTION_PAUSE_MS {
+        if self.them_speaking || self.elapsed_ms() < turn.end_ms + question_pause_ms(&turn.text) {
             return;
         }
         let verdict_wait = self.verdict_wait(turn.likely);
@@ -2361,6 +2421,32 @@ impl Engine {
             return;
         }
         self.maybe_auto_answer(turn.text);
+    }
+
+    /// Shows the answer drafted from a question's partial words.
+    fn reveal_partial_turn(&mut self) {
+        let Some(turn) = self.pending_turn.take() else {
+            return;
+        };
+        let Some(draft) = turn.draft else {
+            return;
+        };
+        if !draft.gate.reveal() {
+            return;
+        }
+        tracing::info!(
+            answer_id = draft.id,
+            turn_id = turn.id,
+            waited_ms = turn.heard.elapsed().as_millis() as u64,
+            speech_end_to_reveal_ms = self
+                .them_pause
+                .map(|ended| self.elapsed_ms().saturating_sub(ended)),
+            "answering the other side from partial words"
+        );
+        self.last_auto_question = Some((turn.text, Instant::now()));
+        if let Some((title, text)) = draft.finished {
+            self.answers.push((draft.id, title, text));
+        }
     }
 
     /// How long ago the user last spoke, if they have, ignoring the other
@@ -4241,6 +4327,79 @@ mod tests {
     }
 
     #[test]
+    fn a_judged_partial_question_shows_once_the_speaker_pauses() {
+        let ((mut engine, _incoming, events, _requests, _directory), _sent) = live_harness();
+        engine.started = Instant::now() - Duration::from_secs(10);
+        let question = "What does pricing look like for us?";
+        let pause = question_pause_ms(question);
+        engine.handle_live(Speaker::Them, LiveEvent::Partial(question.into()));
+        let started = |events: &Arc<Mutex<Vec<CopilotEvent>>>| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        CopilotEvent::AnswerStarted {
+                            automatic: true,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        // Judged, but they have not paused: nothing shows.
+        engine.pending_turn.as_mut().unwrap().verdict = Some(true);
+        engine.evaluate_turn();
+        assert_eq!(started(&events), 0);
+        // A pause that speech then breaks shows nothing either.
+        engine.them_pause = Some(engine.elapsed_ms() - pause - 100);
+        engine.handle_audio(AudioMsg::Resumed {
+            speaker: Speaker::Them,
+        });
+        engine.evaluate_turn();
+        assert_eq!(started(&events), 0);
+        assert!(engine.pending_turn.is_some());
+        // A pause too short to trust waits; the engine wakes when it is not.
+        engine.them_pause = Some(engine.elapsed_ms() - pause + 150);
+        engine.evaluate_turn();
+        assert_eq!(started(&events), 0);
+        assert!(engine.next_wait() <= Duration::from_millis(150));
+        // Long enough: the draft shows without the final line.
+        engine.them_pause = Some(engine.elapsed_ms() - pause - 100);
+        engine.evaluate_turn();
+        assert_eq!(started(&events), 1);
+        assert!(engine.pending_turn.is_none());
+        // The final line of the same question starts nothing more.
+        engine.consider_turn(question.into(), 9_000, None);
+        assert!(engine.pending_turn.is_none());
+        assert_eq!(started(&events), 1);
+    }
+
+    #[test]
+    fn a_partial_question_the_judge_has_not_confirmed_stays_hidden() {
+        let ((mut engine, _incoming, events, _requests, _directory), _sent) = live_harness();
+        engine.started = Instant::now() - Duration::from_secs(10);
+        engine.handle_live(
+            Speaker::Them,
+            LiveEvent::Partial("It's cheaper elsewhere, isn't it?".into()),
+        );
+        engine.them_pause = Some(engine.elapsed_ms() - 2_000);
+        // No verdict yet, then a no.
+        engine.evaluate_turn();
+        engine.pending_turn.as_mut().unwrap().verdict = Some(false);
+        engine.evaluate_turn();
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, CopilotEvent::AnswerStarted { .. }))
+        );
+    }
+
+    #[test]
     fn a_line_that_asks_more_than_its_partial_question_is_judged_again() {
         assert!(same_question(
             "Is that included?",
@@ -4291,7 +4450,8 @@ mod tests {
         let (mut engine, _incoming, _events, _requests, _directory) =
             harness(CopilotSettings::default());
         assert_eq!(engine.next_wait(), IDLE_TICK);
-        engine.started = Instant::now() - Duration::from_millis(QUESTION_PAUSE_MS - 20);
+        engine.started =
+            Instant::now() - Duration::from_millis(question_pause_ms("What is the price?") - 20);
         engine.pending_turn = Some(PendingTurn {
             id: 1,
             text: "What is the price?".into(),

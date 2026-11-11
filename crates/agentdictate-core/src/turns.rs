@@ -12,6 +12,24 @@ use crate::{
 /// someone asking the user something waits; a rhetorical question runs on.
 pub const QUESTION_PAUSE_MS: u64 = 700;
 
+/// Quiet after a line that ends in a question mark. The transcriber has
+/// judged the sentence complete, so less silence could confirm it, but it
+/// is not shorter yet: 300 to 500 ms added a false pop-up on the labelled
+/// calls and gained nothing while a line's last words arrive most of a
+/// second after they are spoken.
+pub const CONFIDENT_QUESTION_PAUSE_MS: u64 = QUESTION_PAUSE_MS;
+
+/// How long the other side must stay quiet after `line` before an answer to
+/// it is shown.
+#[must_use]
+pub fn question_pause_ms(line: &str) -> u64 {
+    if line.trim_end().ends_with('?') {
+        CONFIDENT_QUESTION_PAUSE_MS
+    } else {
+        QUESTION_PAUSE_MS
+    }
+}
+
 /// Other-side speech starting this long after a line ended means the
 /// speaker kept talking rather than waiting for the user.
 pub const RESUMED_SPEECH_MS: u64 = 300;

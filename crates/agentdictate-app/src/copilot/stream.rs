@@ -124,7 +124,31 @@ pub(crate) fn parse_responses_event(value: &Value) -> Vec<StreamEvent> {
                 None => Vec::new(),
             }
         }
-        "response.completed" => vec![StreamEvent::Done],
+        "response.completed" => {
+            // How much of the prompt the service had already read, and at
+            // which speed tier it answered.
+            if let Some(usage) = value.pointer("/response/usage") {
+                let count = |path: &str| usage.pointer(path).and_then(Value::as_u64);
+                let model = value.pointer("/response/model").and_then(Value::as_str);
+                let tier = value
+                    .pointer("/response/service_tier")
+                    .and_then(Value::as_str);
+                let input_tokens = count("/input_tokens");
+                let cached_tokens = count("/input_tokens_details/cached_tokens");
+                let output_tokens = count("/output_tokens");
+                let reasoning_tokens = count("/output_tokens_details/reasoning_tokens");
+                tracing::info!(
+                    model,
+                    tier,
+                    input_tokens,
+                    cached_tokens,
+                    output_tokens,
+                    reasoning_tokens,
+                    "copilot response usage"
+                );
+            }
+            vec![StreamEvent::Done]
+        }
         "response.incomplete" => vec![StreamEvent::Done],
         "response.failed" | "error" => vec![StreamEvent::Error(error_message(value))],
         _ => Vec::new(),

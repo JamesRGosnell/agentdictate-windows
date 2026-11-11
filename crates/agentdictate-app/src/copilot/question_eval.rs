@@ -18,9 +18,9 @@ use std::{
 };
 
 use agentdictate_core::{
-    CopilotEffort, CopilotMode, HeardSpan, JUDGE_TRANSCRIPT_CHARS, QUESTION_PAUSE_MS, Situation,
-    Speaker, TURN_JUDGE_THRESHOLD, TranscriptLine, TurnContext, VoiceNames, judge_transcript,
-    kept_talking, only_listening, parse_turn_verdict, render_transcript, since_user_spoke_ms,
+    CopilotEffort, CopilotMode, HeardSpan, JUDGE_TRANSCRIPT_CHARS, Situation, Speaker,
+    TURN_JUDGE_THRESHOLD, TranscriptLine, TurnContext, VoiceNames, judge_transcript, kept_talking,
+    only_listening, parse_turn_verdict, question_pause_ms, render_transcript, since_user_spoke_ms,
     turn_candidate, turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question,
     utterance_similarity,
 };
@@ -291,7 +291,7 @@ fn score(
             Some(respond) if verdict.elapsed_ms <= VERDICT_WAIT_MS => respond,
             _ => turn_likely_question(&line.text),
         };
-        let decided_ms = line.end_ms + QUESTION_PAUSE_MS.max(verdict.elapsed_ms);
+        let decided_ms = line.end_ms + question_pause_ms(&line.text).max(verdict.elapsed_ms);
         let resumed = lines[index + 1..]
             .iter()
             .filter(|later| later.speaker == Speaker::Them && later.start_ms <= decided_ms)

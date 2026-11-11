@@ -203,8 +203,13 @@ fn responses_body(request: &AnswerRequest, model: &str) -> Value {
     } else {
         Vec::new()
     };
-    json!({
-        "model": model,
+    // "gpt-6-sol#fast" asks for that model in OpenAI's Fast mode.
+    let (model_id, fast) = match model.strip_suffix(FAST_MODE_SUFFIX) {
+        Some(model_id) => (model_id, true),
+        None => (model, false),
+    };
+    let mut body = json!({
+        "model": model_id,
         "instructions": request.system,
         "input": [{"type": "message", "role": "user", "content": content}],
         "tools": tools,
@@ -215,8 +220,16 @@ fn responses_body(request: &AnswerRequest, model: &str) -> Value {
         "stream": true,
         "include": [],
         "prompt_cache_key": cache_key(&request.cache_key),
-    })
+    });
+    if fast {
+        body["service_tier"] = json!("fast");
+    }
+    body
 }
+
+/// Ends a model id that should run in OpenAI's Fast mode, which answers
+/// sooner at a higher price per token.
+pub(crate) const FAST_MODE_SUFFIX: &str = "#fast";
 
 /// Models that refused to answer without reasoning in this process.
 static MUST_REASON: Mutex<Vec<String>> = Mutex::new(Vec::new());

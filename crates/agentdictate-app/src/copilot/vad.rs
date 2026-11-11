@@ -120,6 +120,9 @@ pub(crate) enum SegmentEvent {
     /// would end now. If the pause does end it, the [`SegmentEvent::Utterance`]
     /// that follows has the same start and samples.
     Provisional(Utterance),
+    /// Speech went on after a [`SegmentEvent::Provisional`]: the pause did
+    /// not end the utterance.
+    Resumed,
     Utterance(Utterance),
 }
 
@@ -133,6 +136,8 @@ struct Active {
     peak_rms: f32,
     /// Samples already sent as [`SegmentEvent::Speech`].
     streamed: usize,
+    /// A provisional copy went out for the pause now under way.
+    released: bool,
 }
 
 pub(crate) struct Segmenter {
@@ -218,6 +223,9 @@ impl Segmenter {
             if rms > threshold * 0.6 {
                 active.voiced_blocks += usize::from(voiced);
                 active.silent_run = 0;
+                if std::mem::take(&mut active.released) {
+                    events.push(SegmentEvent::Resumed);
+                }
             } else {
                 active.silent_run += 1;
             }
@@ -237,6 +245,7 @@ impl Segmenter {
             {
                 Self::stream(active, min_speech, 0, events);
                 events.push(SegmentEvent::Provisional(Self::utterance(active)));
+                active.released = true;
                 return;
             }
             Self::stream(active, min_speech, STREAM_CHUNK_BLOCKS * BLOCK, events);
@@ -268,6 +277,7 @@ impl Segmenter {
                 silent_run: 0,
                 peak_rms: rms,
                 streamed: 0,
+                released: false,
             });
             self.onset_run = 0;
             events.push(SegmentEvent::SpeechStarted);
@@ -571,6 +581,26 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].start_sample, early.start_sample);
         assert!(found[0].samples.len() > early.samples.len());
+    }
+
+    #[test]
+    fn speech_after_a_provisional_release_is_announced() {
+        let mut segmenter = Segmenter::new(SegmenterConfig::system_audio());
+        let mut events = segmenter.push(&tone(1_200, 0.3));
+        events.extend(segmenter.push(&silence(340)));
+        assert_eq!(provisionals(&events).len(), 1);
+        assert!(!events.contains(&SegmentEvent::Resumed));
+        let resumed = segmenter.push(&tone(400, 0.3));
+        assert_eq!(
+            resumed
+                .iter()
+                .filter(|event| **event == SegmentEvent::Resumed)
+                .count(),
+            1
+        );
+        // A pause that does end the utterance announces nothing.
+        let ended = segmenter.push(&silence(1_000));
+        assert!(!ended.contains(&SegmentEvent::Resumed));
     }
 
     #[test]
