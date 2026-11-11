@@ -460,17 +460,7 @@ fn session_services(
     // when a speaker has finished; otherwise an OpenAI API key streams it.
     // Without either, or if the stream fails, speech is uploaded at each
     // pause.
-    let assembly_key = settings.assemblyai_api_key.trim().to_owned();
-    let live_factory: Option<live::LiveFactory> = if assembly_key.is_empty() {
-        None
-    } else {
-        let url = assembly::session_url(assembly::STREAMING_URL, &language);
-        tracing::info!("copilot transcribes with AssemblyAI");
-        Some(Arc::new(move |speaker, events| {
-            assembly::spawn(url.clone(), assembly_key.clone(), speaker, events)
-        }) as live::LiveFactory)
-    };
-    let live_factory: Option<live::LiveFactory> = live_factory.or_else(|| {
+    let openai_live: Option<live::LiveFactory> = {
         let key = if settings.openai_api_key.trim().is_empty() {
             dictation_openai_key.clone()
         } else {
@@ -488,7 +478,37 @@ fn session_services(
                 )
             }) as live::LiveFactory
         })
-    });
+    };
+    let assembly_key = settings.assemblyai_api_key.trim().to_owned();
+    let live_factory: Option<live::LiveFactory> = if assembly_key.is_empty() {
+        openai_live
+    } else {
+        // The key is tried once as the session starts; the service is used
+        // only once it has accepted it, so a wrong key costs nothing.
+        let url = assembly::session_url(assembly::STREAMING_URL, &language);
+        let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (url, key, accepted) = (url.clone(), assembly_key.clone(), Arc::clone(&accepted));
+            let _ = std::thread::Builder::new()
+                .name("copilot-assembly-check".into())
+                .spawn(move || match assembly::check_key(&url, &key) {
+                    Ok(()) => {
+                        tracing::info!("copilot transcribes with AssemblyAI");
+                        accepted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "AssemblyAI did not accept its key; transcribing without it"
+                    ),
+                });
+        }
+        Some(Arc::new(move |speaker, events| match &openai_live {
+            Some(openai) if !accepted.load(std::sync::atomic::Ordering::Relaxed) => {
+                openai(speaker, events)
+            }
+            _ => assembly::spawn(url.clone(), assembly_key.clone(), speaker, events),
+        }) as live::LiveFactory)
+    };
     let transcriber: Transcriber = {
         let chatgpt = Arc::clone(&chatgpt);
         let openai_key = if settings.openai_api_key.trim().is_empty() {

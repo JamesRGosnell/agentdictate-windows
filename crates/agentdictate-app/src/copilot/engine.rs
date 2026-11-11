@@ -1548,6 +1548,23 @@ impl Engine {
         }
     }
 
+    /// What a side has said that is not yet a line of the transcript: the
+    /// text of its commits so far and the words still streaming in.
+    fn unfinished_words(&self, speaker: Speaker) -> String {
+        let lane = &self.live[lane_index(speaker)];
+        if lane.failed() {
+            return String::new();
+        }
+        lane.tags
+            .iter()
+            .filter_map(|tag| lane.texts.get(tag).map(String::as_str))
+            .chain(std::iter::once(lane.partial.as_str()))
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Finishes every waiting transcription whose commits are all back.
     fn resolve_live(&mut self, speaker: Speaker) {
         let lane = &mut self.live[lane_index(speaker)];
@@ -2660,11 +2677,25 @@ impl Engine {
             model: model.clone(),
             automatic,
         });
-        let transcript = render_transcript(
+        let mut transcript = render_transcript(
             &self.transcript,
             &self.roster.names(),
             ANSWER_TRANSCRIPT_CHARS,
         );
+        // Help asked for mid-sentence covers the words still being spoken,
+        // which have no line yet. A detected question is those words.
+        if !matches!(kind, AnswerKind::Detected { .. }) {
+            for (speaker, label) in [(Speaker::Them, "Them"), (Speaker::Me, "Me")] {
+                let words = self.unfinished_words(speaker);
+                if words.is_empty() {
+                    continue;
+                }
+                if !transcript.is_empty() && !transcript.ends_with('\n') {
+                    transcript.push('\n');
+                }
+                transcript.push_str(&format!("{label} (still speaking): {words}\n"));
+            }
+        }
         let knowledge = self.knowledge_for(&kind);
         let brain_query = match &kind {
             AnswerKind::Typed(question) | AnswerKind::Detected { question, .. } => question.clone(),
@@ -2690,6 +2721,7 @@ impl Engine {
         // web search it starts in about a second.
         let instant =
             !catch_up && settings.instant_answers && (fast_model != model || settings.web_search);
+        let instant_racers = self.judges();
         let providers = Arc::clone(&self.services.providers);
         let platform = Arc::clone(&self.services.platform);
         let thread_gate = Arc::clone(&gate);
@@ -2757,42 +2789,77 @@ impl Engine {
                         max_output_tokens: 1024,
                         cache_key: format!("{session_key}-instant"),
                     };
-                    let providers = Arc::clone(&providers);
-                    let gate = Arc::clone(&gate);
-                    let cancel = Arc::clone(&cancel);
-                    let instant_text = Arc::clone(&instant_text);
-                    let _ = std::thread::Builder::new()
-                        .name("copilot-instant".into())
-                        .spawn(move || {
-                            let result = providers(&fast_settings).and_then(|provider| {
-                                let mut first = true;
-                                provider.stream(&request, &cancel, &mut |event| {
-                                    if cancel.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    if let StreamEvent::Text(delta) = event {
-                                        if first {
-                                            first = false;
-                                            tracing::info!(
+                    // On a billed provider the draft is asked for twice and
+                    // the first to produce a word is shown: one slow start
+                    // no longer delays the line.
+                    let request = Arc::new(request);
+                    let fast_settings = Arc::new(fast_settings);
+                    let winner = Arc::new(AtomicUsize::new(0));
+                    let running = Arc::new(AtomicUsize::new(instant_racers));
+                    for racer in 1..=instant_racers {
+                        let providers = Arc::clone(&providers);
+                        let gate = Arc::clone(&gate);
+                        let cancel = Arc::clone(&cancel);
+                        let instant_text = Arc::clone(&instant_text);
+                        let request = Arc::clone(&request);
+                        let fast_settings = Arc::clone(&fast_settings);
+                        let winner = Arc::clone(&winner);
+                        let running = Arc::clone(&running);
+                        let instant_done = instant_done.clone();
+                        // Set when this draft lost the race or the answer
+                        // was cancelled.
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let _ = std::thread::Builder::new()
+                            .name("copilot-instant".into())
+                            .spawn(move || {
+                                let result = providers(&fast_settings).and_then(|provider| {
+                                    provider.stream(&request, &stop, &mut |event| {
+                                        if cancel.load(Ordering::Relaxed) {
+                                            stop.store(true, Ordering::Relaxed);
+                                            return;
+                                        }
+                                        let StreamEvent::Text(delta) = event else {
+                                            return;
+                                        };
+                                        match winner.compare_exchange(
+                                            0,
+                                            racer,
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        ) {
+                                            Ok(_) => tracing::info!(
                                                 answer_id = id,
+                                                racer,
                                                 first_text_ms =
                                                     started.elapsed().as_millis() as u64,
                                                 "copilot instant draft streaming"
-                                            );
+                                            ),
+                                            Err(first) if first != racer => {
+                                                stop.store(true, Ordering::Relaxed);
+                                                return;
+                                            }
+                                            Err(_) => {}
                                         }
                                         if let Ok(mut text) = instant_text.lock() {
                                             text.push_str(&delta);
                                         }
                                         gate.send(CopilotEvent::InstantDelta { id, text: delta });
-                                    }
-                                })
+                                    })
+                                });
+                                let last = running.fetch_sub(1, Ordering::AcqRel) == 1;
+                                let first = winner.load(Ordering::Acquire);
+                                if let Err(error) = result
+                                    && (first == racer || first == 0)
+                                {
+                                    tracing::warn!(%error, "copilot instant draft failed");
+                                }
+                                // The draft shown has ended, or none started.
+                                if first == racer || (last && first == 0) {
+                                    gate.send(CopilotEvent::InstantFinished { id });
+                                    let _ = instant_done.send(());
+                                }
                             });
-                            if let Err(error) = result {
-                                tracing::warn!(%error, "copilot instant draft failed");
-                            }
-                            gate.send(CopilotEvent::InstantFinished { id });
-                            let _ = instant_done.send(());
-                        });
+                    }
                 } else {
                     drop(instant_done);
                 }
@@ -4437,6 +4504,29 @@ mod tests {
     }
 
     #[test]
+    fn help_asked_for_mid_sentence_covers_the_words_still_being_spoken() {
+        let ((mut engine, _incoming, _events, requests, _directory), _sent) = live_harness();
+        engine.handle_live(
+            Speaker::Them,
+            LiveEvent::Partial("So what we really need is a way to".into()),
+        );
+        engine.answer(AnswerKind::Quick(QuickAction::WhatToSay));
+        wait_for_requests(&requests, 1);
+        let asked = requests.lock().unwrap();
+        let request = asked
+            .iter()
+            .find(|request| request.user.contains("<transcript>"))
+            .expect("an answer request");
+        assert!(
+            request
+                .user
+                .contains("Them (still speaking): So what we really need is a way to"),
+            "{}",
+            request.user
+        );
+    }
+
+    #[test]
     fn a_turn_the_service_ended_shows_after_a_short_pause() {
         let ((mut engine, _incoming, events, _requests, _directory), _sent) = live_harness();
         engine.started = Instant::now() - Duration::from_secs(10);
@@ -5154,6 +5244,28 @@ mod tests {
             .filter(|request| request.system == turn_judge_system_prompt())
             .count();
         assert_eq!(judged, RACED_JUDGES);
+        // The instant draft is raced too, and only the first one is shown.
+        let drafted = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.user.ends_with(INSTANT_GUIDANCE))
+            .count();
+        assert_eq!(drafted, RACED_JUDGES);
+        let events = events.lock().unwrap();
+        let shown: String = events
+            .iter()
+            .filter_map(|event| match event {
+                CopilotEvent::InstantDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, "Say: **$20** per seat.");
+        let finished = events
+            .iter()
+            .filter(|event| matches!(event, CopilotEvent::InstantFinished { .. }))
+            .count();
+        assert_eq!(finished, 1);
     }
 
     #[test]

@@ -64,6 +64,37 @@ pub(crate) fn session_url(base: &str, language: &str) -> String {
     url
 }
 
+/// Whether the service accepts `key`: opens a session and ends it as soon
+/// as it begins.
+pub(crate) fn check_key(url: &str, key: &str) -> Result<(), String> {
+    let mut socket = open_socket(url, key).map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    let result = loop {
+        match read_event(&mut socket) {
+            Ok(Some(event)) => match event.get("type").and_then(Value::as_str) {
+                Some("Begin") => break Ok(()),
+                Some("Error") => {
+                    break Err(event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the service refused the session")
+                        .to_owned());
+                }
+                _ => {}
+            },
+            Ok(None) if Instant::now() >= deadline => {
+                break Err("the session did not begin".to_owned());
+            }
+            Ok(None) => {}
+            Err(error) => break Err(error.to_string()),
+        }
+    };
+    // An open session is billed until it is ended.
+    let _ = socket.send(Message::text(json!({"type": "Terminate"}).to_string()));
+    let _ = socket.close(None);
+    result
+}
+
 /// Starts a worker that streams to `url` with `key`.
 pub(crate) fn spawn(url: String, key: String, speaker: Speaker, events: LiveEvents) -> LiveStream {
     let (commands, queue) = mpsc::channel();
@@ -431,6 +462,40 @@ mod tests {
         assert!(session_url(STREAMING_URL, " fr ").ends_with("&language_codes=%5B%22fr%22%5D"));
         // Anything that is not a language code is left out.
         assert!(!session_url(STREAMING_URL, "fr&mode=x").contains("language_codes"));
+    }
+
+    #[test]
+    fn a_key_is_accepted_when_a_session_begins_and_refused_on_an_error() {
+        let serve = |reply: Value| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut ws = tungstenite::accept(tcp).unwrap();
+                ws.send(Message::text(reply.to_string())).unwrap();
+                // The check ends the session it opened.
+                while let Ok(message) = ws.read() {
+                    if message.is_text() {
+                        break;
+                    }
+                }
+            });
+            session_url(&format!("ws://{address}/v3/ws"), "")
+        };
+        assert_eq!(
+            check_key(&serve(json!({"type": "Begin", "id": "s"})), "k"),
+            Ok(())
+        );
+        assert_eq!(
+            check_key(
+                &serve(
+                    json!({"type": "Error", "error": "Unauthorized Connection: Invalid API key"})
+                ),
+                "k"
+            ),
+            Err("Unauthorized Connection: Invalid API key".to_owned())
+        );
     }
 
     #[test]
