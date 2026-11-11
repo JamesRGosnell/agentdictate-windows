@@ -36,7 +36,7 @@ pub(super) struct SettingsPageModel {
 /// Keeps short controls compact while allowing long-form prompts to use the
 /// page width. This is the single sizing policy for Settings controls.
 #[derive(Clone, Copy)]
-enum SettingsControlKind {
+pub(super) enum SettingsControlKind {
     Choice,
     Number,
     Shortcut,
@@ -53,7 +53,7 @@ impl SettingsControlKind {
     }
 }
 
-fn control_slot(selector: &'static str, kind: SettingsControlKind) -> gpui::Div {
+pub(super) fn control_slot(selector: &'static str, kind: SettingsControlKind) -> gpui::Div {
     gpui::div()
         .debug_selector(move || format!("{selector}-control"))
         .w(px(kind.width()))
@@ -704,7 +704,7 @@ fn delivery_storage_section(
     ))
 }
 
-fn settings_section(
+pub(super) fn settings_section(
     selector: &'static str,
     title: &'static str,
     detail: &'static str,
@@ -1059,7 +1059,11 @@ fn toggle_row(
         )
 }
 
-fn setting_label(label: &'static str, detail: &'static str, theme: ThemeTokens) -> gpui::Div {
+pub(super) fn setting_label(
+    label: &'static str,
+    detail: &'static str,
+    theme: ThemeTokens,
+) -> gpui::Div {
     v_flex()
         .min_w(px(220.))
         .flex_1()

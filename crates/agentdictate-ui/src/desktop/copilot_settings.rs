@@ -1,7 +1,8 @@
 //! The Meeting Copilot section of the main window's Settings, so the copilot
-//! can be set up without starting a meeting. Choices save at once; text
-//! saves with its button. A running meeting keeps its settings until the
-//! next one starts.
+//! can be set up without starting a meeting. It shows as a few titled
+//! groups, with rarely changed settings behind a collapsed "Advanced" group.
+//! Choices save at once; text saves with any Save button. A running meeting
+//! keeps its settings until the next one starts.
 
 use std::{cell::RefCell, sync::Arc};
 
@@ -23,7 +24,10 @@ use gpui_component::{
 use crate::ThemeTokens;
 use crate::action::action_button;
 
-use super::{SettingsShell, enabled_label, gpui_color};
+use super::{
+    SettingsShell, enabled_label, gpui_color,
+    settings_page::{SettingsControlKind, control_slot, setting_label, settings_section},
+};
 
 type LoadCopilotSettings = dyn Fn() -> CopilotSettings + Send + Sync;
 type SaveCopilotSettings = dyn Fn(&CopilotSettings) -> Result<(), String> + Send + Sync;
@@ -75,6 +79,8 @@ pub(super) struct CopilotSettingsState {
     /// The answer to it, or why there is none, in Markdown.
     docs_answer: Option<String>,
     docs_asking: bool,
+    /// Whether the rarely changed settings are shown; closed on each open.
+    advanced_open: bool,
     feedback: Option<String>,
 }
 
@@ -156,6 +162,7 @@ impl CopilotSettingsState {
             docs_question: Some(docs_question),
             docs_answer: None,
             docs_asking: false,
+            advanced_open: false,
             feedback: None,
         }
     }
@@ -175,6 +182,7 @@ impl CopilotSettingsState {
             docs_question: self.docs_question.clone()?,
             docs_answer: self.docs_answer.clone(),
             docs_asking: self.docs_asking,
+            advanced_open: self.advanced_open,
             feedback: self.feedback.clone(),
         })
     }
@@ -194,6 +202,7 @@ pub(super) struct CopilotSectionModel {
     docs_question: Entity<InputState>,
     docs_answer: Option<String>,
     docs_asking: bool,
+    advanced_open: bool,
     feedback: Option<String>,
 }
 
@@ -318,6 +327,8 @@ fn models(provider: CopilotProvider, current: &str) -> Vec<ModelChoice> {
     models
 }
 
+/// Builds the copilot's settings as a few titled groups, most-changed first,
+/// with the technical ones behind a collapsed "Advanced" group.
 pub(super) fn section(
     model: CopilotSectionModel,
     theme: ThemeTokens,
@@ -338,6 +349,7 @@ pub(super) fn section(
         docs_question,
         docs_answer,
         docs_asking,
+        advanced_open,
         feedback,
     } = model;
     let provider = settings.provider;
@@ -347,7 +359,7 @@ pub(super) fn section(
         keys.push((
             "copilot-settings-key",
             "Anthropic API key",
-            "Answers with Claude; stored on this computer",
+            "For Claude answers. Stored on this computer.",
             anthropic_key,
             "copilot-settings-save-key",
         ));
@@ -360,9 +372,9 @@ pub(super) fn section(
         },
         "OpenAI API key",
         if provider == CopilotProvider::OpenaiApi {
-            "Answers, transcribes calls and dictation; stored on this computer"
+            "For answers and transcription. Stored on this computer."
         } else {
-            "Transcribes calls and dictation; stored on this computer"
+            "For transcription. Stored on this computer."
         },
         openai_key,
         "copilot-settings-save-openai-key",
@@ -372,10 +384,16 @@ pub(super) fn section(
     keys.push((
         "copilot-settings-assemblyai-key",
         "AssemblyAI API key",
-        "Optional. Transcribes calls faster than OpenAI; from the next meeting",
+        "Optional. Transcribes calls faster than OpenAI.",
         assemblyai_key,
         "copilot-settings-save-assemblyai-key",
     ));
+    let key_rows = keys
+        .into_iter()
+        .map(|(selector, label, detail, input, save)| {
+            input_save_row(selector, label, detail, &input, save, theme, cx)
+        })
+        .collect::<Vec<_>>();
     let answer_model = settings.answer_model();
     let fast_model = settings.fast_model();
 
@@ -505,6 +523,8 @@ pub(super) fn section(
         )
     }));
 
+    // The order fixes each switch's `copilot-settings-toggle-N` selector, so
+    // new switches go at the end; where each one shows is decided below.
     let toggles: [Toggle; 13] = [
         (
             "Answer questions automatically",
@@ -514,25 +534,25 @@ pub(super) fn section(
         ),
         (
             "Instant answers",
-            "A fast draft appears first while a fuller answer follows",
+            "A quick draft shows while the full answer is written",
             settings.instant_answers,
             |s| s.instant_answers = !s.instant_answers,
         ),
         (
             "Search the web",
-            "Fuller answers may look things up",
+            "Full answers can look things up",
             settings.web_search,
             |s| s.web_search = !s.web_search,
         ),
         (
             "Save meeting notes",
-            "Notes and a follow-up email land on the Meetings page",
+            "Notes and a follow-up email go to the Meetings page",
             settings.save_notes,
             |s| s.save_notes = !s.save_notes,
         ),
         (
-            "Open with the dictation shortcut in meetings",
-            "The dictation shortcut starts the copilot during a call",
+            "Open with the dictation shortcut",
+            "During a call, the dictation shortcut opens the copilot",
             settings.launch_from_dictation_hotkey,
             |s| s.launch_from_dictation_hotkey = !s.launch_from_dictation_hotkey,
         ),
@@ -556,7 +576,7 @@ pub(super) fn section(
         ),
         (
             "Open when a meeting starts",
-            "The copilot opens by itself when a call begins, without the shortcut",
+            "No shortcut needed when a call begins",
             settings.auto_start,
             |s| s.auto_start = !s.auto_start,
         ),
@@ -568,139 +588,135 @@ pub(super) fn section(
         ),
         (
             "Live insights",
-            "Rolling topic, checklist, and what you promised",
+            "The topic, a checklist, and what you promised",
             settings.live_insights,
             |s| s.live_insights = !s.live_insights,
         ),
         (
             "Use my screen",
-            "Typed questions include a screenshot; the copilot never appears in it",
+            "Typed questions include a screenshot, without the copilot in it",
             settings.screen_context,
             |s| s.screen_context = !s.screen_context,
         ),
         (
             "Remember past meetings",
-            "Answers and the pre-call brief draw on your earlier meetings",
+            "Answers and the pre-call brief use your earlier meetings",
             settings.use_past_meetings,
             |s| s.use_past_meetings = !s.use_past_meetings,
         ),
     ];
+    let mut index = 0;
+    let [
+        auto_answer,
+        instant_answers,
+        web_search,
+        save_notes,
+        dictation_shortcut,
+        hide_from_sharing,
+        microphone,
+        system_audio,
+        auto_start,
+        compact,
+        live_insights,
+        screen,
+        past_meetings,
+    ] = toggles.map(|toggle| {
+        let row = toggle_row(index, toggle, theme, cx);
+        index += 1;
+        row
+    });
 
-    let mut column = v_flex()
-        .w_full()
-        .debug_selector(|| "settings-group-copilot".to_owned())
-        .child(
-            v_flex()
-                .gap_1()
-                .pb_3()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child("Meeting Copilot"),
-                )
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(gpui_color(theme.text_muted))
-                        .child("How the meeting copilot answers. Applies when your next meeting starts."),
-                ),
-        )
-        .child(chip_row(
-            "Answer engine",
-            provider.detail(),
-            provider_chips,
-            theme,
-        ));
-    for (selector, label, detail, input, save) in keys {
-        column = column.child(
-            row(theme)
-                .debug_selector(move || selector.to_owned())
-                .child(label_block(label, detail, theme))
-                .child(
-                    h_flex()
-                        .w(px(360.))
-                        .max_w(gpui::relative(1.))
-                        .gap_2()
-                        .child(
-                            gpui::div()
-                                .min_w_0()
-                                .flex_1()
-                                .child(Input::new(&input).small()),
-                        )
-                        .child(save_button(save, cx)),
-                ),
-        );
-    }
-    column = column
-        .child(chip_row(
-            "Researched answers",
-            "The model behind full answers",
-            answer_chips,
-            theme,
-        ))
-        .child(chip_row(
-            "Instant answers",
-            "The quick model that drafts first",
-            fast_chips,
-            theme,
-        ))
-        .child(chip_row(
-            "Rewrites",
-            "What rewrites the line to say",
-            rewrite_chips,
-            theme,
-        ))
-        .child(chip_row(
-            "Speed",
-            "How long full answers may think",
-            effort_chips,
-            theme,
-        ))
-        .child(chip_row(
-            "Meeting type",
-            "Shapes answers, the checklist, and the notes",
-            mode_chips,
-            theme,
-        ))
-        .child(text_block(
-            "Goal for your next meeting",
-            "Each part becomes a checklist item that ticks itself off; cleared when the meeting ends",
-            goal,
-            theme,
-        ))
-        .child(chip_row(
-            "Spoken language",
-            "Automatic suits most calls; pick one when names or accents are misheard",
-            language_chips,
-            theme,
-        ))
-        .child(chip_row(
-            "Translate what they say into",
-            "Their lines in another language get a translation in the transcript",
-            translate_chips,
-            theme,
-        ))
-        .child(chip_row(
-            "Brain",
-            "Company knowledge used alongside your knowledge folder",
-            brain_chips,
-            theme,
-        ));
-    for (index, (label, detail, enabled, toggle)) in toggles.into_iter().enumerate() {
-        column = column.child(
-            row(theme).child(label_block(label, detail, theme)).child(
-                action_button(("copilot-settings-toggle", index))
-                    .debug_selector(move || format!("copilot-settings-toggle-{index}"))
-                    .small()
-                    .selected(enabled)
-                    .label(enabled_label(enabled))
-                    .on_click(cx.listener(move |shell, _, _, cx| {
-                        shell.update_copilot(cx, toggle);
-                    })),
-            ),
-        );
-    }
+    let engine = settings_section(
+        "settings-group-copilot-engine",
+        "Meeting Copilot",
+        "Answers questions during your calls. Changes apply when your next meeting starts.",
+        false,
+        theme,
+    )
+    .child(chip_row(
+        "Answer engine",
+        provider.detail(),
+        provider_chips,
+        theme,
+    ))
+    .children(key_rows);
+
+    let answers = settings_section(
+        "settings-group-copilot-answers",
+        "Answers",
+        "When the copilot answers, and which models write the answers.",
+        true,
+        theme,
+    )
+    .child(chip_row(
+        "Meeting type",
+        "Shapes answers, the checklist, and the notes",
+        mode_chips,
+        theme,
+    ))
+    .child(auto_answer)
+    .child(instant_answers)
+    .child(web_search)
+    .child(chip_row(
+        "Full answer model",
+        "Writes the researched answer",
+        answer_chips,
+        theme,
+    ))
+    .child(chip_row(
+        "Instant answer model",
+        "Writes the quick draft",
+        fast_chips,
+        theme,
+    ));
+
+    let during = settings_section(
+        "settings-group-copilot-call",
+        "During the call",
+        "What the copilot hears and what it shows you.",
+        true,
+        theme,
+    )
+    .child(microphone)
+    .child(system_audio)
+    .child(chip_row(
+        "Spoken language",
+        "Pick one if names or accents are misheard",
+        language_chips,
+        theme,
+    ))
+    .child(chip_row(
+        "Translate what they say",
+        "Adds a translation under their lines in the transcript",
+        translate_chips,
+        theme,
+    ))
+    .child(live_insights)
+    .child(screen)
+    .child(compact)
+    .child(hide_from_sharing);
+
+    let around = settings_section(
+        "settings-group-copilot-around",
+        "Before and after the call",
+        "How the copilot opens, your goal, and what it keeps.",
+        true,
+        theme,
+    )
+    .child(auto_start)
+    .child(dictation_shortcut)
+    .child(input_save_row(
+        "copilot-settings-goal",
+        "Goal for your next meeting",
+        "Each part becomes a checklist item; cleared after the meeting",
+        &goal,
+        "copilot-settings-save-goal",
+        theme,
+        cx,
+    ))
+    .child(save_notes)
+    .child(past_meetings);
+
     let asked = docs_answer.map(|answer| {
         let style = TextViewStyle {
             is_dark: true,
@@ -718,114 +734,260 @@ pub(super) fn section(
                     .selectable(true),
             )
     });
-    column
-        .child(
-            v_flex()
-                .w_full()
-                .gap_2()
-                .border_b_1()
-                .border_color(gpui_color(theme.border))
-                .py_3()
-                .child(label_block(
-                    "Ask your documents",
-                    "Try a question before a call: see the answer and which document it comes from",
-                    theme,
-                ))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .child(
-                            gpui::div()
-                                .debug_selector(|| "copilot-settings-docs-question".to_owned())
-                                .min_w_0()
-                                .flex_1()
-                                .child(Input::new(&docs_question).small().w_full()),
-                        )
-                        .child(
-                            action_button("copilot-settings-docs-ask")
-                                .debug_selector(|| "copilot-settings-docs-ask".to_owned())
-                                .small()
-                                .primary()
-                                .label(if docs_asking { "Asking\u{2026}" } else { "Ask" })
-                                .on_click(cx.listener(|shell, _, _, cx| {
-                                    shell.ask_copilot_documents(cx);
-                                })),
-                        ),
-                )
-                .when_some(asked, |column, answer| column.child(answer)),
-        )
-        .child(text_block(
-            "Your name",
-            "When you are only listening and someone says it, the copilot alerts you",
-            user_name,
-            theme,
-        ))
-        .child(text_block(
-            "Calendar",
-            "A private .ics address names the meeting and who is in it before anyone speaks",
-            calendar,
-            theme,
-        ))
-        .child(text_block(
-            "Send finished meetings to",
-            "A webhook for your CRM, Notion, Zapier, or Make; it receives the summary, commitments, and transcript",
-            webhook,
-            theme,
-        ))
-        .child(text_block(
-            "About you",
-            "Background answers can draw on",
-            profile,
-            theme,
-        ))
-        .child(text_block(
-            "Standing instructions",
-            "Applied to every answer",
-            instructions,
-            theme,
-        ))
+    let about = settings_section(
+        "settings-group-copilot-about",
+        "You and your documents",
+        "What answers can draw on.",
+        true,
+        theme,
+    )
+    .child(input_save_row(
+        "copilot-settings-name",
+        "Your name",
+        "Alerts you when someone says it while you only listen",
+        &user_name,
+        "copilot-settings-save-name",
+        theme,
+        cx,
+    ))
+    .child(text_area_block(
+        "About you",
+        "Your role, company, and product",
+        &profile,
+        "copilot-settings-save-text",
+        theme,
+        cx,
+    ))
+    .child(
+        v_flex()
+            .w_full()
+            .gap_2()
+            .border_b_1()
+            .border_color(gpui_color(theme.border))
+            .py_3()
+            .child(setting_label(
+                "Ask your documents",
+                "Try a question and see which document answers it",
+                theme,
+            ))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        gpui::div()
+                            .debug_selector(|| "copilot-settings-docs-question".to_owned())
+                            .min_w_0()
+                            .flex_1()
+                            .child(Input::new(&docs_question).small().w_full()),
+                    )
+                    .child(
+                        action_button("copilot-settings-docs-ask")
+                            .debug_selector(|| "copilot-settings-docs-ask".to_owned())
+                            .small()
+                            .primary()
+                            .label(if docs_asking { "Asking\u{2026}" } else { "Ask" })
+                            .on_click(cx.listener(|shell, _, _, cx| {
+                                shell.ask_copilot_documents(cx);
+                            })),
+                    ),
+            )
+            .when_some(asked, |column, answer| column.child(answer)),
+    );
+
+    let advanced = v_flex()
+        .w_full()
+        .debug_selector(|| "settings-group-copilot-advanced".to_owned())
         .child(
             h_flex()
-                .py_3()
-                .gap_3()
-                .items_center()
-                .child(save_button("copilot-settings-save-text", cx))
-                .when_some(feedback, |row, feedback| {
-                    row.child(
-                        gpui::div()
-                            .debug_selector(|| "copilot-settings-feedback".to_owned())
-                            .text_xs()
-                            .text_color(gpui_color(theme.text_muted))
-                            .child(feedback),
-                    )
-                }),
+                .w_full()
+                .items_start()
+                .justify_between()
+                .gap_6()
+                .pb_3()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_1()
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child("Advanced"),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_xs()
+                                .text_color(gpui_color(theme.text_muted))
+                                .child(
+                                    "Thinking time, rewrites, company knowledge, custom \
+                                     instructions, calendar, and webhook.",
+                                ),
+                        ),
+                )
+                .child(
+                    action_button("copilot-settings-advanced")
+                        .debug_selector(|| "copilot-settings-advanced".to_owned())
+                        .small()
+                        .label(if advanced_open { "Hide" } else { "Show" })
+                        .on_click(cx.listener(|shell, _, _, cx| {
+                            shell.copilot.advanced_open = !shell.copilot.advanced_open;
+                            cx.notify();
+                        })),
+                ),
+        )
+        .when(advanced_open, |group| {
+            group
+                .child(chip_row(
+                    "Thinking time",
+                    "How long full answers may think",
+                    effort_chips,
+                    theme,
+                ))
+                .child(chip_row(
+                    "Rewrite engine",
+                    "Rewrites the line to say when you ask",
+                    rewrite_chips,
+                    theme,
+                ))
+                .child(chip_row(
+                    "Company knowledge",
+                    "Used alongside your knowledge folder",
+                    brain_chips,
+                    theme,
+                ))
+                .child(text_area_block(
+                    "Custom instructions",
+                    "Applied to every answer",
+                    &instructions,
+                    "copilot-settings-save-instructions",
+                    theme,
+                    cx,
+                ))
+                .child(input_save_row(
+                    "copilot-settings-calendar",
+                    "Calendar feed",
+                    "A private .ics address; names the meeting and who attends",
+                    &calendar,
+                    "copilot-settings-save-calendar",
+                    theme,
+                    cx,
+                ))
+                .child(input_save_row(
+                    "copilot-settings-webhook",
+                    "Send finished meetings to",
+                    "A webhook for your CRM, Notion, Zapier, or Make",
+                    &webhook,
+                    "copilot-settings-save-webhook",
+                    theme,
+                    cx,
+                ))
+        });
+
+    v_flex()
+        .w_full()
+        .gap_6()
+        .debug_selector(|| "settings-group-copilot".to_owned())
+        .child(engine)
+        .child(answers)
+        .child(during)
+        .child(around)
+        .child(about)
+        .child(advanced)
+        .when_some(feedback, |column, feedback| {
+            column.child(
+                gpui::div()
+                    .debug_selector(|| "copilot-settings-feedback".to_owned())
+                    .text_xs()
+                    .text_color(gpui_color(theme.text_muted))
+                    .child(feedback),
+            )
+        })
+}
+
+/// A switch row, laid out like the page's other switches.
+fn toggle_row(
+    index: usize,
+    (label, detail, enabled, toggle): Toggle,
+    theme: ThemeTokens,
+    cx: &mut Context<SettingsShell>,
+) -> gpui::Div {
+    h_flex()
+        .min_h(px(52.))
+        .justify_between()
+        .gap_6()
+        .border_b_1()
+        .border_color(gpui_color(theme.border))
+        .py_2()
+        .child(setting_label(label, detail, theme))
+        .child(
+            action_button(("copilot-settings-toggle", index))
+                .debug_selector(move || format!("copilot-settings-toggle-{index}"))
+                .small()
+                .selected(enabled)
+                .label(enabled_label(enabled))
+                .on_click(cx.listener(move |shell, _, _, cx| {
+                    shell.update_copilot(cx, toggle);
+                })),
         )
 }
 
-fn row(theme: ThemeTokens) -> gpui::Div {
+/// A one-line field with its own Save, laid out like the page's API key row.
+fn input_save_row(
+    selector: &'static str,
+    label: &'static str,
+    detail: &'static str,
+    input: &Entity<InputState>,
+    save: &'static str,
+    theme: ThemeTokens,
+    cx: &mut Context<SettingsShell>,
+) -> gpui::Div {
     h_flex()
-        .min_h(px(52.))
+        .debug_selector(move || selector.to_owned())
+        .min_h(px(54.))
+        .items_start()
         .flex_wrap()
         .justify_between()
         .gap_6()
         .border_b_1()
         .border_color(gpui_color(theme.border))
         .py_2()
+        .child(setting_label(label, detail, theme))
+        .child(
+            control_slot(selector, SettingsControlKind::Credential)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    gpui::div()
+                        .min_w_0()
+                        .flex_1()
+                        .child(Input::new(input).small()),
+                )
+                .child(save_button(save, cx)),
+        )
 }
 
-fn label_block(label: &'static str, detail: &'static str, theme: ThemeTokens) -> gpui::Div {
+/// A multi-line field across the page width, with its Save underneath.
+fn text_area_block(
+    label: &'static str,
+    detail: &'static str,
+    input: &Entity<InputState>,
+    save: &'static str,
+    theme: ThemeTokens,
+    cx: &mut Context<SettingsShell>,
+) -> gpui::Div {
     v_flex()
-        .min_w(px(220.))
-        .flex_1()
-        .gap_0p5()
-        .child(gpui::div().text_sm().child(label))
-        .child(
-            gpui::div()
-                .text_xs()
-                .text_color(gpui_color(theme.text_muted))
-                .child(detail),
-        )
+        .w_full()
+        .gap_2()
+        .border_b_1()
+        .border_color(gpui_color(theme.border))
+        .py_3()
+        .child(setting_label(label, detail, theme))
+        .child(Input::new(input).small().w_full())
+        .child(h_flex().justify_end().child(save_button(save, cx)))
 }
 
 fn chip_row(
@@ -840,24 +1002,8 @@ fn chip_row(
         .border_b_1()
         .border_color(gpui_color(theme.border))
         .py_3()
-        .child(label_block(label, detail, theme))
+        .child(setting_label(label, detail, theme))
         .child(h_flex().flex_wrap().gap_2().children(chips))
-}
-
-fn text_block(
-    label: &'static str,
-    detail: &'static str,
-    input: Entity<InputState>,
-    theme: ThemeTokens,
-) -> gpui::Div {
-    v_flex()
-        .w_full()
-        .gap_2()
-        .border_b_1()
-        .border_color(gpui_color(theme.border))
-        .py_3()
-        .child(label_block(label, detail, theme))
-        .child(Input::new(&input).small().w_full())
 }
 
 fn chip(
@@ -879,6 +1025,7 @@ fn chip(
         }))
 }
 
+/// Every Save stores all of the copilot's text fields at once.
 fn save_button(
     selector: &'static str,
     cx: &mut Context<SettingsShell>,

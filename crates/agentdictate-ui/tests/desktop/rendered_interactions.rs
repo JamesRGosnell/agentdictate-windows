@@ -2065,6 +2065,10 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
     harness.scroll_route_by(-(f32::from(top) - 300.));
     harness.click("copilot-settings-toggle-0");
     assert_eq!(saved.lock().unwrap().auto_answer, !auto_answer);
+    // Rarely changed settings wait behind a closed "Advanced" group.
+    assert!(!harness.has("copilot-settings-effort-0"));
+    harness.scroll_to("copilot-settings-advanced");
+    harness.click("copilot-settings-advanced");
     // What the in-call sheet offers is here too.
     for selector in [
         "copilot-settings-brain-0",
