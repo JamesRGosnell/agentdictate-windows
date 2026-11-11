@@ -291,7 +291,7 @@ the next meeting. Its model judges from the words that a speaker has finished,
 a fraction of a second after they stop, so a question reaches the copilot
 sooner than when a fixed pause has to pass. The copilot then shows its answer
 after a shorter pause. Open sessions are billed by AssemblyAI by the minute;
-the copilot closes them after 45 seconds of quiet. If the service fails,
+the copilot closes them after ten minutes of quiet. If the service fails,
 speech is uploaded at each pause as before.
 
 **Speed** sets how much the researched model reasons before answering. Fast is

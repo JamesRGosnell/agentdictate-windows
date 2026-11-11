@@ -1243,6 +1243,15 @@ pub(crate) fn bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize>
     };
     let lane = |model: &str| -> Result<(Box<dyn providers::AnswerProvider>, String), String> {
         let model = model.split_once('@').map_or(model, |(model, _)| model);
+        // "openrouter:qwen/qwen3.8-27b" runs a model on OpenRouter with the
+        // OpenRouter key saved in the AssemblyAI field.
+        if let Some(model) = model.strip_prefix("openrouter:") {
+            let key = settings.assemblyai_api_key.trim();
+            if !key.starts_with(providers::OPENROUTER_KEY_PREFIX) {
+                return Err("no OpenRouter key is saved".to_owned());
+            }
+            return Ok((providers::openrouter_provider(key), model.to_owned()));
+        }
         let mut lane = settings.clone();
         let model = if let Some(model) = model.strip_prefix("claude:") {
             lane.provider = CopilotProvider::ClaudeCode;

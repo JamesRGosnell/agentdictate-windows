@@ -33,9 +33,10 @@ const UNHEARD_WAIT: Duration = Duration::from_millis(600);
 /// Audio sent since the last turn ended that may hold words not yet
 /// reported: less than this is the silence that ended the turn.
 const UNHEARD_AUDIO: Duration = Duration::from_millis(700);
-/// Quiet after which the session is closed until speech resumes; an open
-/// session is billed by the minute.
-const IDLE_CLOSE: Duration = Duration::from_secs(45);
+/// Quiet after which the session is closed until speech resumes. An open
+/// session is billed by the minute, but reopening one costs the first words
+/// of whoever speaks next, so only a long silence closes it.
+const IDLE_CLOSE: Duration = Duration::from_secs(600);
 /// How often the worker checks for server events while connected.
 const POLL: Duration = Duration::from_millis(20);
 /// 16 kHz, 16-bit mono.

@@ -510,6 +510,11 @@ impl AnswerProvider for ResponsesProvider {
         let ResponsesAuth::ApiKey(key) = &self.auth else {
             return None;
         };
+        // Only OpenAI's own API has the service; a key for another host
+        // never goes there.
+        if self.endpoint != OPENAI_RESPONSES_ENDPOINT {
+            return None;
+        }
         if DECISIONS_UNAVAILABLE.load(Ordering::Relaxed) {
             return None;
         }
@@ -922,6 +927,22 @@ pub(crate) fn transcribe_wav_with_openai(
         .trim()
         .to_owned())
 }
+
+/// OpenRouter's Responses endpoint, which reaches models from many hosts.
+const OPENROUTER_RESPONSES_ENDPOINT: &str = "https://openrouter.ai/api/v1/responses";
+
+/// Answers from a model on OpenRouter, for comparing models' speed.
+pub(crate) fn openrouter_provider(key: &str) -> Box<dyn AnswerProvider> {
+    Box::new(ResponsesProvider {
+        client: http_client(),
+        endpoint: OPENROUTER_RESPONSES_ENDPOINT,
+        auth: ResponsesAuth::ApiKey(key.to_owned()),
+        fallback_models: Vec::new(),
+    })
+}
+
+/// The prefix of an OpenRouter API key.
+pub(crate) const OPENROUTER_KEY_PREFIX: &str = "sk-or-";
 
 /// Collects a whole non-interactive answer (insights, notes).
 pub(crate) fn complete(

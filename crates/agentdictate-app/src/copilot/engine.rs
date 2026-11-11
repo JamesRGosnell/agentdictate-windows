@@ -1003,6 +1003,7 @@ impl Engine {
                     // Without a verdict, the wording decides.
                     turn.verdict = Some(respond.unwrap_or(turn.likely));
                 }
+                self.draft_confirmed_turn();
                 self.evaluate_turn();
             }
             EngineMsg::Hotkey(HotkeyCommand::Assist) => {
@@ -2497,6 +2498,39 @@ impl Engine {
             return;
         }
         self.maybe_auto_answer(turn.text);
+    }
+
+    /// Starts the hidden draft of a turn the judge has confirmed and that
+    /// was not worded plainly enough to be drafted on sight, so its answer
+    /// is under way while the pause, or the final line, is still awaited.
+    fn draft_confirmed_turn(&mut self) {
+        let Some((id, question)) = self
+            .pending_turn
+            .as_ref()
+            .filter(|turn| turn.verdict == Some(true) && turn.draft.is_none())
+            .map(|turn| (turn.id, turn.text.clone()))
+        else {
+            return;
+        };
+        if !self.may_auto_answer(&question) {
+            return;
+        }
+        let draft = self
+            .answer_with(
+                AnswerKind::Detected {
+                    question,
+                    automatic: true,
+                },
+                true,
+            )
+            .map(|(id, gate)| Draft {
+                id,
+                gate,
+                finished: None,
+            });
+        if let Some(turn) = self.pending_turn.as_mut().filter(|turn| turn.id == id) {
+            turn.draft = draft;
+        }
     }
 
     /// Shows the answer drafted from a question's partial words.
@@ -4523,6 +4557,39 @@ mod tests {
                 .contains("Them (still speaking): So what we really need is a way to"),
             "{}",
             request.user
+        );
+    }
+
+    #[test]
+    fn a_request_the_judge_confirms_is_drafted_before_its_final_line() {
+        let ((mut engine, _incoming, events, _requests, _directory), _sent) = live_harness();
+        // Not worded as a question, so nothing is drafted on sight.
+        engine.handle_live(
+            Speaker::Them,
+            LiveEvent::TurnEnded(
+                "I'd love to hear how you would approach onboarding a new team.".into(),
+            ),
+        );
+        let turn = engine.pending_turn.as_ref().expect("a turn to judge");
+        assert!(turn.draft.is_none());
+        let id = turn.id;
+        engine.handle(EngineMsg::TurnVerdict {
+            id,
+            respond: Some(true),
+        });
+        // Drafted now, and still hidden.
+        assert!(
+            engine
+                .pending_turn
+                .as_ref()
+                .is_some_and(|turn| turn.draft.is_some())
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, CopilotEvent::AnswerStarted { .. }))
         );
     }
 
