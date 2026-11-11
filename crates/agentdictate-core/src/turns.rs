@@ -19,6 +19,10 @@ pub const QUESTION_PAUSE_MS: u64 = 700;
 /// second after they are spoken.
 pub const CONFIDENT_QUESTION_PAUSE_MS: u64 = QUESTION_PAUSE_MS;
 
+/// Quiet after a turn the transcription service judged complete from its
+/// words: that judgment and the pause together confirm it.
+pub const ENDED_TURN_PAUSE_MS: u64 = 300;
+
 /// How long the other side must stay quiet after `line` before an answer to
 /// it is shown.
 #[must_use]

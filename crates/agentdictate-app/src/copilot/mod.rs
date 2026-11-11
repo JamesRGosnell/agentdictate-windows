@@ -11,6 +11,7 @@
 #[cfg(windows)]
 mod answer_eval;
 mod ask;
+mod assembly;
 mod brain;
 mod calendar;
 #[cfg(windows)]
@@ -455,9 +456,21 @@ fn session_services(
     }
     let known_chatgpt_models: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // An OpenAI API key streams speech as it is spoken; without one, or if
-    // the stream fails, speech is uploaded at each pause.
-    let live_factory: Option<live::LiveFactory> = {
+    // An AssemblyAI key streams speech to its service, which also judges
+    // when a speaker has finished; otherwise an OpenAI API key streams it.
+    // Without either, or if the stream fails, speech is uploaded at each
+    // pause.
+    let assembly_key = settings.assemblyai_api_key.trim().to_owned();
+    let live_factory: Option<live::LiveFactory> = if assembly_key.is_empty() {
+        None
+    } else {
+        let url = assembly::session_url(assembly::STREAMING_URL, &language);
+        tracing::info!("copilot transcribes with AssemblyAI");
+        Some(Arc::new(move |speaker, events| {
+            assembly::spawn(url.clone(), assembly_key.clone(), speaker, events)
+        }) as live::LiveFactory)
+    };
+    let live_factory: Option<live::LiveFactory> = live_factory.or_else(|| {
         let key = if settings.openai_api_key.trim().is_empty() {
             dictation_openai_key.clone()
         } else {
@@ -475,7 +488,7 @@ fn session_services(
                 )
             }) as live::LiveFactory
         })
-    };
+    });
     let transcriber: Transcriber = {
         let chatgpt = Arc::clone(&chatgpt);
         let openai_key = if settings.openai_api_key.trim().is_empty() {

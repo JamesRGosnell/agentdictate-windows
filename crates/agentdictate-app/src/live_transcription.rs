@@ -121,10 +121,25 @@ pub(crate) fn connect_realtime(
     key: &str,
     transcription: Value,
 ) -> anyhow::Result<RealtimeSocket> {
+    let mut socket = open_socket(url, &format!("Bearer {key}"))?;
+    socket.send(Message::text(
+        json!({"type":"session.update","session":{"type":"transcription","audio":{"input":{
+            "format":{"type":"audio/pcm","rate":24000}, "turn_detection":null,
+            "transcription":transcription
+        }}}})
+        .to_string(),
+    ))?;
+    Ok(socket)
+}
+
+/// Opens a WebSocket to `url`, sending `authorization` as that header.
+/// Reads time out after 40 ms so the caller can interleave sending and
+/// reading.
+pub(crate) fn open_socket(url: &str, authorization: &str) -> anyhow::Result<RealtimeSocket> {
     let mut request = url.into_client_request()?;
     request
         .headers_mut()
-        .insert("Authorization", format!("Bearer {key}").parse()?);
+        .insert("Authorization", authorization.parse()?);
     let host = request
         .uri()
         .host()
@@ -151,13 +166,6 @@ pub(crate) fn connect_realtime(
         _ => anyhow::bail!("unsupported transport"),
     };
     tcp.set_read_timeout(Some(Duration::from_millis(40)))?;
-    socket.send(Message::text(
-        json!({"type":"session.update","session":{"type":"transcription","audio":{"input":{
-            "format":{"type":"audio/pcm","rate":24000}, "turn_detection":null,
-            "transcription":transcription
-        }}}})
-        .to_string(),
-    ))?;
     Ok(socket)
 }
 

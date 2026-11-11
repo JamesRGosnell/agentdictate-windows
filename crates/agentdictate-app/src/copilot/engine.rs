@@ -32,6 +32,8 @@ use agentdictate_core::{
     turn_likely_question, typed_note, typed_question_instruction, utterance_similarity,
 };
 
+use agentdictate_core::ENDED_TURN_PAUSE_MS;
+
 use super::{
     knowledge::{Knowledge, fingerprint},
     live::{LiveCommand, LiveEvent, LiveFactory, LiveStream},
@@ -468,6 +470,19 @@ struct PendingTurn {
     /// Started from words still being heard; waits for the line to be
     /// final before it can be shown, and is redone if the line changed.
     awaiting_final: bool,
+    /// The transcription service judged the turn complete from its words.
+    ended: bool,
+}
+
+impl PendingTurn {
+    /// Quiet the other side must keep before the answer shows.
+    fn pause_ms(&self) -> u64 {
+        if self.ended {
+            ENDED_TURN_PAUSE_MS
+        } else {
+            question_pause_ms(&self.text)
+        }
+    }
 }
 
 /// An answer drafted ahead of the verdict, hidden until confirmed.
@@ -1504,6 +1519,26 @@ impl Engine {
                     self.consider_partial_turn(&text);
                 }
             }
+            LiveEvent::TurnEnded(text) => {
+                if lane.failed() {
+                    return;
+                }
+                lane.partial = text;
+                let mut shown: Vec<&str> = lane
+                    .tags
+                    .iter()
+                    .filter_map(|tag| lane.texts.get(tag).map(String::as_str))
+                    .collect();
+                shown.push(&lane.partial);
+                let text = shown.join(" ").trim().to_owned();
+                (self.ui)(CopilotEvent::PartialTranscript {
+                    speaker,
+                    text: text.clone(),
+                });
+                if speaker == Speaker::Them {
+                    self.consider_ended_turn(&text);
+                }
+            }
             LiveEvent::Committed { tag, text } => {
                 lane.partial.clear();
                 lane.texts.insert(tag, text);
@@ -2190,6 +2225,29 @@ impl Engine {
         self.start_turn(text.to_owned(), 0, None, true);
     }
 
+    /// Judges and drafts a turn the transcription service has judged
+    /// complete, without waiting for the engine's own pause to end it.
+    fn consider_ended_turn(&mut self, text: &str) {
+        let text = text.trim();
+        if !self.may_consider_turn(text) {
+            return;
+        }
+        if let Some(turn) = self
+            .pending_turn
+            .as_mut()
+            .filter(|turn| turn.awaiting_final && same_question(&turn.text, text))
+        {
+            turn.ended = true;
+            self.evaluate_turn();
+            return;
+        }
+        tracing::info!("judging a turn the transcription service ended");
+        self.start_turn(text.to_owned(), 0, None, true);
+        if let Some(turn) = self.pending_turn.as_mut() {
+            turn.ended = true;
+        }
+    }
+
     fn start_turn(&mut self, text: String, end_ms: u64, voice: Option<u8>, awaiting_final: bool) {
         self.drop_turn();
         let id = self.next_turn;
@@ -2222,6 +2280,7 @@ impl Engine {
             draft,
             heard: Instant::now(),
             awaiting_final,
+            ended: false,
         });
     }
 
@@ -2320,7 +2379,7 @@ impl Engine {
             .filter(|turn| turn.awaiting_final)
         {
             return self.them_pause.map_or(IDLE_TICK, |ended| {
-                let left = (ended + question_pause_ms(&turn.text))
+                let left = (ended + turn.pause_ms())
                     .saturating_sub(self.elapsed_ms())
                     .max(1);
                 IDLE_TICK.min(Duration::from_millis(left))
@@ -2359,7 +2418,7 @@ impl Engine {
             // final line.
             let paused = self
                 .them_pause
-                .is_some_and(|ended| self.elapsed_ms() >= ended + question_pause_ms(&turn.text));
+                .is_some_and(|ended| self.elapsed_ms() >= ended + turn.pause_ms());
             if paused && turn.verdict == Some(true) && turn.draft.is_some() {
                 self.reveal_partial_turn();
             }
@@ -4378,6 +4437,58 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_the_service_ended_shows_after_a_short_pause() {
+        let ((mut engine, _incoming, events, _requests, _directory), _sent) = live_harness();
+        engine.started = Instant::now() - Duration::from_secs(10);
+        let question = "What does pricing look like for us?";
+        engine.handle_live(Speaker::Them, LiveEvent::TurnEnded(question.into()));
+        let shown = |events: &Arc<Mutex<Vec<CopilotEvent>>>| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, CopilotEvent::AnswerStarted { .. }))
+        };
+        // The words show as partial text until the engine's own commit.
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            CopilotEvent::PartialTranscript { speaker: Speaker::Them, text } if text == question
+        )));
+        let turn = engine.pending_turn.as_mut().unwrap();
+        assert!(turn.ended && turn.awaiting_final && turn.draft.is_some());
+        assert!(turn.pause_ms() < question_pause_ms(question));
+        turn.verdict = Some(true);
+        // Still inside even the short pause.
+        engine.them_pause = Some(engine.elapsed_ms() - ENDED_TURN_PAUSE_MS + 150);
+        engine.evaluate_turn();
+        assert!(!shown(&events));
+        // Past it, well before a pause alone would confirm the line.
+        engine.them_pause = Some(engine.elapsed_ms() - ENDED_TURN_PAUSE_MS - 50);
+        engine.evaluate_turn();
+        assert!(shown(&events));
+        assert!(engine.pending_turn.is_none());
+    }
+
+    #[test]
+    fn a_turn_ended_by_the_service_marks_the_partial_question_already_judged() {
+        let ((mut engine, _incoming, _events, requests, _directory), _sent) = live_harness();
+        let question = "What does pricing look like for us?";
+        engine.handle_live(Speaker::Them, LiveEvent::Partial(question.into()));
+        let early = engine.pending_turn.as_ref().unwrap().id;
+        engine.handle_live(Speaker::Them, LiveEvent::TurnEnded(question.into()));
+        let turn = engine.pending_turn.as_ref().unwrap();
+        assert_eq!(turn.id, early, "judged once");
+        assert!(turn.ended);
+        let judged = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.system == turn_judge_system_prompt())
+            .count();
+        assert!(judged <= 1);
+    }
+
+    #[test]
     fn a_partial_question_the_judge_has_not_confirmed_stays_hidden() {
         let ((mut engine, _incoming, events, _requests, _directory), _sent) = live_harness();
         engine.started = Instant::now() - Duration::from_secs(10);
@@ -4462,6 +4573,7 @@ mod tests {
             draft: None,
             heard: Instant::now(),
             awaiting_final: false,
+            ended: false,
         });
         assert!(engine.next_wait() <= Duration::from_millis(20));
         engine.them_speaking = true;
@@ -4689,6 +4801,7 @@ mod tests {
                 draft: None,
                 heard: Instant::now() - Duration::from_millis(1_600),
                 awaiting_final: false,
+                ended: false,
             });
             engine.evaluate_turn();
         };

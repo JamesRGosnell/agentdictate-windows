@@ -63,6 +63,7 @@ pub(super) struct CopilotSettingsState {
     settings: Option<CopilotSettings>,
     openai_key: Option<Entity<InputState>>,
     anthropic_key: Option<Entity<InputState>>,
+    assemblyai_key: Option<Entity<InputState>>,
     profile: Option<Entity<InputState>>,
     instructions: Option<Entity<InputState>>,
     goal: Option<Entity<InputState>>,
@@ -95,6 +96,12 @@ impl CopilotSettingsState {
                 .placeholder("sk-ant-\u{2026}")
                 .masked(true)
                 .default_value(settings.anthropic_api_key.clone())
+        });
+        let assemblyai_key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("AssemblyAI key")
+                .masked(true)
+                .default_value(settings.assemblyai_api_key.clone())
         });
         let profile = cx.new(|cx| {
             InputState::new(window, cx)
@@ -139,6 +146,7 @@ impl CopilotSettingsState {
             settings: Some(settings),
             openai_key: Some(openai_key),
             anthropic_key: Some(anthropic_key),
+            assemblyai_key: Some(assemblyai_key),
             profile: Some(profile),
             instructions: Some(instructions),
             goal: Some(goal),
@@ -157,6 +165,7 @@ impl CopilotSettingsState {
             settings: self.settings.clone()?,
             openai_key: self.openai_key.clone()?,
             anthropic_key: self.anthropic_key.clone()?,
+            assemblyai_key: self.assemblyai_key.clone()?,
             profile: self.profile.clone()?,
             instructions: self.instructions.clone()?,
             goal: self.goal.clone()?,
@@ -175,6 +184,7 @@ pub(super) struct CopilotSectionModel {
     settings: CopilotSettings,
     openai_key: Entity<InputState>,
     anthropic_key: Entity<InputState>,
+    assemblyai_key: Entity<InputState>,
     profile: Entity<InputState>,
     instructions: Entity<InputState>,
     goal: Entity<InputState>,
@@ -211,6 +221,7 @@ impl SettingsShell {
         };
         let openai = read(&self.copilot.openai_key, cx);
         let anthropic = read(&self.copilot.anthropic_key, cx);
+        let assemblyai = read(&self.copilot.assemblyai_key, cx);
         let profile = read(&self.copilot.profile, cx);
         let instructions = read(&self.copilot.instructions, cx);
         let goal = read(&self.copilot.goal, cx);
@@ -235,6 +246,9 @@ impl SettingsShell {
             }
             if let Some(key) = anthropic {
                 settings.anthropic_api_key = key;
+            }
+            if let Some(key) = assemblyai {
+                settings.assemblyai_api_key = key;
             }
             if let Some(profile) = profile {
                 settings.profile = profile;
@@ -314,6 +328,7 @@ pub(super) fn section(
         settings,
         openai_key,
         anthropic_key,
+        assemblyai_key,
         profile,
         instructions,
         goal,
@@ -351,6 +366,15 @@ pub(super) fn section(
         },
         openai_key,
         "copilot-settings-save-openai-key",
+    ));
+    // Optional: its model ends a speaker's turn sooner, so answers start
+    // sooner.
+    keys.push((
+        "copilot-settings-assemblyai-key",
+        "AssemblyAI API key",
+        "Optional. Transcribes calls faster than OpenAI; from the next meeting",
+        assemblyai_key,
+        "copilot-settings-save-assemblyai-key",
     ));
     let answer_model = settings.answer_model();
     let fast_model = settings.fast_model();

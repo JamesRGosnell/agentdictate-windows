@@ -610,6 +610,10 @@ pub struct CopilotSettings {
     pub custom_instructions: String,
     pub anthropic_api_key: String,
     pub openai_api_key: String,
+    /// Transcribes calls with AssemblyAI when set: its model ends a
+    /// speaker's turn sooner than a fixed pause can.
+    #[serde(default)]
+    pub assemblyai_api_key: String,
     pub save_notes: bool,
     /// Answers may draw on notes from earlier meetings.
     pub use_past_meetings: bool,
@@ -663,6 +667,7 @@ impl Default for CopilotSettings {
             custom_instructions: String::new(),
             anthropic_api_key: String::new(),
             openai_api_key: String::new(),
+            assemblyai_api_key: String::new(),
             save_notes: true,
             use_past_meetings: true,
             onboarded: false,
@@ -720,6 +725,9 @@ impl CopilotSettings {
         }
         if !copy.openai_api_key.is_empty() {
             copy.openai_api_key = "<set>".into();
+        }
+        if !copy.assemblyai_api_key.is_empty() {
+            copy.assemblyai_api_key = "<set>".into();
         }
         // Both addresses carry a secret in their path.
         if !copy.webhook_url.is_empty() {

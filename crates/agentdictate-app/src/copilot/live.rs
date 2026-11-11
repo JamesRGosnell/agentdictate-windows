@@ -49,6 +49,9 @@ pub(crate) enum LiveCommand {
 pub(crate) enum LiveEvent {
     /// Text so far for speech not yet transcribed in full.
     Partial(String),
+    /// The service judged the speaker's turn complete: the text since the
+    /// last commit, final. Only services that detect turns report it.
+    TurnEnded(String),
     Committed {
         tag: u64,
         text: String,

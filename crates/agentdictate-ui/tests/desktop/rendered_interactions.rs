@@ -2047,6 +2047,8 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
     // The OpenAI key transcribes the call whatever engine answers.
     assert!(harness.has("copilot-settings-openai-key"));
     assert!(!harness.has("copilot-settings-key"));
+    // AssemblyAI can transcribe the call in OpenAI's place.
+    assert!(harness.has("copilot-settings-assemblyai-key"));
     let top = harness.bounds("copilot-settings-provider-3").top();
     harness.scroll_route_by(-(f32::from(top) - 300.));
     // OpenAI API is the fourth engine; choosing it saves at once and asks
