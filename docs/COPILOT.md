@@ -12,14 +12,40 @@ web when facts matter, and stays invisible to screen sharing.
   dictates as usual, so you can still dictate into the meeting chat.
 - **From the tray**, choose **Meeting Copilot**.
 - **From a terminal**, run `agentdictate copilot`.
-- **By itself**, when you turn on **Open when a meeting starts**. The copilot
-  then opens as a call begins. If you end it during that call, it stays closed
-  for the rest of the call.
+- **By itself**, when **Opens** is set to **By itself when a call starts**.
+  The copilot then opens as a call begins. If you end it during that call, it
+  stays closed for the rest of the call; the dictation shortcut still reopens
+  it.
 
 A meeting is detected when a call app or browser (Zoom, Teams, Meet, Webex,
 Slack, Discord, and others) is using the microphone, or when a meeting window
-is open. Turn this off with **Open with the dictation shortcut in meetings** in
-the copilot settings.
+is open. **Opens** in Settings, under Meeting Copilot, chooses between **With
+my dictation shortcut in calls** (the default), **By itself when a call
+starts**, and **Only from the tray**, where the shortcut always dictates.
+
+## Settings
+
+The copilot's settings are in the AgentDictate window's **Settings**, under
+**Meeting Copilot**. Seven are shown: **When to answer**, the **Answer
+engine** with the key it needs (the OpenAI key is always offered, since it
+also transcribes), **Meeting type**, **Opens**, **Save meeting notes**, **Your
+name**, and **About you**. Everything else waits behind **Advanced**, which
+starts closed, in four parts:
+
+- **Answers:** Instant answers, Search the web, the full and instant answer
+  models, Thinking time, the rewrite engine, and Custom instructions.
+- **Audio and language:** Spoken language, Translate what they say, and
+  **Don't transcribe my side**, which stops transcribing your microphone. The
+  other side is always heard.
+- **Privacy and screen:** Hide from screen sharing, Use my screen, Live
+  insights, and Remember past meetings.
+- **Connections:** the AssemblyAI key, the calendar feed, the webhook, Company
+  knowledge, and, when that is Leadlord, its setup.
+
+**Ask your documents** comes last under Advanced. During a call, the sliders
+button on the bar opens a short sheet with **When to answer**, **Goal for this
+meeting**, **Meeting type**, **Spoken language**, **Open knowledge folder**,
+and **More settings**, which opens the AgentDictate window's Settings.
 
 The copilot appears as a small bar at the top center of the primary monitor.
 Drag any empty part of the bar to move it; it stays where you put it, in this
@@ -75,8 +101,15 @@ does not reach other apps, including chat apps that use it to send.
   questions they answer themselves, remarks to someone else, and advice do
   not. A question is drafted the moment it is transcribed, while it is being
   judged, and shown only once confirmed; a rejected draft is discarded unseen,
-  so checking adds almost no delay. Turn this off with **Answer questions
-  automatically**.
+  so checking adds almost no delay.
+- **When to answer.** The first choice in the copilot's settings, both in the
+  AgentDictate window's Settings under Meeting Copilot and at the top of the
+  in-call settings sheet. **Automatically** answers as described above.
+  **When I ask** shows an answer only when you press <kbd>Ctrl</kbd> +
+  <kbd>Enter</kbd> or **Ask AI**; it is the fastest way to an answer, because
+  nothing waits for the other side to stop talking, and the bar tints **Ask
+  AI** to show the mode. Transcript, insights, and notes work the same in
+  both.
 - **Live insights.** The current topic, a short summary, any unanswered
   question directed at you as a card you can click to answer, and suggested
   prompts. Insights also tell a conversation you take part in from a
@@ -106,12 +139,12 @@ does not reach other apps, including chat apps that use it to send.
 - **Several answers at once.** A new answer no longer stops the one being
   written: the earlier one keeps streaming just below it, so the first half of
   a two-part question is not lost.
-- **Compact panel.** The **−** button on the bar, or **Compact panel** in
-  settings, shows only the line to say. **Show everything** brings the full
+- **Compact panel.** The **−** button on the bar shows only the line to say,
+  and the copilot remembers it. **Show everything** brings the full
   panel back.
 - **Goal and checklist.** Each meeting type has a short checklist (a sales
   call: their problem, budget, decision maker, timeline, next step). Type a
-  **Goal for this meeting** in settings, such as "get a second meeting, ask
+  **Goal for this meeting** in the in-call settings sheet, such as "get a second meeting, ask
   about budget", and each part joins the list. Items tick themselves off as
   the conversation covers them. The goal is cleared when the meeting ends.
 - **You promised.** When you commit to something ("I'll send that Friday"),
@@ -127,10 +160,12 @@ does not reach other apps, including chat apps that use it to send.
 - **Before you start.** Once the copilot knows who is on the call, from a
   name in the conversation or your calendar, it shows the last meeting with
   them and what you still owe them.
-- **Calendar.** Paste a private `.ics` address into **Calendar** (Outlook:
+- **Calendar.** Paste a private `.ics` address into **Calendar feed**, under
+  Advanced, Connections (Outlook:
   Settings, Calendar, Shared calendars, Publish a calendar). The meeting under
   way then names the notes and offers its guests as names for the voices.
-- **Translation.** Choose a language under **Translate what they say into**.
+- **Translation.** Choose a language under **Translate what they say**, in
+  Advanced, Audio and language.
   Lines in another language get a translation under them in the transcript,
   and the line to say comes with its meaning. **Spoken language** fixes the
   language transcription expects; it applies from the next meeting.
@@ -172,7 +207,8 @@ the chevron. While collapsed, new answers reopen it.
 
 ## Your knowledge
 
-Choose **Brain** in copilot settings: **Personal HQ**, **Leadlord**, or **None**.
+Choose **Company knowledge** in Settings, under Meeting Copilot, Advanced,
+Connections: **Personal HQ**, **Leadlord**, or **None**.
 With a brain selected, each answer reads up to two relevant live pages, retaining
 their source and revision. Both the instant and researched answers receive those
 excerpts, alongside your own documents. The separate **Remember past
@@ -180,7 +216,8 @@ meetings** preference still controls retrieval from earlier meetings. A failed
 brain connection is reported and never treated as an empty brain.
 
 To see what the copilot would say before a call, type a question under **Ask
-your documents** in the AgentDictate window's Settings. The answer comes from
+your documents**, last under Advanced in the AgentDictate window's Settings.
+The answer comes from
 your knowledge folder alone and names the document each fact is from; when
 nothing covers the question, it says so.
 
@@ -196,8 +233,9 @@ HQ's existing evidence and privacy eligibility rules.
 production reader without opening the copilot, capturing audio/screens, sending
 a model request, or printing private source text.
 
-For Leadlord, enter the installed `packages/hq-cli/src/hq-brain-index.ts` path in
-settings. Enter a Bitwarden Secrets Manager access token for an existing
+For Leadlord, choose it as Company knowledge, then enter the installed
+`packages/hq-cli/src/hq-brain-index.ts` path in **Leadlord brain**, which
+appears below it. Enter a Bitwarden Secrets Manager access token for an existing
 appropriately scoped company machine account in **Bitwarden access token**, then
 save. The masked token is stored with the owner-protected copilot settings and
 redacted from settings logs. It is passed to the child CLI through
@@ -210,8 +248,8 @@ A changed revision requires a fresh read.
 Answers about you and your business come from your own material first, so the
 copilot quotes your real prices, offer, and results instead of guessing.
 
-- **Knowledge folder.** In the copilot settings, choose **Open knowledge
-  folder** and add pricing sheets, product docs, case studies, FAQs, or your
+- **Knowledge folder.** In the in-call settings sheet, choose **Open
+  knowledge folder** and add pricing sheets, product docs, case studies, FAQs, or your
   resume as Word (`.docx`), Markdown, text, or CSV files. Subfolders are read
   too. The folder is `%LOCALAPPDATA%\AgentDictate\knowledge`. The copilot
   knows your documents from the start: every answer is given them whole,
@@ -219,7 +257,7 @@ copilot quotes your real prices, offer, and results instead of guessing.
   what does not fit is searched for the parts that match the question. The
   session sends this to the answer models once when it starts, so the first
   question does not wait for them to read it. Changes are picked up within
-  seconds, even mid-call. PDFs and slides cannot be read yet; settings lists any it skipped
+  seconds, even mid-call. PDFs and slides cannot be read yet; the sheet lists any it skipped
   so you can save them as Word or text.
 - **Past meetings.** With **Remember past meetings** on, answers also know what
   your earlier meetings concluded, newest first, and search their transcripts
@@ -266,7 +304,8 @@ reached **You**; run it in a quiet room without speaking.
 
 ## Answer engines
 
-Choose the engine and models in the copilot settings (the sliders button).
+Choose the engine in Settings, under Meeting Copilot; the models are under
+Advanced, Answers.
 
 | Engine | Setup | Notes |
 | --- | --- | --- |
@@ -286,7 +325,7 @@ without writing a reply: about a quarter of a second, against more than a
 second for asking the model. If that service fails, the model is asked.
 
 **Faster transcription (optional).** Paste an **AssemblyAI API key** in
-Settings, under Meeting Copilot, and calls are transcribed by AssemblyAI from
+Settings, under Meeting Copilot, Advanced, Connections, and calls are transcribed by AssemblyAI from
 the next meeting. Its model judges from the words that a speaker has finished,
 a fraction of a second after they stop, so a question reaches the copilot
 sooner than when a fixed pause has to pass. The copilot then shows its answer
@@ -294,12 +333,13 @@ after a shorter pause. Open sessions are billed by AssemblyAI by the minute;
 the copilot closes them after ten minutes of quiet. If the service fails,
 speech is uploaded at each pause as before.
 
-**Speed** sets how much the researched model reasons before answering. Fast is
-recommended during live calls.
+**Thinking time**, under Advanced, Answers, sets how much the researched model
+reasons before answering. Fast is recommended during live calls.
 
 **Meeting type** (General, Sales call, Job interview, Hiring, Lecture,
 Negotiation) tunes how answers are framed. Add your role, company, product,
-and goals in **About you**, and standing rules in **Standing instructions**.
+and goals in **About you**, and standing rules in **Custom instructions**,
+under Advanced, Answers.
 
 ## Privacy and consent
 

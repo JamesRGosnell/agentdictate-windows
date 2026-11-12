@@ -2029,9 +2029,11 @@ fn successful_api_key_save_clears_the_secret_field(cx: &mut TestAppContext) {
     ));
 }
 
-#[gpui::test]
-fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext) {
-    let saved = Arc::new(Mutex::new(agentdictate_core::CopilotSettings::default()));
+/// Gives the main window a copilot settings store kept in memory.
+fn copilot_store(
+    settings: agentdictate_core::CopilotSettings,
+) -> Arc<Mutex<agentdictate_core::CopilotSettings>> {
+    let saved = Arc::new(Mutex::new(settings));
     let load = Arc::clone(&saved);
     let store = Arc::clone(&saved);
     agentdictate_ui::set_copilot_settings_store(agentdictate_ui::CopilotSettingsStore {
@@ -2042,15 +2044,31 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
         }),
         ask_documents: Arc::new(|question| Ok(format!("Asked: {question}"))),
     });
+    saved
+}
+
+impl Harness {
+    /// Scrolls the page until `selector` sits near the top of the view.
+    fn reveal(&mut self, selector: &'static str) {
+        let top = self.bounds(selector).top();
+        self.scroll_route_by(-(f32::from(top) - 300.));
+    }
+
+    fn open_copilot_advanced(&mut self) {
+        self.scroll_to("copilot-settings-advanced");
+        self.click("copilot-settings-advanced");
+    }
+}
+
+#[gpui::test]
+fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext) {
+    let saved = copilot_store(agentdictate_core::CopilotSettings::default());
     let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
     assert!(harness.has("settings-group-copilot"));
     // The OpenAI key transcribes the call whatever engine answers.
     assert!(harness.has("copilot-settings-openai-key"));
     assert!(!harness.has("copilot-settings-key"));
-    // AssemblyAI can transcribe the call in OpenAI's place.
-    assert!(harness.has("copilot-settings-assemblyai-key"));
-    let top = harness.bounds("copilot-settings-provider-3").top();
-    harness.scroll_route_by(-(f32::from(top) - 300.));
+    harness.reveal("copilot-settings-provider-3");
     // OpenAI API is the fourth engine; choosing it saves at once and asks
     // for its key.
     harness.click("copilot-settings-provider-3");
@@ -2060,16 +2078,24 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
     );
     assert!(harness.has("copilot-settings-key"));
     assert!(harness.has("copilot-settings-feedback"));
-    let auto_answer = saved.lock().unwrap().auto_answer;
-    let top = harness.bounds("copilot-settings-toggle-0").top();
-    harness.scroll_route_by(-(f32::from(top) - 300.));
-    harness.click("copilot-settings-toggle-0");
-    assert_eq!(saved.lock().unwrap().auto_answer, !auto_answer);
-    // Rarely changed settings wait behind a closed "Advanced" group.
-    assert!(!harness.has("copilot-settings-effort-0"));
-    harness.scroll_to("copilot-settings-advanced");
-    harness.click("copilot-settings-advanced");
-    // What the in-call sheet offers is here too.
+    // When to answer is its own group, above the engine, and not a switch.
+    assert!(
+        harness.bounds("settings-group-copilot-mode").top()
+            < harness.bounds("settings-group-copilot-engine").top()
+    );
+    assert!(!harness.has("copilot-settings-toggle-0"));
+    assert!(harness.has("copilot-settings-toggle-3"));
+    assert!(saved.lock().unwrap().auto_answer);
+    assert!(harness.has("copilot-settings-answer-mode-auto-selected"));
+    harness.reveal("copilot-settings-answer-mode-ask");
+    harness.click("copilot-settings-answer-mode-ask");
+    assert!(!saved.lock().unwrap().auto_answer);
+    assert!(harness.has("copilot-settings-answer-mode-ask-selected"));
+    harness.click("copilot-settings-answer-mode-auto");
+    assert!(saved.lock().unwrap().auto_answer);
+    assert!(harness.has("copilot-settings-answer-mode-auto-selected"));
+    harness.open_copilot_advanced();
+    // What the in-call sheet no longer offers is here.
     for selector in [
         "copilot-settings-brain-0",
         "copilot-settings-effort-0",
@@ -2080,8 +2106,167 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
     ] {
         assert!(harness.has(selector), "{selector}");
     }
-    let top = harness.bounds("copilot-settings-language-fr").top();
-    harness.scroll_route_by(-(f32::from(top) - 300.));
+    harness.reveal("copilot-settings-rewrite-1");
+    harness.click("copilot-settings-rewrite-1");
+    assert_eq!(
+        saved.lock().unwrap().rewrite_engine,
+        agentdictate_core::RewriteEngine::ClaudeSonnet
+    );
+    harness.reveal("copilot-settings-language-fr");
     harness.click("copilot-settings-language-fr");
     assert_eq!(saved.lock().unwrap().language, "fr");
+}
+
+#[gpui::test]
+fn the_meeting_copilot_shows_seven_things_until_advanced_opens(cx: &mut TestAppContext) {
+    copilot_store(agentdictate_core::CopilotSettings::default());
+    let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
+    // When to answer, the engine and its key, meeting type, how it opens,
+    // saving notes, your name, and about you.
+    for selector in [
+        "copilot-settings-answer-mode-auto",
+        "copilot-settings-provider-0",
+        "copilot-settings-openai-key",
+        "copilot-settings-mode-0",
+        "copilot-settings-opens-shortcut",
+        "copilot-settings-toggle-3",
+        "copilot-settings-name",
+        "copilot-settings-save-text",
+    ] {
+        assert!(harness.has(selector), "{selector}");
+    }
+    // None of these has been drawn in this window yet.
+    for selector in [
+        "copilot-settings-toggle-1",
+        "copilot-settings-toggle-2",
+        "copilot-settings-toggle-5",
+        "copilot-settings-toggle-10",
+        "copilot-settings-toggle-11",
+        "copilot-settings-toggle-12",
+        "copilot-settings-toggle-13",
+        "copilot-settings-answer-0",
+        "copilot-settings-fast-0",
+        "copilot-settings-effort-0",
+        "copilot-settings-rewrite-0",
+        "copilot-settings-language-auto",
+        "copilot-settings-translate-off",
+        "copilot-settings-assemblyai-key",
+        "copilot-settings-calendar",
+        "copilot-settings-webhook",
+        "copilot-settings-brain-0",
+        "copilot-settings-docs-ask",
+        "settings-group-copilot-advanced-answers",
+    ] {
+        assert!(
+            !harness.has(selector),
+            "{selector} shows before Advanced opens"
+        );
+    }
+    harness.open_copilot_advanced();
+    for selector in [
+        "settings-group-copilot-advanced-answers",
+        "settings-group-copilot-advanced-audio",
+        "settings-group-copilot-advanced-privacy",
+        "settings-group-copilot-advanced-connections",
+        "copilot-settings-toggle-1",
+        "copilot-settings-toggle-2",
+        "copilot-settings-toggle-5",
+        "copilot-settings-toggle-10",
+        "copilot-settings-toggle-11",
+        "copilot-settings-toggle-12",
+        "copilot-settings-toggle-13",
+        "copilot-settings-answer-0",
+        "copilot-settings-fast-0",
+        "copilot-settings-assemblyai-key",
+        "copilot-settings-calendar",
+        "copilot-settings-webhook",
+        "copilot-settings-docs-ask",
+    ] {
+        assert!(harness.has(selector), "{selector}");
+    }
+    // Replaced or removed, so never drawn: the old switches, the compact
+    // panel, the meeting goal, and the Leadlord fields while it is not used.
+    for selector in [
+        "copilot-settings-toggle-0",
+        "copilot-settings-toggle-4",
+        "copilot-settings-toggle-6",
+        "copilot-settings-toggle-7",
+        "copilot-settings-toggle-8",
+        "copilot-settings-toggle-9",
+        "copilot-settings-goal",
+        "copilot-settings-leadlord-cli",
+    ] {
+        assert!(!harness.has(selector), "{selector}");
+    }
+    // The four parts come in order, with Ask your documents last.
+    let tops = [
+        "settings-group-copilot-advanced-answers",
+        "settings-group-copilot-advanced-audio",
+        "settings-group-copilot-advanced-privacy",
+        "settings-group-copilot-advanced-connections",
+        "copilot-settings-docs-ask",
+    ]
+    .map(|selector| harness.bounds(selector).top());
+    assert!(tops.windows(2).all(|pair| pair[0] < pair[1]), "{tops:?}");
+}
+
+#[gpui::test]
+fn the_copilot_opens_choice_saves_both_switches(cx: &mut TestAppContext) {
+    let saved = copilot_store(agentdictate_core::CopilotSettings::default());
+    let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
+    let switches = |saved: &Arc<Mutex<agentdictate_core::CopilotSettings>>| {
+        let saved = saved.lock().unwrap();
+        (saved.auto_start, saved.launch_from_dictation_hotkey)
+    };
+    harness.reveal("copilot-settings-opens-auto");
+    harness.click("copilot-settings-opens-auto");
+    assert_eq!(switches(&saved), (true, true));
+    harness.click("copilot-settings-opens-tray");
+    assert_eq!(switches(&saved), (false, false));
+    harness.click("copilot-settings-opens-shortcut");
+    assert_eq!(switches(&saved), (false, true));
+}
+
+#[gpui::test]
+fn dont_transcribe_my_side_turns_the_microphone_off(cx: &mut TestAppContext) {
+    let saved = copilot_store(agentdictate_core::CopilotSettings::default());
+    let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
+    harness.open_copilot_advanced();
+    harness.reveal("copilot-settings-toggle-13");
+    harness.click("copilot-settings-toggle-13");
+    assert!(!saved.lock().unwrap().capture_microphone);
+    assert!(saved.lock().unwrap().capture_system_audio);
+    harness.click("copilot-settings-toggle-13");
+    assert!(saved.lock().unwrap().capture_microphone);
+}
+
+#[gpui::test]
+fn company_knowledge_asks_for_leadlord_setup_only_when_chosen(cx: &mut TestAppContext) {
+    let saved = copilot_store(agentdictate_core::CopilotSettings::default());
+    let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
+    harness.open_copilot_advanced();
+    harness.reveal("copilot-settings-brain-1");
+    harness.click("copilot-settings-brain-1");
+    assert_eq!(
+        saved.lock().unwrap().brain_source,
+        agentdictate_core::BrainSource::PersonalHq
+    );
+    assert!(!harness.has("copilot-settings-leadlord-cli"));
+    harness.click("copilot-settings-brain-2");
+    assert_eq!(
+        saved.lock().unwrap().brain_source,
+        agentdictate_core::BrainSource::Leadlord
+    );
+    harness.reveal("copilot-settings-leadlord-token");
+    assert!(harness.has("copilot-settings-leadlord-cli"));
+    let control = harness.bounds("copilot-settings-leadlord-token-control");
+    let position = point(control.left() + px(24.), control.center().y);
+    harness.cx.simulate_click(position, Modifiers::none());
+    harness.cx.simulate_input("synthetic-company-token");
+    harness.cx.run_until_parked();
+    harness.click("copilot-settings-save-leadlord-token");
+    assert_eq!(
+        saved.lock().unwrap().leadlord_bws_access_token,
+        "synthetic-company-token"
+    );
 }

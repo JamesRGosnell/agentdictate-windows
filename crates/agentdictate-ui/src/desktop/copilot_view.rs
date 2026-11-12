@@ -9,11 +9,10 @@ use std::{
 };
 
 use agentdictate_core::{
-    AlertKind, AnswerStatus, BrainSource, CopilotAction, CopilotEffort, CopilotEvent, CopilotMode,
-    CopilotProvider, CopilotSettings, FollowUp, Grounding, LANGUAGES, ListenState, ModelChoice,
-    QuickAction, RewriteEngine, RewriteStyle, Situation, Speaker, SpeakerLabels, TranscriptLine,
-    VoiceNames, combined_answer, format_offset, given_name, has_several_voices, model_pace,
-    researched_follow_up,
+    AlertKind, AnswerStatus, CopilotAction, CopilotEvent, CopilotMode, CopilotSettings, FollowUp,
+    Grounding, LANGUAGES, ListenState, QuickAction, RewriteStyle, Situation, Speaker,
+    SpeakerLabels, TranscriptLine, VoiceNames, combined_answer, format_offset, given_name,
+    has_several_voices, researched_follow_up,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FontWeight, Hsla, IntoElement,
@@ -96,6 +95,21 @@ fn icon(name: &str, size: f32, tint: u32) -> impl IntoElement + use<> {
         .text_color(color(tint))
 }
 
+/// A shortcut's keycap labels as words for a sentence, like "Ctrl+Enter".
+pub(super) fn shortcut_text(labels: &[String]) -> String {
+    labels
+        .iter()
+        .map(|key| {
+            if key == "\u{21b5}" {
+                "Enter"
+            } else {
+                key.as_str()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 fn keycaps(labels: &[String]) -> impl IntoElement + use<> {
     h_flex().gap(px(3.)).children(labels.iter().map(|label| {
         div()
@@ -138,21 +152,6 @@ fn chip(id: impl Into<gpui::ElementId>, selected: bool) -> Stateful<Div> {
                 .border_color(color(HAIRLINE))
                 .text_color(color(MUTED))
                 .hover(|style| style.bg(color(HOVER)).text_color(color(TEXT)))
-        })
-}
-
-/// A model chip's label with its measured pace, like "GPT-6 Luna  Fastest".
-fn model_label(model: &ModelChoice) -> impl IntoElement + use<> {
-    h_flex()
-        .gap(px(6.))
-        .child(model.label.clone())
-        .when_some(model_pace(&model.id), |row, pace| {
-            row.child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(color(DIM))
-                    .child(pace.label()),
-            )
         })
 }
 
@@ -307,17 +306,8 @@ pub struct CopilotWindow {
     /// The voice being named, from the transcript.
     naming: Option<u8>,
     name_input: Entity<InputState>,
-    profile: Entity<InputState>,
-    instructions: Entity<InputState>,
-    leadlord_cli: Entity<InputState>,
-    leadlord_token: Entity<InputState>,
-    anthropic_key: Entity<InputState>,
-    openai_key: Entity<InputState>,
     /// What the user wants from this meeting.
     goal: Entity<InputState>,
-    user_name: Entity<InputState>,
-    calendar: Entity<InputState>,
-    webhook: Entity<InputState>,
     /// The brief was closed for this session.
     brief_closed: bool,
     body_scroll: ScrollHandle,
@@ -499,50 +489,8 @@ impl CopilotWindow {
                 .clean_on_escape()
         });
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Their name"));
-        let profile = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .rows(3)
-                .placeholder("Your role, company, product, goals for this call\u{2026}")
-        });
-        let instructions = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .rows(2)
-                .placeholder("e.g. Keep answers under 50 words. Use metric units.")
-        });
-        let anthropic_key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("sk-ant-\u{2026}")
-                .masked(true)
-        });
-        let openai_key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("sk-\u{2026}")
-                .masked(true)
-        });
-        let leadlord_cli = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Path to Leadlord's hq-brain-index.ts")
-        });
-        let leadlord_token = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Bitwarden Secrets Manager access token")
-                .masked(true)
-        });
         let goal = cx.new(|cx| {
             InputState::new(window, cx).placeholder("e.g. Get a second meeting, ask about budget")
-        });
-        let user_name =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Your first name, as they say it"));
-        let calendar = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Private .ics address from Outlook or Google Calendar")
-                .masked(true)
-        });
-        let webhook = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("https://\u{2026} receives each finished meeting as JSON")
-                .masked(true)
         });
         let mut subscriptions = vec![cx.subscribe_in(
             &ask,
@@ -594,16 +542,7 @@ impl CopilotWindow {
             ask,
             naming: None,
             name_input,
-            profile,
-            instructions,
-            leadlord_cli,
-            leadlord_token,
-            anthropic_key,
-            openai_key,
             goal,
-            user_name,
-            calendar,
-            webhook,
             brief_closed: false,
             body_scroll: ScrollHandle::new(),
             transcript_scroll: ScrollHandle::new(),
@@ -664,37 +603,9 @@ impl CopilotWindow {
     }
 
     fn load_text_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let settings = self.model.settings.clone();
-        self.profile.update(cx, |input, cx| {
-            input.set_value(settings.profile.clone(), window, cx)
-        });
-        self.instructions.update(cx, |input, cx| {
-            input.set_value(settings.custom_instructions.clone(), window, cx)
-        });
-        self.leadlord_cli.update(cx, |input, cx| {
-            input.set_value(settings.leadlord_brain_cli.clone(), window, cx)
-        });
-        self.leadlord_token.update(cx, |input, cx| {
-            input.set_value(settings.leadlord_bws_access_token.clone(), window, cx)
-        });
-        self.anthropic_key.update(cx, |input, cx| {
-            input.set_value(settings.anthropic_api_key.clone(), window, cx)
-        });
-        self.openai_key.update(cx, |input, cx| {
-            input.set_value(settings.openai_api_key.clone(), window, cx)
-        });
-        self.goal.update(cx, |input, cx| {
-            input.set_value(settings.meeting_goal.clone(), window, cx)
-        });
-        self.user_name.update(cx, |input, cx| {
-            input.set_value(settings.user_name.clone(), window, cx)
-        });
-        self.calendar.update(cx, |input, cx| {
-            input.set_value(settings.calendar_ics.clone(), window, cx)
-        });
-        self.webhook.update(cx, |input, cx| {
-            input.set_value(settings.webhook_url.clone(), window, cx)
-        });
+        let goal = self.model.settings.meeting_goal.clone();
+        self.goal
+            .update(cx, |input, cx| input.set_value(goal, window, cx));
     }
 
     pub fn apply(&mut self, event: CopilotEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -814,29 +725,10 @@ impl CopilotWindow {
     }
 
     fn save_text_settings(&mut self, cx: &mut Context<Self>) {
-        let profile = self.profile.read(cx).value().to_string();
-        let instructions = self.instructions.read(cx).value().to_string();
-        let leadlord_cli = self.leadlord_cli.read(cx).value().trim().to_owned();
-        let leadlord_token = self.leadlord_token.read(cx).value().trim().to_owned();
-        let anthropic = self.anthropic_key.read(cx).value().trim().to_owned();
-        let openai = self.openai_key.read(cx).value().trim().to_owned();
+        // The goal is the sheet's only text; the rest is edited in Settings.
         let goal = self.goal.read(cx).value().trim().to_owned();
-        let user_name = self.user_name.read(cx).value().trim().to_owned();
-        let calendar = self.calendar.read(cx).value().trim().to_owned();
-        let webhook = self.webhook.read(cx).value().trim().to_owned();
-        self.update_settings(|settings| {
-            settings.profile = profile;
-            settings.custom_instructions = instructions;
-            settings.leadlord_brain_cli = leadlord_cli;
-            settings.leadlord_bws_access_token = leadlord_token;
-            settings.anthropic_api_key = anthropic;
-            settings.openai_api_key = openai;
-            settings.meeting_goal = goal;
-            settings.user_name = user_name;
-            settings.calendar_ics = calendar;
-            settings.webhook_url = webhook;
-        });
-        self.model.notice = Some("Settings saved".into());
+        self.update_settings(|settings| settings.meeting_goal = goal);
+        self.model.notice = Some("Goal saved".into());
         self.notice_at = Some(Instant::now());
     }
 
@@ -1125,6 +1017,9 @@ impl CopilotWindow {
                     .into_any_element(),
             };
         let panel_open = self.panel_open;
+        // When answers come only on request, Ask AI is tinted as the way to
+        // get one.
+        let on_demand = !self.model.settings.auto_answer;
         let pill = h_flex()
             .debug_selector(|| "copilot-bar".to_owned())
             .id("copilot-bar")
@@ -1183,9 +1078,13 @@ impl CopilotWindow {
             .child(divider())
             .child(
                 bar_button("copilot-assist")
+                    .when(on_demand, |button| button.bg(color(ACCENT_SOFT)))
                     .child(icon("sparkles", 13., ACCENT))
                     .child(
                         div()
+                            .when(on_demand, |label| {
+                                label.debug_selector(|| "copilot-assist-on-demand".to_owned())
+                            })
                             .text_size(px(12.5))
                             .font_weight(FontWeight::MEDIUM)
                             .child("Ask AI"),
@@ -2106,20 +2005,7 @@ impl CopilotWindow {
     }
 
     fn render_empty_state(&self, _cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let shortcut = self
-            .model
-            .shortcuts
-            .assist
-            .iter()
-            .map(|key| {
-                if key == "\u{21b5}" {
-                    "Enter"
-                } else {
-                    key.as_str()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("+");
+        let shortcut = shortcut_text(&self.model.shortcuts.assist);
         let headline = match &self.model.listen {
             ListenState::Listening => "Listening to your meeting",
             ListenState::Starting => "Connecting to your audio",
@@ -2128,6 +2014,9 @@ impl CopilotWindow {
         };
         let detail = match &self.model.listen {
             ListenState::Unavailable(message) => message.clone(),
+            _ if !self.model.settings.auto_answer => format!(
+                "Answers come only when you ask. Press {shortcut} or Ask AI for help with what's on your screen and in the conversation."
+            ),
             _ => format!(
                 "Questions they ask are answered automatically. Press {shortcut} anytime for help with what's on your screen and in the conversation."
             ),
@@ -3298,63 +3187,10 @@ impl CopilotWindow {
             )
     }
 
+    /// The in-call sheet: only what a call may need changed on the spot.
+    /// Everything else is in the main window's Settings, one click away.
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let settings = self.model.settings.clone();
-        let current_model = settings.answer_model();
-        let current_fast_model = settings.fast_model();
-        let models = self.model.models.clone();
-        let toggle = |id: &'static str,
-                      label: &'static str,
-                      detail: &'static str,
-                      enabled: bool,
-                      cx: &mut Context<Self>,
-                      change: fn(&mut CopilotSettings)| {
-            h_flex()
-                .debug_selector(move || id.to_owned())
-                .id(id)
-                .w_full()
-                .gap(px(12.))
-                .px(px(12.))
-                .py(px(9.))
-                .rounded(px(10.))
-                .cursor_pointer()
-                .hover(|style| style.bg(color(0xffffff08)))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(px(1.))
-                        .child(div().text_size(px(13.)).child(label))
-                        .child(
-                            div()
-                                .text_size(px(11.5))
-                                .text_color(color(DIM))
-                                .child(detail),
-                        ),
-                )
-                .child(
-                    div()
-                        .w(px(34.))
-                        .h(px(20.))
-                        .flex_none()
-                        .rounded(px(10.))
-                        .bg(color(if enabled { ACCENT } else { 0xffffff1f }))
-                        .relative()
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(2.))
-                                .left(px(if enabled { 16. } else { 2. }))
-                                .size(px(16.))
-                                .rounded_full()
-                                .bg(color(if enabled { 0x1a1110ff } else { 0xd4d4d8ff })),
-                        ),
-                )
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.update_settings(change);
-                    cx.notify();
-                }))
-        };
         let text_area = |id: &'static str, input: &Entity<InputState>, cx: &mut Context<Self>| {
             div()
                 .debug_selector(move || id.to_owned())
@@ -3373,16 +3209,113 @@ impl CopilotWindow {
                 )
                 .child(Input::new(input).appearance(false).bordered(false))
         };
-        let needs_anthropic = settings.provider == CopilotProvider::AnthropicApi;
-        let needs_openai = settings.provider == CopilotProvider::OpenaiApi;
         let hint =
             |text: &'static str| div().text_size(px(11.5)).text_color(color(DIM)).child(text);
         let spoken = settings.language.trim().to_lowercase();
-        let translate = settings.translate_to.trim().to_lowercase();
+        // The choice that changes the copilot most, first and on its own.
+        let ask_keys = shortcut_text(&self.model.shortcuts.assist);
+        let answer_mode = |id: &'static str,
+                           title: &'static str,
+                           detail: String,
+                           automatic: bool,
+                           cx: &mut Context<Self>| {
+            let selected = settings.auto_answer == automatic;
+            h_flex()
+                .debug_selector(move || id.to_owned())
+                .id(id)
+                .min_w(px(200.))
+                .flex_1()
+                .items_start()
+                .gap(px(10.))
+                .p(px(12.))
+                .rounded(px(12.))
+                .border_1()
+                .cursor_pointer()
+                .when(selected, |card| {
+                    card.bg(color(ACCENT_SOFT)).border_color(color(ACCENT))
+                })
+                .when(!selected, |card| {
+                    card.bg(color(0xffffff08))
+                        .border_color(color(HAIRLINE))
+                        .hover(|style| style.bg(color(HOVER)))
+                })
+                .child(
+                    div()
+                        .mt(px(1.))
+                        .size(px(16.))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .border_2()
+                        .border_color(color(if selected { ACCENT } else { DIM }))
+                        .when(selected, |mark| {
+                            mark.child(
+                                div()
+                                    .debug_selector(move || format!("{id}-selected"))
+                                    .size(px(8.))
+                                    .rounded_full()
+                                    .bg(color(ACCENT)),
+                            )
+                        }),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(color(TEXT))
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(color(MUTED))
+                                .child(detail),
+                        ),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.update_settings(|settings| settings.auto_answer = automatic);
+                    cx.notify();
+                }))
+        };
         let content = v_flex()
             .w_full()
             .gap(px(16.))
             .p(px(16.))
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(section_label("When to answer"))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(answer_mode(
+                                "copilot-answer-mode-auto",
+                                "Automatically",
+                                "Answers appear by themselves when the other side asks you something."
+                                    .to_owned(),
+                                true,
+                                cx,
+                            ))
+                            .child(answer_mode(
+                                "copilot-answer-mode-ask",
+                                "When I ask",
+                                format!(
+                                    "Answers only when you press {ask_keys} or Ask AI. Fastest, since nothing waits for them to stop talking."
+                                ),
+                                false,
+                                cx,
+                            )),
+                    ),
+            )
             .child(
                 v_flex()
                     .gap(px(6.))
@@ -3390,115 +3323,18 @@ impl CopilotWindow {
                     .child(text_area("copilot-goal", &self.goal, cx))
                     .child(hint(
                         "Each part becomes a checklist item that ticks itself off. Cleared when the meeting ends.",
-                    )),
-            )
-            .child(
-                v_flex()
-                    .gap(px(8.))
-                    .child(section_label("Answer engine"))
-                    .child(h_flex().flex_wrap().gap(px(6.)).children(
-                        CopilotProvider::ALL.into_iter().map(|provider| {
-                            chip(("copilot-provider", provider as usize), provider == settings.provider)
-                                .debug_selector(move || format!("copilot-provider-{}", provider as usize))
-                                .child(provider.label())
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.update_settings(|settings| settings.provider = provider);
-                                    this.model.models = provider.suggested_models();
-                                    cx.notify();
-                                }))
-                        }),
                     ))
                     .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(color(DIM))
-                            .child(settings.provider.detail()),
-                    ),
-            )
-            .when(needs_anthropic, |column| {
-                column.child(
-                    v_flex()
-                        .gap(px(6.))
-                        .child(section_label("Anthropic API key"))
-                        .child(text_area("copilot-anthropic-key", &self.anthropic_key, cx)),
-                )
-            })
-            .when(needs_openai, |column| {
-                column.child(
-                    v_flex()
-                        .gap(px(6.))
-                        .child(section_label("OpenAI API key"))
-                        .child(text_area("copilot-openai-key", &self.openai_key, cx)),
-                )
-            })
-            .child(
-                v_flex()
-                    .gap(px(8.))
-                    .child(section_label("Researched answers"))
-                    .child(h_flex().flex_wrap().gap(px(6.)).children(
-                        models.iter().cloned().enumerate().map(|(index, model)| {
-                            let id = model.id.clone();
-                            chip(("copilot-model", index), model.id == current_model)
-                                .child(model_label(&model))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    let id = id.clone();
-                                    this.update_settings(|settings| settings.set_answer_model(id));
+                        h_flex().child(
+                            chip("copilot-save-settings", true)
+                                .debug_selector(|| "copilot-save-settings".to_owned())
+                                .child("Save goal")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.save_text_settings(cx);
+                                    this.stop_typing(true, cx);
                                     cx.notify();
-                                }))
-                        }),
-                    )),
-            )
-            .child(
-                v_flex()
-                    .gap(px(8.))
-                    .child(section_label("Instant answers"))
-                    .child(h_flex().flex_wrap().gap(px(6.)).children(
-                        models.into_iter().enumerate().map(|(index, model)| {
-                            let id = model.id.clone();
-                            chip(("copilot-fast-model", index), model.id == current_fast_model)
-                                .child(model_label(&model))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    let id = id.clone();
-                                    this.update_settings(|settings| settings.set_fast_model(id));
-                                    cx.notify();
-                                }))
-                        }),
-                    )),
-            )
-            .child(
-                v_flex()
-                    .gap(px(8.))
-                    .child(section_label("Rewrites"))
-                    .child(h_flex().flex_wrap().gap(px(6.)).children(
-                        RewriteEngine::ALL.into_iter().enumerate().map(|(index, engine)| {
-                            chip(("copilot-rewrite-engine", index), engine == settings.rewrite_engine)
-                                .debug_selector(move || format!("copilot-rewrite-engine-{index}"))
-                                .child(engine.label())
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.update_settings(|settings| settings.rewrite_engine = engine);
-                                    cx.notify();
-                                }))
-                        }),
-                    )),
-            )
-            .child(
-                h_flex()
-                    .gap(px(24.))
-                    .items_start()
-                    .child(
-                        v_flex()
-                            .gap(px(8.))
-                            .child(section_label("Speed"))
-                            .child(h_flex().gap(px(6.)).children(CopilotEffort::ALL.into_iter().map(
-                                |effort| {
-                                    chip(("copilot-effort", effort as usize), effort == settings.effort)
-                                        .child(effort.label())
-                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            this.update_settings(|settings| settings.effort = effort);
-                                            cx.notify();
-                                        }))
-                                },
-                            ))),
+                                })),
+                        ),
                     ),
             )
             .child(
@@ -3508,6 +3344,7 @@ impl CopilotWindow {
                     .child(h_flex().flex_wrap().gap(px(6.)).children(CopilotMode::ALL.into_iter().map(
                         |mode| {
                             chip(("copilot-mode", mode as usize), mode == settings.mode)
+                                .debug_selector(move || format!("copilot-mode-{}", mode as usize))
                                 .child(mode.label())
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.update_settings(|settings| settings.mode = mode);
@@ -3552,164 +3389,7 @@ impl CopilotWindow {
             .child(
                 v_flex()
                     .gap(px(8.))
-                    .child(section_label("Translate what they say into"))
-                    .child(
-                        h_flex()
-                            .flex_wrap()
-                            .gap(px(6.))
-                            .child(
-                                chip("copilot-translate-off", translate.is_empty())
-                                    .debug_selector(|| "copilot-translate-off".to_owned())
-                                    .child("Off")
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.update_settings(|settings| {
-                                            settings.translate_to.clear();
-                                        });
-                                        cx.notify();
-                                    })),
-                            )
-                            .children(LANGUAGES.into_iter().enumerate().map(|(index, (code, name))| {
-                                chip(("copilot-translate", index), translate == code)
-                                    .debug_selector(move || format!("copilot-translate-{code}"))
-                                    .child(name)
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.update_settings(|settings| {
-                                            settings.translate_to = code.to_owned();
-                                        });
-                                        cx.notify();
-                                    }))
-                            })),
-                    )
-                    .child(hint(
-                        "Their lines in another language get a translation under them in the transcript, and the line to say comes with its meaning.",
-                    )),
-            )
-            .child(
-                v_flex()
-                    .gap(px(2.))
-                    .child(section_label("Behavior"))
-                    .child(toggle(
-                        "copilot-compact-mode",
-                        "Compact panel",
-                        "Show only the line to say. The \u{2212} button on the bar switches it too.",
-                        settings.compact,
-                        cx,
-                        |settings| settings.compact = !settings.compact,
-                    ))
-                    .child(toggle(
-                        "copilot-auto-start",
-                        "Open when a meeting starts",
-                        "The copilot opens by itself when a call begins, without the shortcut.",
-                        settings.auto_start,
-                        cx,
-                        |settings| settings.auto_start = !settings.auto_start,
-                    ))
-                    .child(toggle(
-                        "copilot-web",
-                        "Search the web",
-                        "Look up current facts while answering.",
-                        settings.web_search,
-                        cx,
-                        |settings| settings.web_search = !settings.web_search,
-                    ))
-                    .child(toggle(
-                        "copilot-instant",
-                        "Instant answers",
-                        "A fast model drafts a reply in about a second while the main model researches.",
-                        settings.instant_answers,
-                        cx,
-                        |settings| settings.instant_answers = !settings.instant_answers,
-                    ))
-                    .child(toggle(
-                        "copilot-screen",
-                        "Use my screen",
-                        "Ask AI and typed questions include a screenshot. The copilot never appears in it.",
-                        settings.screen_context,
-                        cx,
-                        |settings| settings.screen_context = !settings.screen_context,
-                    ))
-                    .child(toggle(
-                        "copilot-hidden",
-                        "Hide from screen sharing",
-                        "Invisible in Zoom, Teams, and Meet shares, recordings, and screenshots.",
-                        settings.hide_from_screen_share,
-                        cx,
-                        |settings| settings.hide_from_screen_share = !settings.hide_from_screen_share,
-                    ))
-                    .child(toggle(
-                        "copilot-auto",
-                        "Answer questions automatically",
-                        "When they ask you something, an answer starts streaming right away.",
-                        settings.auto_answer,
-                        cx,
-                        |settings| settings.auto_answer = !settings.auto_answer,
-                    ))
-                    .child(toggle(
-                        "copilot-insights",
-                        "Live insights",
-                        "Rolling topic, summary, and suggested prompts.",
-                        settings.live_insights,
-                        cx,
-                        |settings| settings.live_insights = !settings.live_insights,
-                    ))
-                    .child(toggle(
-                        "copilot-launch",
-                        "Open with the dictation shortcut in meetings",
-                        "Your dictation shortcut opens the copilot when a call is detected.",
-                        settings.launch_from_dictation_hotkey,
-                        cx,
-                        |settings| {
-                            settings.launch_from_dictation_hotkey =
-                                !settings.launch_from_dictation_hotkey;
-                        },
-                    ))
-                    .child(toggle(
-                        "copilot-mic",
-                        "Listen to my microphone",
-                        "Transcribes what you say as \u{201c}You\u{201d}.",
-                        settings.capture_microphone,
-                        cx,
-                        |settings| settings.capture_microphone = !settings.capture_microphone,
-                    ))
-                    .child(toggle(
-                        "copilot-system",
-                        "Listen to system audio",
-                        "Transcribes the other participants as \u{201c}Them\u{201d}.",
-                        settings.capture_system_audio,
-                        cx,
-                        |settings| settings.capture_system_audio = !settings.capture_system_audio,
-                    ))
-                    .child(toggle(
-                        "copilot-notes",
-                        "Save meeting notes",
-                        "Writes a summary and transcript when you end the session.",
-                        settings.save_notes,
-                        cx,
-                        |settings| settings.save_notes = !settings.save_notes,
-                    )),
-            )
-            .child(
-                v_flex()
-                    .gap(px(8.))
-                    .child(section_label("Brain"))
-                    .child(h_flex().flex_wrap().gap(px(6.)).children(
-                        BrainSource::ALL.into_iter().enumerate().map(|(index, source)| {
-                            chip(("copilot-brain", index), source == settings.brain_source)
-                                .debug_selector(move || format!("copilot-brain-{index}"))
-                                .child(source.label())
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.update_settings(|settings| settings.brain_source = source);
-                                    cx.notify();
-                                }))
-                        }),
-                    ))
-                    .when(settings.brain_source == BrainSource::Leadlord, |column| {
-                        column.child(text_area("copilot-leadlord-cli", &self.leadlord_cli, cx))
-                            .child(section_label("Bitwarden access token"))
-                            .child(text_area("copilot-leadlord-token", &self.leadlord_token, cx))
-                    })
-                    .when(settings.brain_source == BrainSource::None, |column| {
-                        column
+                    .child(section_label("Your documents"))
                     .child(
                         div()
                             .debug_selector(|| "copilot-knowledge-status".to_owned())
@@ -3739,77 +3419,27 @@ impl CopilotWindow {
                                     this.act(CopilotAction::OpenKnowledgeFolder);
                                 })),
                         ),
-                    )
-                    })
-                    .child(toggle(
-                        "copilot-past-meetings",
-                        "Remember past meetings",
-                        "Answers can draw on notes from your earlier meetings.",
-                        settings.use_past_meetings,
-                        cx,
-                        |settings| settings.use_past_meetings = !settings.use_past_meetings,
-                    )),
-            )
-            .child(
-                v_flex()
-                    .gap(px(6.))
-                    .child(section_label("Your name"))
-                    .child(text_area("copilot-user-name", &self.user_name, cx))
-                    .child(hint(
-                        "When you are only listening and someone says it, the copilot alerts you with what was just said.",
-                    )),
-            )
-            .child(
-                v_flex()
-                    .gap(px(6.))
-                    .child(section_label("About you"))
-                    .child(text_area("copilot-profile", &self.profile, cx)),
-            )
-            .child(
-                v_flex()
-                    .gap(px(6.))
-                    .child(section_label("Standing instructions"))
-                    .child(text_area("copilot-instructions", &self.instructions, cx)),
-            )
-            .child(
-                v_flex()
-                    .gap(px(6.))
-                    .child(section_label("Calendar"))
-                    .child(text_area("copilot-calendar", &self.calendar, cx))
-                    .child(hint(
-                        "Names the meeting and who is in it before anyone speaks. Outlook: Settings, Calendar, Shared calendars, Publish a calendar, ICS link.",
-                    )),
-            )
-            .child(
-                v_flex()
-                    .gap(px(6.))
-                    .child(section_label("Send finished meetings to"))
-                    .child(text_area("copilot-webhook", &self.webhook, cx))
-                    .child(hint(
-                        "A webhook address for your CRM, Notion, Zapier, or Make. It receives the summary, commitments, and transcript.",
-                    )),
-            )
-            .child(
-                h_flex()
-                    .gap(px(8.))
-                    .child(
-                        chip("copilot-save-settings", true)
-                            .debug_selector(|| "copilot-save-settings".to_owned())
-                            .child("Save")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.save_text_settings(cx);
-                                this.stop_typing(true, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        chip("copilot-notes-folder", false)
-                            .child(icon("file-text", 12., MUTED))
-                            .child("Meeting notes folder")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
-                                this.act(CopilotAction::OpenNotesFolder);
-                            })),
                     ),
+            )
+            .child(
+                v_flex()
+                    .gap(px(6.))
+                    .child(
+                        h_flex().child(
+                            chip("copilot-more-settings", false)
+                                .debug_selector(|| "copilot-more-settings".to_owned())
+                                .child(icon("sliders", 12., MUTED))
+                                .child("More settings")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                                    this.act(CopilotAction::OpenUrl(
+                                        crate::COPILOT_SETTINGS_LINK.to_owned(),
+                                    ));
+                                })),
+                        ),
+                    )
+                    .child(hint(
+                        "The answer engine, models, audio, privacy, and connections are in AgentDictate's Settings, under Meeting Copilot.",
+                    )),
             );
         div()
             .debug_selector(|| "copilot-settings-body".to_owned())

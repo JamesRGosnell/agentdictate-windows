@@ -12,11 +12,12 @@ use std::{
 
 use agentdictate_core::{
     AlertKind, AnswerStatus, ChecklistItem, CopilotAction, CopilotAlert, CopilotEvent,
-    CopilotInsights, CopilotProvider, CopilotSettings, KnowledgeSummary, ListenState, QuickAction,
+    CopilotInsights, CopilotMode, CopilotSettings, KnowledgeSummary, ListenState, QuickAction,
     RewriteStyle, Situation, Speaker, TranscriptLine,
 };
 use agentdictate_ui::{
-    CopilotShape, CopilotViewModel, CopilotWindow, CopilotWindowHost, test_support,
+    COPILOT_SETTINGS_LINK, CopilotShape, CopilotViewModel, CopilotWindow, CopilotWindowHost,
+    test_support,
 };
 use gpui::{
     Bounds, Entity, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TestAppContext,
@@ -337,36 +338,6 @@ fn settings_show_the_knowledge_and_what_cannot_be_read(cx: &mut TestAppContext) 
     harness.reveal_setting("copilot-open-knowledge");
     harness.click("copilot-open-knowledge");
     assert_eq!(harness.actions(), vec![CopilotAction::OpenKnowledgeFolder]);
-}
-
-#[gpui::test]
-fn the_brain_selector_saves_each_source_and_only_requests_leadlord_setup_when_selected(
-    cx: &mut TestAppContext,
-) {
-    let mut harness = Harness::open(cx);
-    harness.click("copilot-settings");
-    harness.reveal_setting("copilot-brain-1");
-    harness.click("copilot-brain-1");
-    assert!(
-        matches!(harness.actions().last(), Some(CopilotAction::UpdateSettings(settings)) if settings.brain_source == agentdictate_core::BrainSource::PersonalHq)
-    );
-    assert!(!harness.has("copilot-leadlord-cli"));
-    assert!(!harness.has("copilot-leadlord-token"));
-    harness.reveal_setting("copilot-brain-2");
-    harness.click("copilot-brain-2");
-    assert!(
-        matches!(harness.actions().last(), Some(CopilotAction::UpdateSettings(settings)) if settings.brain_source == agentdictate_core::BrainSource::Leadlord)
-    );
-    harness.reveal_setting("copilot-leadlord-cli");
-    assert!(harness.has("copilot-leadlord-cli"));
-    harness.reveal_setting("copilot-leadlord-token");
-    harness.click("copilot-leadlord-token");
-    harness.cx.simulate_input("synthetic-company-token");
-    harness.reveal_setting("copilot-save-settings");
-    harness.click("copilot-save-settings");
-    assert!(
-        matches!(harness.actions().last(), Some(CopilotAction::UpdateSettings(settings)) if settings.leadlord_bws_access_token == "synthetic-company-token")
-    );
 }
 
 #[gpui::test]
@@ -698,39 +669,75 @@ fn hide_and_the_toggle_shortcut_change_window_visibility(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn settings_toggles_and_provider_choices_are_saved(cx: &mut TestAppContext) {
+fn the_sheet_offers_six_things_and_links_to_settings(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);
     harness.click("copilot-settings");
-    harness.reveal_setting("copilot-web");
-    harness.click("copilot-web");
-    harness.reveal_setting("copilot-provider-0");
-    harness.click(&*Box::leak(
-        format!("copilot-provider-{}", CopilotProvider::ClaudeCode as usize).into_boxed_str(),
+    for selector in [
+        "copilot-answer-mode-auto",
+        "copilot-goal",
+        "copilot-mode-0",
+        "copilot-language-auto",
+        "copilot-open-knowledge",
+        "copilot-more-settings",
+    ] {
+        assert!(harness.has(selector), "{selector}");
+    }
+    // The rest lives in the main window's Settings and was never drawn here.
+    for selector in [
+        "copilot-provider-0",
+        "copilot-web",
+        "copilot-hidden",
+        "copilot-compact-mode",
+        "copilot-brain-0",
+        "copilot-translate-off",
+        "copilot-profile",
+        "copilot-user-name",
+        "copilot-webhook",
+        "copilot-rewrite-engine-0",
+    ] {
+        assert!(!harness.has(selector), "{selector}");
+    }
+    harness.click("copilot-mode-1");
+    assert!(matches!(
+        harness.actions().last(),
+        Some(CopilotAction::UpdateSettings(settings)) if settings.mode == CopilotMode::ALL[1]
     ));
-    let saved: Vec<CopilotSettings> = harness
-        .actions()
-        .into_iter()
-        .filter_map(|action| match action {
-            CopilotAction::UpdateSettings(settings) => Some(*settings),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(saved.len(), 2);
-    assert!(!saved[0].web_search);
-    assert_eq!(saved[1].provider, CopilotProvider::ClaudeCode);
-    assert!(!saved[1].web_search);
+    harness.click("copilot-goal");
+    harness.cx.simulate_input("Book a pilot");
+    harness.cx.run_until_parked();
+    harness.click("copilot-save-settings");
+    assert!(matches!(
+        harness.actions().last(),
+        Some(CopilotAction::UpdateSettings(settings)) if settings.meeting_goal == "Book a pilot"
+    ));
+    harness.reveal_setting("copilot-more-settings");
+    harness.click("copilot-more-settings");
+    assert_eq!(
+        harness.actions().last(),
+        Some(&CopilotAction::OpenUrl(COPILOT_SETTINGS_LINK.to_owned()))
+    );
 }
 
 #[gpui::test]
-fn rewrites_can_go_through_claude(cx: &mut TestAppContext) {
+fn the_sheet_chooses_when_to_answer_and_the_bar_shows_on_demand(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);
+    assert!(!harness.has("copilot-assist-on-demand"));
     harness.click("copilot-settings");
-    harness.reveal_setting("copilot-rewrite-engine-1");
-    harness.click("copilot-rewrite-engine-1");
+    // The choice leads the sheet, ahead of the meeting goal.
+    assert!(harness.bounds("copilot-answer-mode-ask").top() < harness.bounds("copilot-goal").top());
+    assert!(harness.has("copilot-answer-mode-auto-selected"));
+    harness.click("copilot-answer-mode-ask");
     assert!(matches!(
         harness.actions().last(),
-        Some(CopilotAction::UpdateSettings(settings))
-            if settings.rewrite_engine == agentdictate_core::RewriteEngine::ClaudeSonnet
+        Some(CopilotAction::UpdateSettings(settings)) if !settings.auto_answer
+    ));
+    assert!(harness.has("copilot-answer-mode-ask-selected"));
+    // Ask AI on the bar is marked as the way to get an answer.
+    assert!(harness.has("copilot-assist-on-demand"));
+    harness.click("copilot-answer-mode-auto");
+    assert!(matches!(
+        harness.actions().last(),
+        Some(CopilotAction::UpdateSettings(settings)) if settings.auto_answer
     ));
 }
 
@@ -763,9 +770,13 @@ fn ending_the_session_takes_a_confirming_second_click(cx: &mut TestAppContext) {
 #[gpui::test]
 fn turning_off_screen_share_hiding_updates_the_host(cx: &mut TestAppContext) {
     let mut harness = Harness::open(cx);
-    harness.click("copilot-settings");
-    harness.reveal_setting("copilot-hidden");
-    harness.click("copilot-hidden");
+    // The switch is in the main window's Settings; the copilot hears of it
+    // as new settings.
+    harness.send(CopilotEvent::Settings(Box::new(CopilotSettings {
+        onboarded: true,
+        hide_from_screen_share: false,
+        ..CopilotSettings::default()
+    })));
     assert!(
         harness
             .host_calls()

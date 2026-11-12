@@ -17,6 +17,11 @@ pub const COPILOT_PANEL_HEIGHT: f32 = 480.0;
 pub const COPILOT_PANEL_GAP: f32 = 6.0;
 pub const COPILOT_TOP_MARGIN: f32 = 10.0;
 
+/// Sent as [`agentdictate_core::CopilotAction::OpenUrl`] by the in-call
+/// sheet's "More settings" link; the copilot process opens the main window's
+/// Settings for it rather than a browser.
+pub const COPILOT_SETTINGS_LINK: &str = "agentdictate://settings/meeting-copilot";
+
 /// Number of recent level samples kept for each mini waveform.
 pub const LEVEL_HISTORY: usize = 14;
 
@@ -547,9 +552,107 @@ pub fn source_host(url: &str) -> String {
     host.trim_start_matches("www.").to_owned()
 }
 
+/// How the copilot opens, as one choice over the two saved switches
+/// `auto_start` and `launch_from_dictation_hotkey`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopilotOpens {
+    /// The dictation shortcut opens it during a detected call.
+    Shortcut,
+    /// It opens by itself as a call starts; the shortcut still reopens it.
+    Automatically,
+    /// Only from the tray or the Overview.
+    TrayOnly,
+}
+
+impl CopilotOpens {
+    pub const ALL: [Self; 3] = [Self::Shortcut, Self::Automatically, Self::TrayOnly];
+
+    /// Opening by itself wins, since it opens whatever the shortcut does.
+    #[must_use]
+    pub const fn from_settings(settings: &CopilotSettings) -> Self {
+        match (settings.auto_start, settings.launch_from_dictation_hotkey) {
+            (true, _) => Self::Automatically,
+            (false, true) => Self::Shortcut,
+            (false, false) => Self::TrayOnly,
+        }
+    }
+
+    pub const fn apply(self, settings: &mut CopilotSettings) {
+        let (auto_start, shortcut) = match self {
+            Self::Shortcut => (false, true),
+            Self::Automatically => (true, true),
+            Self::TrayOnly => (false, false),
+        };
+        settings.auto_start = auto_start;
+        settings.launch_from_dictation_hotkey = shortcut;
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Shortcut => "With my dictation shortcut in calls",
+            Self::Automatically => "By itself when a call starts",
+            Self::TrayOnly => "Only from the tray",
+        }
+    }
+
+    /// The stable last part of the choice's selector.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Shortcut => "shortcut",
+            Self::Automatically => "auto",
+            Self::TrayOnly => "tray",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn how_the_copilot_opens_maps_onto_both_saved_switches() {
+        let saved = |auto_start, launch_from_dictation_hotkey| CopilotSettings {
+            auto_start,
+            launch_from_dictation_hotkey,
+            ..CopilotSettings::default()
+        };
+        assert_eq!(
+            CopilotOpens::from_settings(&CopilotSettings::default()),
+            CopilotOpens::Shortcut
+        );
+        assert_eq!(
+            CopilotOpens::from_settings(&saved(false, true)),
+            CopilotOpens::Shortcut
+        );
+        assert_eq!(
+            CopilotOpens::from_settings(&saved(true, true)),
+            CopilotOpens::Automatically
+        );
+        assert_eq!(
+            CopilotOpens::from_settings(&saved(true, false)),
+            CopilotOpens::Automatically
+        );
+        assert_eq!(
+            CopilotOpens::from_settings(&saved(false, false)),
+            CopilotOpens::TrayOnly
+        );
+        // Every saved combination keeps the choice it shows when re-chosen.
+        for (auto_start, shortcut) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut settings = saved(auto_start, shortcut);
+            let shown = CopilotOpens::from_settings(&settings);
+            shown.apply(&mut settings);
+            assert_eq!(CopilotOpens::from_settings(&settings), shown);
+        }
+        let mut settings = saved(false, false);
+        CopilotOpens::Automatically.apply(&mut settings);
+        assert!(settings.auto_start && settings.launch_from_dictation_hotkey);
+        CopilotOpens::Shortcut.apply(&mut settings);
+        assert!(!settings.auto_start && settings.launch_from_dictation_hotkey);
+        CopilotOpens::TrayOnly.apply(&mut settings);
+        assert!(!settings.auto_start && !settings.launch_from_dictation_hotkey);
+    }
 
     fn model() -> CopilotViewModel {
         CopilotViewModel::new(CopilotSettings::default(), 0)

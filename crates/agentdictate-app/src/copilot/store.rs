@@ -16,6 +16,14 @@ pub(crate) fn settings_path(config_file: &Path) -> PathBuf {
 /// damaged file can never keep the copilot from opening.
 #[must_use]
 pub(crate) fn load(path: &Path) -> CopilotSettings {
+    let mut settings = read(path);
+    // Settings no longer offer turning system audio off, and without it the
+    // copilot hears nothing to answer; an older choice cannot strand anyone.
+    settings.capture_system_audio = true;
+    settings
+}
+
+fn read(path: &Path) -> CopilotSettings {
     match std::fs::read_to_string(path) {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|error| {
             tracing::warn!(%error, "copilot settings are invalid; using defaults");
@@ -55,5 +63,21 @@ mod tests {
         assert_eq!(load(&path), settings);
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load(&path), CopilotSettings::default());
+    }
+
+    #[test]
+    fn loading_turns_system_audio_back_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = settings_path(&directory.path().join("config.json"));
+        let saved = CopilotSettings {
+            capture_system_audio: false,
+            capture_microphone: false,
+            ..CopilotSettings::default()
+        };
+        save(&path, &saved).unwrap();
+        let loaded = load(&path);
+        assert!(loaded.capture_system_audio);
+        // Not transcribing your own side is still a choice.
+        assert!(!loaded.capture_microphone);
     }
 }

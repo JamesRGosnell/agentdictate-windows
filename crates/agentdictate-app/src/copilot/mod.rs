@@ -685,6 +685,24 @@ fn post_json(address: &str, body: &str) -> Result<(), String> {
     }
 }
 
+/// Opens the main window on its Settings page, as the tray's Meeting notes
+/// item opens it on Meetings. The copilot runs from `agentdictated.exe`;
+/// the window is `agentdictate.exe` beside it.
+#[cfg(all(windows, feature = "desktop"))]
+fn open_main_settings() {
+    let opened = std::env::current_exe().and_then(|executable| {
+        std::process::Command::new(executable.with_file_name("agentdictate.exe"))
+            .args(["--route", agentdictate_ui::Route::Settings.slug()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    });
+    if let Err(error) = opened {
+        tracing::warn!(%error, "settings could not be opened from the copilot");
+    }
+}
+
 /// Runs the copilot process until the user ends the session.
 #[cfg(all(windows, feature = "desktop"))]
 pub fn run_copilot() -> anyhow::Result<()> {
@@ -774,6 +792,13 @@ pub fn run_copilot() -> anyhow::Result<()> {
     let actions = {
         let sender = engine_sender.clone();
         Arc::new(move |action: CopilotAction| {
+            // "More settings" opens the main window's Settings, which the
+            // engine has no part in.
+            if matches!(&action, CopilotAction::OpenUrl(url) if url == agentdictate_ui::COPILOT_SETTINGS_LINK)
+            {
+                open_main_settings();
+                return;
+            }
             let _ = sender.send(EngineMsg::Action(action));
         })
     };
