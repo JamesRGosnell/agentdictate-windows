@@ -1,6 +1,6 @@
 //! The Meeting Copilot and API keys tabs of the main window's Settings, so
 //! the copilot can be set up without starting a meeting. The copilot tab
-//! shows the seven settings most people change, with the rest behind a
+//! shows the settings most people change, with the rest behind a
 //! collapsed "Advanced" group. Choices save at once; text saves with any Save
 //! button. A running meeting keeps its settings until the next one starts.
 //!
@@ -708,12 +708,25 @@ pub(super) fn section(
     let engine = settings_section(
         "settings-group-copilot-engine",
         "Answer engine",
-        "Which AI writes the answers. Keys are kept under API keys, so you can switch freely.",
+        "Which AI writes the answers, and with which models. Keys are kept under API keys, \
+         so you can switch freely.",
         false,
         theme,
     )
     .child(chip_row("Engine", provider.detail(), provider_chips, theme))
-    .children(engine_key);
+    .children(engine_key)
+    .child(chip_row(
+        "Full answer model",
+        "Writes the researched answer",
+        answer_chips,
+        theme,
+    ))
+    .child(chip_row(
+        "Instant answer model",
+        "Writes the quick draft that shows first",
+        fast_chips,
+        theme,
+    ));
 
     let meetings = settings_section(
         "settings-group-copilot-meetings",
@@ -782,18 +795,6 @@ pub(super) fn section(
         let answers = advanced_group("settings-group-copilot-advanced-answers", "Answers", theme)
             .children(instant_answers)
             .children(web_search)
-            .child(chip_row(
-                "Full answer model",
-                "Writes the researched answer",
-                answer_chips,
-                theme,
-            ))
-            .child(chip_row(
-                "Instant answer model",
-                "Writes the quick draft",
-                fast_chips,
-                theme,
-            ))
             .child(chip_row(
                 "Thinking time",
                 "How long full answers may think",

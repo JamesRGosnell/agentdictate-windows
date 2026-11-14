@@ -2131,15 +2131,17 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn the_meeting_copilot_shows_seven_things_until_advanced_opens(cx: &mut TestAppContext) {
+fn the_meeting_copilot_folds_rarely_changed_settings_until_advanced_opens(cx: &mut TestAppContext) {
     copilot_store(agentdictate_core::CopilotSettings::default());
     let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
     harness.open_copilot_tab();
-    // When to answer, the engine, meeting type, how it opens, saving notes,
-    // your name, and about you.
+    // When to answer, the engine and its models, meeting type, how it
+    // opens, saving notes, your name, and about you.
     for selector in [
         "copilot-settings-answer-mode-auto",
         "copilot-settings-provider-0",
+        "copilot-settings-answer-0",
+        "copilot-settings-fast-0",
         "copilot-settings-mode-0",
         "copilot-settings-opens-shortcut",
         "copilot-settings-toggle-3",
@@ -2157,8 +2159,6 @@ fn the_meeting_copilot_shows_seven_things_until_advanced_opens(cx: &mut TestAppC
         "copilot-settings-toggle-11",
         "copilot-settings-toggle-12",
         "copilot-settings-toggle-13",
-        "copilot-settings-answer-0",
-        "copilot-settings-fast-0",
         "copilot-settings-effort-0",
         "copilot-settings-rewrite-0",
         "copilot-settings-language-auto",
@@ -2187,8 +2187,6 @@ fn the_meeting_copilot_shows_seven_things_until_advanced_opens(cx: &mut TestAppC
         "copilot-settings-toggle-11",
         "copilot-settings-toggle-12",
         "copilot-settings-toggle-13",
-        "copilot-settings-answer-0",
-        "copilot-settings-fast-0",
         "copilot-settings-calendar",
         "copilot-settings-webhook",
         "copilot-settings-docs-ask",

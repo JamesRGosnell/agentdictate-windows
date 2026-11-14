@@ -1262,6 +1262,9 @@ pub(crate) fn bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize>
         } else if let Some(model) = model.strip_prefix("chatgpt:") {
             lane.provider = CopilotProvider::ChatgptSubscription;
             model
+        } else if let Some(model) = model.strip_prefix("openai:") {
+            lane.provider = CopilotProvider::OpenaiApi;
+            model
         } else {
             // GPT models run on the OpenAI key when that is the chosen
             // engine, otherwise on the ChatGPT sign-in.

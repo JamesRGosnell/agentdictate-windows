@@ -104,7 +104,7 @@ impl CopilotProvider {
                 ("claude-opus-5-5", "Claude Opus 5.5"),
                 ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
                 ("claude-haiku-5-5", "Claude Haiku 5.5"),
-                ("claude-fable-5-1", "Claude Fable 5.1"),
+                ("claude-fable-5-2", "Claude Fable 5.2"),
             ],
             Self::ClaudeCode => &[
                 ("opus", "Opus (latest)"),
@@ -524,7 +524,7 @@ impl RewriteEngine {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Quickest => "Fastest model",
-            Self::ClaudeSonnet => "Claude Sonnet (Claude CLI)",
+            Self::ClaudeSonnet => "Claude Sonnet",
         }
     }
 }

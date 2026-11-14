@@ -19,9 +19,9 @@ use std::{
 use agentdictate_core::{
     AlertKind, AnswerStatus, BrainSource, CallView, ChecklistItem, CopilotAction, CopilotAlert,
     CopilotEffort, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft,
-    HeardSpan, INSTANT_GUIDANCE, JUDGE_TRANSCRIPT_CHARS, ListenState, ModelChoice, NotesExtras,
-    QuickAction, RewriteEngine, RewriteStyle, Scorecard, Speaker, SpeakerLabels, TranscriptLine,
-    TurnContext, answer_system_prompt, answer_user_prompt, call_view_system_prompt,
+    Grounding, HeardSpan, INSTANT_GUIDANCE, JUDGE_TRANSCRIPT_CHARS, ListenState, ModelChoice,
+    NotesExtras, QuickAction, RewriteEngine, RewriteStyle, Scorecard, Speaker, SpeakerLabels,
+    TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt, call_view_system_prompt,
     call_view_user_prompt, combined_answer, detected_question_instruction, insights_system_prompt,
     insights_user_prompt_with, is_echo_of, judge_transcript, kept_talking, language_name,
     meeting_checklist, meeting_notes_with, mentions_name, notes_prompt, only_listening,
@@ -112,6 +112,9 @@ const SHOT_SLACK_MS: u64 = 300;
 const PRIME_MIN_CHARS: usize = 4_000;
 /// The Claude model that rewrites through the claude CLI.
 const CLAUDE_REWRITE_MODEL: &str = "sonnet";
+/// Claude Sonnet on the Anthropic API, used for rewrites when its key is
+/// saved: it starts a line in under a second, the CLI in about five.
+const CLAUDE_API_REWRITE_MODEL: &str = "claude-sonnet-5-5";
 /// Names seen in the meeting window kept for the user to pick from.
 const MAX_SEEN_NAMES: usize = 16;
 /// How often the desktop is checked for the meeting still going on.
@@ -2323,7 +2326,13 @@ impl Engine {
             ),
             image_jpeg: None,
             model: settings.answer_model(),
-            effort: CopilotEffort::Low,
+            // A verdict needs no reasoning; Claude would otherwise think
+            // before it, taking up to two seconds.
+            effort: if self.settings.provider == CopilotProvider::AnthropicApi {
+                CopilotEffort::None
+            } else {
+                CopilotEffort::Low
+            },
             web_search: false,
             max_output_tokens: 200,
             cache_key: format!("{}-turns", self.session_key),
@@ -2899,7 +2908,7 @@ impl Engine {
                 }
                 // The researched answer continues the draft the user is
                 // already reading, so it starts once the draft is written.
-                let draft = if instant {
+                let (draft, grounding) = if instant {
                     if !wait_for_instant(&instant_finished, &cancel) {
                         let _ = messages.send(EngineMsg::AnswerFinished {
                             id,
@@ -2910,10 +2919,10 @@ impl Engine {
                     }
                     instant_text
                         .lock()
-                        .map(|text| split_grounding(&text).0)
+                        .map(|text| split_grounding(&text))
                         .unwrap_or_default()
                 } else {
-                    String::new()
+                    (String::new(), None)
                 };
                 if cancel.load(Ordering::Relaxed) {
                     let _ = messages.send(EngineMsg::AnswerFinished {
@@ -2934,7 +2943,10 @@ impl Engine {
                     image_jpeg: image,
                     model,
                     effort: settings.effort,
-                    web_search: settings.web_search,
+                    // A draft drawn from the user's own documents or the
+                    // conversation needs no web search to continue: it
+                    // would add seconds, and could override their documents.
+                    web_search: settings.web_search && grounding != Some(Grounding::Mine),
                     max_output_tokens: 4096,
                     cache_key: session_key,
                 };
@@ -3044,9 +3056,19 @@ impl Engine {
             .unwrap_or_default();
         let mut fallback = self.settings.clone();
         fallback.set_answer_model(self.settings.provider.default_fast_model());
-        // Claude rewrites through the claude CLI; the quickest model steps in
-        // when Claude is unavailable.
+        // Claude rewrites on the Anthropic API when its key is saved, else
+        // through the claude CLI; the quickest model steps in when Claude is
+        // unavailable.
+        let claude_api = !self.settings.anthropic_api_key.trim().is_empty();
         let (settings, fallback) = match self.settings.rewrite_engine {
+            RewriteEngine::ClaudeSonnet if claude_api => {
+                let mut claude = self.settings.clone();
+                claude.provider = CopilotProvider::AnthropicApi;
+                claude.set_answer_model(CLAUDE_API_REWRITE_MODEL);
+                // The quickest model of the chosen engine steps in if it fails.
+                let fallback = Some(fallback);
+                (claude, fallback)
+            }
             RewriteEngine::ClaudeSonnet => {
                 let mut claude = self.settings.clone();
                 claude.provider = CopilotProvider::ClaudeCode;
@@ -3058,6 +3080,12 @@ impl Engine {
             }
             RewriteEngine::Quickest => (fallback, None),
         };
+        // A line to say needs no reasoning first; Claude skips thinking.
+        let effort = if claude_api && self.settings.rewrite_engine == RewriteEngine::ClaudeSonnet {
+            CopilotEffort::None
+        } else {
+            CopilotEffort::Low
+        };
         let mut request = AnswerRequest {
             system: answer_system_prompt(&self.settings, self.knowledge.primer()),
             user: answer_user_prompt(
@@ -3068,7 +3096,7 @@ impl Engine {
             ),
             image_jpeg: None,
             model: settings.answer_model(),
-            effort: CopilotEffort::Low,
+            effort,
             web_search: false,
             max_output_tokens: 400,
             cache_key: format!("{}-instant", self.session_key),

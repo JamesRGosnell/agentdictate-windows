@@ -139,11 +139,7 @@ pub(crate) fn provider_for(
             fallback_models: chatgpt_models.to_vec(),
         })),
         CopilotProvider::OpenaiApi => {
-            let key = if settings.openai_api_key.trim().is_empty() {
-                fallback_openai_key.trim()
-            } else {
-                settings.openai_api_key.trim()
-            };
+            let key = openai_key(settings, fallback_openai_key);
             if key.is_empty() {
                 return Err("Add an OpenAI API key in Copilot settings.".to_owned());
             }
@@ -161,9 +157,13 @@ pub(crate) fn provider_for(
                     "Add an Anthropic API key in Copilot settings to use Claude API.".to_owned(),
                 );
             }
+            // OpenAI's decision service judges turns in a fraction of the
+            // time Claude takes to write a verdict, so it judges whenever an
+            // OpenAI key is saved; Claude still writes every answer.
             Ok(Box::new(AnthropicProvider {
                 client: http_client(),
                 api_key: key.to_owned(),
+                decider: openai_decider(settings, fallback_openai_key),
             }))
         }
         CopilotProvider::ClaudeCode => {
@@ -172,6 +172,26 @@ pub(crate) fn provider_for(
             })?;
             Ok(Box::new(ClaudeCodeProvider { binary }))
         }
+    }
+}
+
+/// OpenAI's decision service on the saved OpenAI key, if there is one.
+fn openai_decider(settings: &CopilotSettings, fallback: &str) -> Option<ResponsesProvider> {
+    let key = openai_key(settings, fallback);
+    (!key.is_empty()).then(|| ResponsesProvider {
+        client: http_client(),
+        endpoint: OPENAI_RESPONSES_ENDPOINT,
+        auth: ResponsesAuth::ApiKey(key.to_owned()),
+        fallback_models: Vec::new(),
+    })
+}
+
+/// The copilot's own OpenAI key, else the one dictation has.
+fn openai_key<'a>(settings: &'a CopilotSettings, fallback: &'a str) -> &'a str {
+    if settings.openai_api_key.trim().is_empty() {
+        fallback.trim()
+    } else {
+        settings.openai_api_key.trim()
     }
 }
 
@@ -593,25 +613,16 @@ fn parse_decision(body: &str) -> Result<f32, String> {
 struct AnthropicProvider {
     client: reqwest::blocking::Client,
     api_key: String,
+    /// OpenAI's decision service, when an OpenAI key is saved.
+    decider: Option<ResponsesProvider>,
 }
 
-fn anthropic_search_tool(model: &str) -> Value {
-    let dynamic = [
-        "opus-5",
-        "opus-4-6",
-        "opus-4-7",
-        "opus-4-8",
-        "sonnet-5",
-        "sonnet-4-6",
-    ]
-    .iter()
-    .any(|family| model.contains(family));
-    let kind = if dynamic {
-        "web_search_20260209"
-    } else {
-        "web_search_20250305"
-    };
-    json!({"type": kind, "name": "web_search", "max_uses": 3})
+/// Claude's basic web search. The newer dynamic-filtering search runs code
+/// behind the scenes and measured 10-16 s to first words on a one-fact
+/// question against 4-5 s for the basic one, which a live call cannot wait
+/// for; answers here need a fact or two, not filtered pages.
+fn anthropic_search_tool(_model: &str) -> Value {
+    json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 3})
 }
 
 fn anthropic_body(request: &AnswerRequest, full: bool) -> Value {
@@ -635,6 +646,9 @@ fn anthropic_body(request: &AnswerRequest, full: bool) -> Value {
     }
     if full {
         body["output_config"] = json!({"effort": request.effort.at_least_low().as_str()});
+        if let Some(thinking) = thinking_off(&request.model, request.effort) {
+            body["thinking"] = thinking;
+        }
         if supports_server_fallback(&request.model) {
             body["fallbacks"] = json!("default");
         }
@@ -642,10 +656,28 @@ fn anthropic_body(request: &AnswerRequest, full: bool) -> Value {
     body
 }
 
+/// Claude thinks by default, which delays the first words of an answer
+/// asked for with no reasoning. Haiku 5.5 can switch thinking off and
+/// Sonnet 5.5 only between tool calls; Opus and Fable always think, so low
+/// effort is their least.
+fn thinking_off(model: &str, effort: CopilotEffort) -> Option<serde_json::Value> {
+    if !matches!(effort, CopilotEffort::None | CopilotEffort::Minimal) {
+        return None;
+    }
+    if model.starts_with("claude-haiku-5") {
+        Some(json!({"type": "disabled"}))
+    } else if model == "claude-sonnet-5-5" {
+        Some(json!({"type": "between_tools"}))
+    } else {
+        None
+    }
+}
+
 fn supports_server_fallback(model: &str) -> bool {
     [
         "claude-opus-5-5",
         "claude-opus-5",
+        "claude-fable-5-2",
         "claude-fable-5-1",
         "claude-sonnet-5-5",
     ]
@@ -653,6 +685,10 @@ fn supports_server_fallback(model: &str) -> bool {
 }
 
 impl AnswerProvider for AnthropicProvider {
+    fn decide(&self, decision: &Decision) -> Option<Result<f32, String>> {
+        self.decider.as_ref()?.decide(decision)
+    }
+
     fn stream(
         &self,
         request: &AnswerRequest,
@@ -996,6 +1032,25 @@ mod tests {
     }
 
     #[test]
+    fn instant_claude_answers_skip_thinking_where_the_model_allows() {
+        let mut request = request();
+        request.effort = CopilotEffort::None;
+        let thinking = |request: &AnswerRequest| anthropic_body(request, true)["thinking"].clone();
+        request.model = "claude-haiku-5-5".into();
+        assert_eq!(thinking(&request)["type"], "disabled");
+        request.model = "claude-sonnet-5-5".into();
+        assert_eq!(thinking(&request)["type"], "between_tools");
+        // Opus cannot stop thinking, and the plain retry sends no thinking.
+        request.model = "claude-opus-5-5".into();
+        assert!(thinking(&request).is_null());
+        request.model = "claude-haiku-5-5".into();
+        assert!(anthropic_body(&request, false)["thinking"].is_null());
+        // Full answers keep thinking.
+        request.effort = CopilotEffort::Low;
+        assert!(thinking(&request).is_null());
+    }
+
+    #[test]
     fn a_decision_asks_one_yes_or_no_question_and_reads_its_probability() {
         let body = decision_body(&Decision {
             rules: "Rules".into(),
@@ -1127,6 +1182,7 @@ mod tests {
             Box::new(AnthropicProvider {
                 client: http_client(),
                 api_key: "unused".into(),
+                decider: None,
             }),
             Box::new(ClaudeCodeProvider {
                 binary: "missing-claude-must-not-start".into(),
@@ -1139,6 +1195,21 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn claude_judges_with_openai_decisions_only_when_an_openai_key_is_saved() {
+        let mut settings = CopilotSettings {
+            provider: CopilotProvider::AnthropicApi,
+            ..CopilotSettings::default()
+        };
+        assert!(openai_decider(&settings, "").is_none());
+        // Dictation's key serves too.
+        assert!(openai_decider(&settings, "sk-dictation").is_some());
+        settings.openai_api_key = "sk-copilot".into();
+        let decider = openai_decider(&settings, "").unwrap();
+        assert_eq!(decider.endpoint, OPENAI_RESPONSES_ENDPOINT);
+        assert!(matches!(decider.auth, ResponsesAuth::ApiKey(ref key) if key == "sk-copilot"));
     }
 
     #[test]
@@ -1161,9 +1232,9 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_body_uses_dynamic_search_and_optional_fields() {
+    fn anthropic_body_uses_basic_search_and_optional_fields() {
         let full = anthropic_body(&request(), true);
-        assert_eq!(full["tools"][0]["type"], "web_search_20260209");
+        assert_eq!(full["tools"][0]["type"], "web_search_20250305");
         assert_eq!(full["output_config"]["effort"], "low");
         assert_eq!(full["fallbacks"], "default");
         assert_eq!(
