@@ -202,9 +202,15 @@ fn run() -> anyhow::Result<()> {
         };
     }
     // `--route meetings` opens the settings window on a page, as the tray's
-    // Meeting notes item does.
+    // Meeting notes item does; `--route copilot-settings` opens Settings on
+    // its Meeting Copilot tab, as the copilot's link does.
     let mut route = Route::Overview;
     let args = match args.as_slice() {
+        [flag, slug] if flag == "--route" && slug == "copilot-settings" => {
+            route = Route::Settings;
+            agentdictate_ui::open_settings_on_copilot();
+            Vec::new()
+        }
         [flag, slug] if flag == "--route" => {
             route = slug.parse().map_err(anyhow::Error::msg)?;
             Vec::new()

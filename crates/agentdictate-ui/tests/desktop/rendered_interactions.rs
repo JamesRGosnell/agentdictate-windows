@@ -1797,6 +1797,8 @@ fn navigating_from_deep_history_opens_settings_at_its_own_top(cx: &mut TestAppCo
     harness.settle_sidebar_motion();
     harness.click(Route::Settings.navigation_id());
 
+    // Settings pins its tabs above the page, so its viewport starts lower.
+    let viewport = harness.bounds("route-content");
     let settings = harness.bounds("settings-page");
     assert!(settings.top() >= viewport.top());
     assert!(settings.top() <= viewport.top() + px(32.));
@@ -1807,16 +1809,14 @@ fn settings_is_one_aligned_page_with_clear_section_hierarchy(cx: &mut TestAppCon
     let mut harness = Harness::open(cx);
     harness.click(Route::Settings.navigation_id());
 
-    let account = harness.bounds("settings-group-account");
     let dictation = harness.bounds("settings-group-dictation");
     let cleanup = harness.bounds("settings-group-cleanup");
     let recording = harness.bounds("settings-group-recording-audio");
     let delivery = harness.bounds("settings-group-delivery-storage");
-    for section in [dictation, cleanup, recording, delivery] {
-        assert!((section.left() - account.left()).abs() <= px(1.));
-        assert!((section.size.width - account.size.width).abs() <= px(1.));
+    for section in [cleanup, recording, delivery] {
+        assert!((section.left() - dictation.left()).abs() <= px(1.));
+        assert!((section.size.width - dictation.size.width).abs() <= px(1.));
     }
-    assert!(account.top() < dictation.top());
     assert!(dictation.top() < cleanup.top());
     assert!(cleanup.top() < recording.top());
     assert!(recording.top() < delivery.top());
@@ -1898,9 +1898,12 @@ fn chatgpt_subscription_replaces_api_controls_with_one_managed_model_status(
     harness.bounds("settings-input-transcription-provider");
     harness.bounds("settings-transcription-managed-by-chatgpt");
     harness.bounds("settings-input-language");
-    harness.bounds("settings-api-key");
     assert!(!harness.has("settings-input-transcription-model"));
+    // The ChatGPT route ignores the speech prompt, work context and
+    // streaming, so none is offered.
     assert!(!harness.has("settings-input-transcription-prompt"));
+    assert!(!harness.has("settings-input-project-context"));
+    assert!(!harness.has("toggle-streaming"));
     assert!(!harness.has("settings-model-catalog-builtin"));
     harness.click("save-settings");
 
@@ -2014,6 +2017,9 @@ fn successful_api_key_save_clears_the_secret_field(cx: &mut TestAppContext) {
     let commands = Arc::new(Mutex::new(Vec::new()));
     let mut harness = Harness::open_connected(cx, Arc::clone(&commands));
 
+    // Without the copilot, the API keys tab holds dictation's own key.
+    assert!(!harness.has("settings-tab-copilot"));
+    harness.click("settings-tab-keys");
     harness.type_text("settings-api-key-input", "sk-test-secret");
     harness.click("save-api-key");
     assert!(!harness.has("settings-feedback"));
@@ -2054,7 +2060,12 @@ impl Harness {
         self.scroll_route_by(-(f32::from(top) - 300.));
     }
 
+    fn open_copilot_tab(&mut self) {
+        self.click("settings-tab-copilot");
+    }
+
     fn open_copilot_advanced(&mut self) {
+        self.open_copilot_tab();
         self.scroll_to("copilot-settings-advanced");
         self.click("copilot-settings-advanced");
     }
@@ -2064,19 +2075,21 @@ impl Harness {
 fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext) {
     let saved = copilot_store(agentdictate_core::CopilotSettings::default());
     let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
+    // The copilot has its own tab, so dictation's page does not run into it.
+    assert!(!harness.has("settings-group-copilot"));
+    harness.open_copilot_tab();
     assert!(harness.has("settings-group-copilot"));
-    // The OpenAI key transcribes the call whatever engine answers.
-    assert!(harness.has("copilot-settings-openai-key"));
-    assert!(!harness.has("copilot-settings-key"));
+    // ChatGPT needs no key, so none is asked for here.
+    assert!(!harness.has("copilot-settings-engine-key"));
     harness.reveal("copilot-settings-provider-3");
-    // OpenAI API is the fourth engine; choosing it saves at once and asks
-    // for its key.
+    // OpenAI API is the fourth engine; choosing it saves at once and shows
+    // that its key is missing.
     harness.click("copilot-settings-provider-3");
     assert_eq!(
         saved.lock().unwrap().provider,
         agentdictate_core::CopilotProvider::OpenaiApi
     );
-    assert!(harness.has("copilot-settings-key"));
+    assert!(harness.has("copilot-settings-engine-key-missing"));
     assert!(harness.has("copilot-settings-feedback"));
     // When to answer is its own group, above the engine, and not a switch.
     assert!(
@@ -2121,12 +2134,12 @@ fn settings_edit_the_meeting_copilot_without_opening_it(cx: &mut TestAppContext)
 fn the_meeting_copilot_shows_seven_things_until_advanced_opens(cx: &mut TestAppContext) {
     copilot_store(agentdictate_core::CopilotSettings::default());
     let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
-    // When to answer, the engine and its key, meeting type, how it opens,
-    // saving notes, your name, and about you.
+    harness.open_copilot_tab();
+    // When to answer, the engine, meeting type, how it opens, saving notes,
+    // your name, and about you.
     for selector in [
         "copilot-settings-answer-mode-auto",
         "copilot-settings-provider-0",
-        "copilot-settings-openai-key",
         "copilot-settings-mode-0",
         "copilot-settings-opens-shortcut",
         "copilot-settings-toggle-3",
@@ -2150,7 +2163,6 @@ fn the_meeting_copilot_shows_seven_things_until_advanced_opens(cx: &mut TestAppC
         "copilot-settings-rewrite-0",
         "copilot-settings-language-auto",
         "copilot-settings-translate-off",
-        "copilot-settings-assemblyai-key",
         "copilot-settings-calendar",
         "copilot-settings-webhook",
         "copilot-settings-brain-0",
@@ -2177,7 +2189,6 @@ fn the_meeting_copilot_shows_seven_things_until_advanced_opens(cx: &mut TestAppC
         "copilot-settings-toggle-13",
         "copilot-settings-answer-0",
         "copilot-settings-fast-0",
-        "copilot-settings-assemblyai-key",
         "copilot-settings-calendar",
         "copilot-settings-webhook",
         "copilot-settings-docs-ask",
@@ -2218,6 +2229,7 @@ fn the_copilot_opens_choice_saves_both_switches(cx: &mut TestAppContext) {
         let saved = saved.lock().unwrap();
         (saved.auto_start, saved.launch_from_dictation_hotkey)
     };
+    harness.open_copilot_tab();
     harness.reveal("copilot-settings-opens-auto");
     harness.click("copilot-settings-opens-auto");
     assert_eq!(switches(&saved), (true, true));
@@ -2269,4 +2281,81 @@ fn company_knowledge_asks_for_leadlord_setup_only_when_chosen(cx: &mut TestAppCo
         saved.lock().unwrap().leadlord_bws_access_token,
         "synthetic-company-token"
     );
+}
+
+#[gpui::test]
+fn api_keys_are_kept_whichever_engine_answers(cx: &mut TestAppContext) {
+    let saved = copilot_store(agentdictate_core::CopilotSettings::default());
+    let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
+    harness.click("settings-tab-keys");
+    for selector in [
+        "settings-key-openai-missing",
+        "settings-key-anthropic-missing",
+        "settings-key-assemblyai-missing",
+    ] {
+        assert!(harness.has(selector), "{selector}");
+    }
+    // An Anthropic key can be stored while ChatGPT still answers.
+    harness.type_text("settings-key-anthropic-input", "sk-ant-synthetic");
+    harness.click("settings-key-anthropic-save");
+    {
+        let saved = saved.lock().unwrap();
+        assert_eq!(saved.anthropic_api_key, "sk-ant-synthetic");
+        assert_eq!(
+            saved.provider,
+            agentdictate_core::CopilotProvider::ChatgptSubscription
+        );
+    }
+    assert!(harness.has("settings-key-anthropic-saved"));
+    assert!(harness.has("copilot-settings-feedback"));
+
+    // Switching to the Claude API finds the key already saved, and the
+    // other engines' keys stay where they were.
+    harness.click("settings-tab-copilot");
+    harness.reveal("copilot-settings-provider-1");
+    harness.click("copilot-settings-provider-1");
+    assert!(harness.has("copilot-settings-engine-key-saved"));
+    harness.click("copilot-settings-provider-3");
+    assert!(harness.has("copilot-settings-engine-key-missing"));
+    assert_eq!(saved.lock().unwrap().anthropic_api_key, "sk-ant-synthetic");
+    // Its button goes straight to the keys.
+    harness.click("copilot-settings-manage-keys");
+    assert!(harness.has("settings-group-keys"));
+    assert!(harness.has("settings-key-anthropic-saved"));
+}
+
+#[gpui::test]
+fn ducking_details_show_only_while_ducking_is_on(cx: &mut TestAppContext) {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let settings = Settings {
+        audio_ducking_enabled: false,
+        ..Settings::default()
+    };
+    let model = ShellViewModel::from_snapshot(
+        Route::Settings,
+        WorkflowSnapshot {
+            phase: WorkflowPhase::Ready,
+        },
+    );
+    let mut harness = Harness::open_connected_with(cx, model, settings, true, commands);
+    harness.scroll_to("toggle-audio-ducking");
+    for selector in [
+        "settings-input-ducked-volume",
+        "settings-input-ducking-fade-out",
+        "settings-input-ducking-fade-in",
+    ] {
+        assert!(!harness.has(selector), "{selector}");
+    }
+    harness.click("toggle-audio-ducking");
+    harness.bounds("settings-input-ducked-volume");
+    harness.bounds("settings-input-ducking-fade-in");
+}
+
+#[gpui::test]
+fn the_copilots_link_opens_settings_on_its_tab(cx: &mut TestAppContext) {
+    copilot_store(agentdictate_core::CopilotSettings::default());
+    agentdictate_ui::open_settings_on_copilot();
+    let mut harness = Harness::open_connected(cx, Arc::new(Mutex::new(Vec::new())));
+    assert!(harness.has("settings-group-copilot"));
+    assert!(!harness.has("settings-group-dictation"));
 }

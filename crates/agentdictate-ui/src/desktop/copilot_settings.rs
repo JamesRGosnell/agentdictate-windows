@@ -1,8 +1,12 @@
-//! The Meeting Copilot section of the main window's Settings, so the copilot
-//! can be set up without starting a meeting. It shows the seven settings
-//! most people change, with the rest behind a collapsed "Advanced" group.
-//! Choices save at once; text saves with any Save button. A running meeting
-//! keeps its settings until the next one starts.
+//! The Meeting Copilot and API keys tabs of the main window's Settings, so
+//! the copilot can be set up without starting a meeting. The copilot tab
+//! shows the seven settings most people change, with the rest behind a
+//! collapsed "Advanced" group. Choices save at once; text saves with any Save
+//! button. A running meeting keeps its settings until the next one starts.
+//!
+//! Every API key lives in the copilot's settings file and is kept whichever
+//! engine is chosen, so engines can be swapped without pasting keys again.
+//! Dictation borrows the OpenAI key from there.
 
 use std::{cell::RefCell, sync::Arc};
 
@@ -59,10 +63,26 @@ fn store() -> Option<CopilotSettingsStore> {
     STORE.with(|slot| slot.borrow().clone())
 }
 
+thread_local! {
+    static OPEN_ON_COPILOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Opens the next Settings on its Meeting Copilot tab, as the copilot's own
+/// link to Settings does; call on the UI thread before the window opens.
+pub fn open_settings_on_copilot() {
+    OPEN_ON_COPILOT.with(|flag| flag.set(true));
+}
+
+/// Whether Settings should open on the Meeting Copilot tab; asked once.
+pub(super) fn take_open_on_copilot() -> bool {
+    OPEN_ON_COPILOT.with(std::cell::Cell::take) && store().is_some()
+}
+
 /// A switch: label, detail, whether it is on, and how to flip it.
 type Toggle = (&'static str, &'static str, bool, fn(&mut CopilotSettings));
 
 const SAVED: &str = "Saved. Applies when your next meeting starts.";
+const KEYS_SAVED: &str = "Keys saved.";
 
 #[derive(Default)]
 pub(super) struct CopilotSettingsState {
@@ -218,6 +238,13 @@ pub(super) struct CopilotSectionModel {
     feedback: Option<String>,
 }
 
+impl CopilotSectionModel {
+    /// What the last instant save did, shown above the page.
+    pub(super) fn feedback(&self) -> Option<&str> {
+        self.feedback.as_deref()
+    }
+}
+
 impl SettingsShell {
     /// Applies a choice to the copilot settings and saves it at once.
     fn update_copilot(
@@ -233,8 +260,9 @@ impl SettingsShell {
         cx.notify();
     }
 
-    /// Saves the copilot's text fields: API keys, About you, instructions.
-    fn save_copilot_text(&mut self, cx: &mut Context<Self>) {
+    /// Saves the API keys tab. Dictation picks up a new OpenAI key on its
+    /// next recording, so the model list is refreshed with it now.
+    fn save_copilot_keys(&mut self, cx: &mut Context<Self>) {
         let read = |input: &Option<Entity<InputState>>, cx: &Context<Self>| {
             input
                 .as_ref()
@@ -243,6 +271,45 @@ impl SettingsShell {
         let openai = read(&self.copilot.openai_key, cx);
         let anthropic = read(&self.copilot.anthropic_key, cx);
         let assemblyai = read(&self.copilot.assemblyai_key, cx);
+        let openai_before = self
+            .copilot
+            .settings
+            .as_ref()
+            .map(|settings| settings.openai_api_key.clone());
+        self.update_copilot(cx, |settings| {
+            if let Some(key) = openai {
+                settings.openai_api_key = key;
+            }
+            if let Some(key) = anthropic {
+                settings.anthropic_api_key = key;
+            }
+            if let Some(key) = assemblyai {
+                settings.assemblyai_api_key = key;
+            }
+        });
+        if self.copilot.feedback.as_deref() == Some(SAVED) {
+            self.copilot.feedback = Some(KEYS_SAVED.to_owned());
+        }
+        let openai_after = self
+            .copilot
+            .settings
+            .as_ref()
+            .map(|settings| settings.openai_api_key.clone());
+        if openai_after != openai_before && openai_after.as_ref().is_some_and(|key| !key.is_empty())
+        {
+            self.settings_commands.has_api_key = true;
+            self.request_model_catalog_refresh();
+        }
+    }
+
+    /// Saves the copilot's text fields: About you, instructions, and its
+    /// connections.
+    fn save_copilot_text(&mut self, cx: &mut Context<Self>) {
+        let read = |input: &Option<Entity<InputState>>, cx: &Context<Self>| {
+            input
+                .as_ref()
+                .map(|input| input.read(cx).value().trim().to_owned())
+        };
         let profile = read(&self.copilot.profile, cx);
         let instructions = read(&self.copilot.instructions, cx);
         let leadlord_cli = read(&self.copilot.leadlord_cli, cx);
@@ -265,15 +332,6 @@ impl SettingsShell {
             }
             if let Some(webhook) = webhook {
                 settings.webhook_url = webhook;
-            }
-            if let Some(key) = openai {
-                settings.openai_api_key = key;
-            }
-            if let Some(key) = anthropic {
-                settings.anthropic_api_key = key;
-            }
-            if let Some(key) = assemblyai {
-                settings.assemblyai_api_key = key;
             }
             if let Some(profile) = profile {
                 settings.profile = profile;
@@ -361,9 +419,6 @@ pub(super) fn section(
 ) -> gpui::Div {
     let CopilotSectionModel {
         settings,
-        openai_key,
-        anthropic_key,
-        assemblyai_key,
         profile,
         instructions,
         leadlord_cli,
@@ -375,42 +430,10 @@ pub(super) fn section(
         docs_answer,
         docs_asking,
         advanced_open,
-        feedback,
+        ..
     } = model;
     let provider = settings.provider;
-    // Only the key the chosen engine needs, plus the OpenAI key, which also
-    // transcribes the call whatever engine answers.
-    let mut keys = Vec::new();
-    if provider == CopilotProvider::AnthropicApi {
-        keys.push((
-            "copilot-settings-key",
-            "Anthropic API key",
-            "For Claude answers. Stored on this computer.",
-            anthropic_key,
-            "copilot-settings-save-key",
-        ));
-    }
-    keys.push((
-        if provider == CopilotProvider::OpenaiApi {
-            "copilot-settings-key"
-        } else {
-            "copilot-settings-openai-key"
-        },
-        "OpenAI API key",
-        if provider == CopilotProvider::OpenaiApi {
-            "For answers and transcription. Stored on this computer."
-        } else {
-            "For transcription. Stored on this computer."
-        },
-        openai_key,
-        "copilot-settings-save-openai-key",
-    ));
-    let key_rows = keys
-        .into_iter()
-        .map(|(selector, label, detail, input, save)| {
-            input_save_row(selector, label, detail, &input, save, theme, cx)
-        })
-        .collect::<Vec<_>>();
+    let engine_key = engine_key_row(&settings, theme, cx);
     let answer_model = settings.answer_model();
     let fast_model = settings.fast_model();
 
@@ -685,12 +708,12 @@ pub(super) fn section(
     let engine = settings_section(
         "settings-group-copilot-engine",
         "Answer engine",
-        "Which AI writes the answers, and the key it uses.",
+        "Which AI writes the answers. Keys are kept under API keys, so you can switch freely.",
         false,
         theme,
     )
     .child(chip_row("Engine", provider.detail(), provider_chips, theme))
-    .children(key_rows);
+    .children(engine_key);
 
     let meetings = settings_section(
         "settings-group-copilot-meetings",
@@ -824,15 +847,6 @@ pub(super) fn section(
             "Connections",
             theme,
         )
-        .child(input_save_row(
-            "copilot-settings-assemblyai-key",
-            "AssemblyAI API key",
-            "Optional. Transcribes calls faster than OpenAI.",
-            &assemblyai_key,
-            "copilot-settings-save-assemblyai-key",
-            theme,
-            cx,
-        ))
         .child(input_save_row(
             "copilot-settings-calendar",
             "Calendar feed",
@@ -973,15 +987,196 @@ pub(super) fn section(
         .child(meetings)
         .child(about)
         .child(advanced)
-        .when_some(feedback, |column, feedback| {
-            column.child(
-                gpui::div()
-                    .debug_selector(|| "copilot-settings-feedback".to_owned())
-                    .text_xs()
-                    .text_color(gpui_color(theme.text_muted))
-                    .child(feedback),
-            )
-        })
+}
+
+/// The key the chosen engine answers with, if it needs one, and whether it
+/// is saved; the keys themselves are edited under API keys.
+fn engine_key_row(
+    settings: &CopilotSettings,
+    theme: ThemeTokens,
+    cx: &mut Context<SettingsShell>,
+) -> Option<gpui::Div> {
+    let (detail, saved) = match settings.provider {
+        CopilotProvider::AnthropicApi => (
+            "Claude API answers with your Anthropic key",
+            !settings.anthropic_api_key.trim().is_empty(),
+        ),
+        CopilotProvider::OpenaiApi => (
+            "OpenAI API answers with your OpenAI key",
+            !settings.openai_api_key.trim().is_empty(),
+        ),
+        CopilotProvider::ChatgptSubscription | CopilotProvider::ClaudeCode => return None,
+    };
+    Some(
+        h_flex()
+            .debug_selector(|| "copilot-settings-engine-key".to_owned())
+            .min_h(px(52.))
+            .justify_between()
+            .gap_6()
+            .border_b_1()
+            .border_color(gpui_color(theme.border))
+            .py_2()
+            .child(setting_label("API key", detail, theme))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_3()
+                    .child(
+                        gpui::div()
+                            .debug_selector(move || {
+                                if saved {
+                                    "copilot-settings-engine-key-saved".to_owned()
+                                } else {
+                                    "copilot-settings-engine-key-missing".to_owned()
+                                }
+                            })
+                            .text_xs()
+                            .text_color(gpui_color(if saved {
+                                theme.success
+                            } else {
+                                theme.danger
+                            }))
+                            .child(if saved { "Saved" } else { "Not set" }),
+                    )
+                    .child(
+                        action_button("copilot-settings-manage-keys")
+                            .debug_selector(|| "copilot-settings-manage-keys".to_owned())
+                            .small()
+                            .label(if saved { "Manage keys" } else { "Add key" })
+                            .on_click(cx.listener(|shell, _, _, cx| {
+                                shell.select_settings_tab(
+                                    super::settings_page::SettingsTab::Keys,
+                                    cx,
+                                );
+                            })),
+                    ),
+            ),
+    )
+}
+
+/// The API keys tab: every key the app can use, kept whichever engine is
+/// chosen.
+pub(super) fn keys_section(
+    model: &CopilotSectionModel,
+    dictation_has_openai_key: bool,
+    theme: ThemeTokens,
+    cx: &mut Context<SettingsShell>,
+) -> gpui::Div {
+    let settings = &model.settings;
+    let provider = settings.provider;
+    let rows = [
+        (
+            "openai",
+            "OpenAI",
+            "Dictation with the OpenAI API source, meeting transcription, and the OpenAI API engine",
+            &model.openai_key,
+            !settings.openai_api_key.trim().is_empty() || dictation_has_openai_key,
+            provider == CopilotProvider::OpenaiApi,
+        ),
+        (
+            "anthropic",
+            "Anthropic",
+            "The Claude API answer engine",
+            &model.anthropic_key,
+            !settings.anthropic_api_key.trim().is_empty(),
+            provider == CopilotProvider::AnthropicApi,
+        ),
+        (
+            "assemblyai",
+            "AssemblyAI",
+            "Optional. Transcribes meetings faster than OpenAI",
+            &model.assemblyai_key,
+            !settings.assemblyai_api_key.trim().is_empty(),
+            false,
+        ),
+    ];
+    settings_section(
+        "settings-group-keys",
+        "API keys",
+        "Stored on this computer. Keys stay saved when you switch engines.",
+        false,
+        theme,
+    )
+    .children(
+        rows.into_iter()
+            .map(|(slug, label, detail, input, saved, answers)| {
+                key_row(slug, label, detail, input, saved, answers, theme, cx)
+            }),
+    )
+}
+
+/// One key: its masked field, its Save, and whether it is saved.
+#[allow(clippy::too_many_arguments)]
+fn key_row(
+    slug: &'static str,
+    label: &'static str,
+    detail: &'static str,
+    input: &Entity<InputState>,
+    saved: bool,
+    answers: bool,
+    theme: ThemeTokens,
+    cx: &mut Context<SettingsShell>,
+) -> gpui::Div {
+    let status = if saved && answers {
+        "In use for answers"
+    } else if saved {
+        "Saved"
+    } else {
+        "Not set"
+    };
+    v_flex()
+        .debug_selector(move || format!("settings-key-{slug}"))
+        .w_full()
+        .gap_2()
+        .border_b_1()
+        .border_color(gpui_color(theme.border))
+        .py_3()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .gap_6()
+                .child(setting_label(label, detail, theme))
+                .child(
+                    gpui::div()
+                        .debug_selector(move || {
+                            format!(
+                                "settings-key-{slug}-{}",
+                                if saved { "saved" } else { "missing" }
+                            )
+                        })
+                        .flex_none()
+                        .text_xs()
+                        .text_color(gpui_color(if saved {
+                            theme.success
+                        } else {
+                            theme.text_muted
+                        }))
+                        .child(status),
+                ),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .child(
+                    gpui::div()
+                        .debug_selector(move || format!("settings-key-{slug}-input"))
+                        .min_w_0()
+                        .flex_1()
+                        .child(Input::new(input).small().w_full()),
+                )
+                .child(
+                    action_button(gpui::ElementId::Name(
+                        format!("settings-key-{slug}-save").into(),
+                    ))
+                    .debug_selector(move || format!("settings-key-{slug}-save"))
+                    .small()
+                    .primary()
+                    .label("Save")
+                    .on_click(cx.listener(|shell, _, _, cx| shell.save_copilot_keys(cx))),
+                ),
+        )
 }
 
 /// One labelled part of the "Advanced" group.

@@ -20,6 +20,8 @@ pub(super) struct SettingsEditState {
     pub(super) dirty: bool,
     pub(super) shortcut_capture_active: bool,
     pub(super) shortcut_capture_error: Option<String>,
+    /// Which part of Settings is shown.
+    pub(super) tab: super::settings_page::SettingsTab,
 }
 
 impl SettingsEditState {
@@ -33,6 +35,7 @@ impl SettingsEditState {
             dirty: false,
             shortcut_capture_active: false,
             shortcut_capture_error: None,
+            tab: super::settings_page::SettingsTab::default(),
         }
     }
 }
@@ -285,6 +288,11 @@ impl SettingsShell {
                 dirty: false,
                 shortcut_capture_active: false,
                 shortcut_capture_error: None,
+                tab: if super::copilot_settings::take_open_on_copilot() {
+                    super::settings_page::SettingsTab::Copilot
+                } else {
+                    super::settings_page::SettingsTab::default()
+                },
             },
             settings_commands: SettingsCommandState {
                 has_api_key,
@@ -323,6 +331,22 @@ impl SettingsShell {
 
     pub const fn sidebar_is_open(&self) -> bool {
         self.layout.sidebar_open
+    }
+
+    /// Shows one part of Settings from its top.
+    pub(super) fn select_settings_tab(
+        &mut self,
+        tab: super::settings_page::SettingsTab,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.tab != tab {
+            self.settings.tab = tab;
+            self.routes
+                .entry(Route::Settings)
+                .scroll
+                .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+        }
+        cx.notify();
     }
 
     pub(super) fn select_route(

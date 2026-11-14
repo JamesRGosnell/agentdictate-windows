@@ -37,7 +37,9 @@ use settings_shell::{
     RouteUiState, SettingsCommandState, SettingsEditState, ShellLayoutState, WorkspaceActionState,
 };
 
-pub use copilot_settings::{CopilotSettingsStore, set_copilot_settings_store};
+pub use copilot_settings::{
+    CopilotSettingsStore, open_settings_on_copilot, set_copilot_settings_store,
+};
 pub use copilot_view::{CopilotActionSink, CopilotWindow};
 pub use overlay_view::RecordingOverlay;
 

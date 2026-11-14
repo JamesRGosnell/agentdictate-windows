@@ -31,6 +31,45 @@ pub(super) struct SettingsPageModel {
     pub(super) shortcut_capture_active: bool,
     pub(super) shortcut_capture_error: Option<String>,
     pub(super) copilot: Option<super::copilot_settings::CopilotSectionModel>,
+    pub(super) tab: SettingsTab,
+}
+
+/// The parts of Settings, one per app plus the keys they share, chosen from
+/// tabs pinned above the page so no part is a long scroll away.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SettingsTab {
+    #[default]
+    Dictation,
+    Copilot,
+    Keys,
+}
+
+impl SettingsTab {
+    const ALL: [Self; 3] = [Self::Dictation, Self::Copilot, Self::Keys];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dictation => "Dictation",
+            Self::Copilot => "Meeting Copilot",
+            Self::Keys => "API keys",
+        }
+    }
+
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Dictation => "dictation",
+            Self::Copilot => "copilot",
+            Self::Keys => "keys",
+        }
+    }
+
+    /// The Meeting Copilot tab exists only where the copilot does.
+    const fn shown(self, has_copilot: bool) -> Self {
+        match self {
+            Self::Copilot if !has_copilot => Self::Dictation,
+            tab => tab,
+        }
+    }
 }
 
 /// Keeps short controls compact while allowing long-form prompts to use the
@@ -84,6 +123,7 @@ pub(super) fn surface(
         shortcut_capture_active,
         shortcut_capture_error,
         copilot,
+        tab,
         ..
     } = model;
     let transcription_provider =
@@ -98,64 +138,115 @@ pub(super) fn surface(
             });
     let uses_chatgpt_subscription =
         transcription_provider == TranscriptionProvider::ChatGptSubscription;
-    h_flex().w_full().justify_center().child(
-        v_flex()
-            .debug_selector(|| "settings-page".to_owned())
-            .w_full()
-            .max_w(px(980.))
-            .gap_6()
-            .child(
-                h_flex().justify_between().gap_6().child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            gpui::div()
-                                .text_base()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child("Settings"),
-                        )
-                        .child(
-                            gpui::div()
-                                .text_xs()
-                                .text_color(gpui_color(theme.text_muted))
-                                .child("Changes apply to the running dictation service."),
-                        ),
-                ),
-            )
-            .child(account_section(
+    let page = v_flex()
+        .debug_selector(|| "settings-page".to_owned())
+        .w_full()
+        .max_w(px(980.))
+        .gap_6();
+    let page =
+        match (tab.shown(copilot.is_some()), copilot) {
+            (SettingsTab::Copilot, Some(copilot)) => {
+                page.child(super::copilot_settings::section(copilot, theme, window, cx))
+            }
+            (SettingsTab::Keys, Some(copilot)) => page.child(
+                super::copilot_settings::keys_section(&copilot, has_api_key, theme, cx),
+            ),
+            // Without the copilot, dictation's own OpenAI key is the only one.
+            (SettingsTab::Keys, None) => page.child(account_section(
                 has_api_key,
                 api_key_input,
                 api_key_feedback,
                 uses_chatgpt_subscription,
                 theme,
                 cx,
-            ))
-            .child(dictation_section(
-                &settings,
-                &model_catalog,
-                settings_form.as_ref(),
-                theme,
-                cx,
-            ))
-            .child(output_section(&settings, settings_form.as_ref(), theme, cx))
-            .child(recording_audio_section(
-                &settings,
-                settings_form.as_ref(),
-                shortcut_capture_active,
-                shortcut_capture_error,
-                theme,
-                cx,
-            ))
-            .child(delivery_storage_section(
-                &settings,
-                settings_form.as_ref(),
-                theme,
-                cx,
-            ))
-            .when_some(copilot, |page, copilot| {
-                page.child(super::copilot_settings::section(copilot, theme, window, cx))
-            }),
-    )
+            )),
+            _ => page
+                .child(dictation_section(
+                    &settings,
+                    &model_catalog,
+                    settings_form.as_ref(),
+                    theme,
+                    cx,
+                ))
+                .child(output_section(&settings, settings_form.as_ref(), theme))
+                .child(recording_audio_section(
+                    &settings,
+                    settings_form.as_ref(),
+                    shortcut_capture_active,
+                    shortcut_capture_error,
+                    theme,
+                    cx,
+                ))
+                .child(delivery_storage_section(
+                    &settings,
+                    settings_form.as_ref(),
+                    theme,
+                    cx,
+                )),
+        };
+    h_flex().w_full().justify_center().child(page)
+}
+
+/// Pinned above the page: a tab per part of Settings, and what the last
+/// instant save of a copilot choice or key did.
+pub(super) fn header(
+    model: &SettingsPageModel,
+    theme: ThemeTokens,
+    cx: &mut Context<SettingsShell>,
+) -> gpui::Div {
+    let has_copilot = model.copilot.is_some();
+    let current = model.tab.shown(has_copilot);
+    let tabs = SettingsTab::ALL
+        .into_iter()
+        .filter(|tab| has_copilot || *tab != SettingsTab::Copilot)
+        .map(|tab| {
+            action_button(("settings-tab", tab as usize))
+                .debug_selector(move || format!("settings-tab-{}", tab.slug()))
+                .small()
+                .selected(tab == current)
+                .label(tab.label())
+                .on_click(cx.listener(move |shell, _, _, cx| {
+                    shell.select_settings_tab(tab, cx);
+                }))
+        })
+        .collect::<Vec<_>>();
+    let feedback = if current == SettingsTab::Dictation {
+        None
+    } else {
+        model
+            .copilot
+            .as_ref()
+            .and_then(super::copilot_settings::CopilotSectionModel::feedback)
+            .map(str::to_owned)
+    };
+    h_flex()
+        .debug_selector(|| "settings-tabs".to_owned())
+        .flex_none()
+        .w_full()
+        .justify_center()
+        .border_b_1()
+        .border_color(gpui_color(theme.border))
+        .bg(gpui_color(theme.canvas))
+        .px_6()
+        .py_2()
+        .child(
+            h_flex()
+                .w_full()
+                .max_w(px(980.))
+                .justify_between()
+                .gap_4()
+                .child(h_flex().flex_none().gap_2().children(tabs))
+                .when_some(feedback, |bar, feedback| {
+                    bar.child(
+                        gpui::div()
+                            .debug_selector(|| "copilot-settings-feedback".to_owned())
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(gpui_color(theme.text_muted))
+                            .child(feedback),
+                    )
+                }),
+        )
 }
 
 /// Rendered below the route viewport so actions and feedback stay visible.
@@ -191,7 +282,15 @@ pub(super) fn footer(
                             .text_xs()
                             .text_color(gpui_color(theme.text_muted))
                             .when(model.settings_dirty, |status| {
-                                status.child("Unsaved changes")
+                                status.child(
+                                    if model.tab.shown(model.copilot.is_some())
+                                        == SettingsTab::Dictation
+                                    {
+                                        "Unsaved changes"
+                                    } else {
+                                        "Unsaved dictation changes"
+                                    },
+                                )
                             })
                             .when_some(model.feedback.clone(), |status, feedback| {
                                 status.child(
@@ -251,8 +350,8 @@ fn account_section(
 ) -> gpui::Div {
     settings_section(
         "settings-group-account",
-        "Account",
-        "API access is stored locally.",
+        "API keys",
+        "Stored on this computer.",
         false,
         theme,
     )
@@ -342,7 +441,7 @@ fn dictation_section(
     model_catalog: &ModelCatalogViewModel,
     editor: Option<&SettingsFormState>,
     theme: ThemeTokens,
-    cx: &Context<SettingsShell>,
+    cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
     let transcription_provider = editor.map_or(settings.transcription_provider, |editor| {
         selected_transcription_provider(
@@ -453,20 +552,41 @@ fn dictation_section(
         false,
         theme,
     ))
+    // The speech prompt and streaming exist only on the OpenAI API; the
+    // ChatGPT route ignores both.
     .when(!uses_chatgpt_subscription, |section| {
-        section.child(prompt_row(
-            "Context prompt",
-            "Describe what you are talking about; spellings belong in Vocabulary",
-            if settings.transcription_prompt.is_empty() {
-                "None"
-            } else {
-                &settings.transcription_prompt
-            },
-            "settings-input-transcription-prompt",
-            editor.map(|editor| editor.transcription_prompt.clone()),
-            false,
-            theme,
-        ))
+        section
+            .child(prompt_row(
+                "Context prompt",
+                "Describe what you usually talk about; spellings belong in Vocabulary",
+                if settings.transcription_prompt.is_empty() {
+                    "None"
+                } else {
+                    &settings.transcription_prompt
+                },
+                "settings-input-transcription-prompt",
+                editor.map(|editor| editor.transcription_prompt.clone()),
+                false,
+                theme,
+            ))
+            .child(prompt_row(
+                "Current work context",
+                "Added to the context prompt; clear it when you change projects",
+                &settings.project_context,
+                "settings-input-project-context",
+                editor.map(|editor| editor.project_context.clone()),
+                false,
+                theme,
+            ))
+            .child(toggle_row(
+                "Stream speech",
+                "Experimental: transcribes while you speak, falling back to the saved audio",
+                settings.streaming_enabled,
+                "toggle-streaming",
+                theme,
+                cx,
+                |draft| draft.streaming_enabled = !draft.streaming_enabled,
+            ))
     })
 }
 
@@ -524,7 +644,6 @@ fn output_section(
     settings: &SettingsDraft,
     editor: Option<&SettingsFormState>,
     theme: ThemeTokens,
-    cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
     settings_section(
         "settings-group-cleanup",
@@ -550,24 +669,6 @@ fn output_section(
         editor.map(|editor| editor.vocabulary.clone()),
         false,
         theme,
-    ))
-    .child(prompt_row(
-        "Current work context",
-        "Optional context you supply; clear it when changing projects",
-        &settings.project_context,
-        "settings-input-project-context",
-        editor.map(|editor| editor.project_context.clone()),
-        false,
-        theme,
-    ))
-    .child(toggle_row(
-        "Stream speech",
-        "Experimental OpenAI API streaming; falls back to saved audio",
-        settings.streaming_enabled,
-        "toggle-streaming",
-        theme,
-        cx,
-        |draft| draft.streaming_enabled = !draft.streaming_enabled,
     ))
 }
 
@@ -595,7 +696,7 @@ fn recording_audio_section(
     ))
     .child(select_row(
         "Recording mode",
-        "Use toggle or hold",
+        "Toggle: press to start and again to stop. Hold: records while held.",
         &settings.recording_mode,
         "settings-input-recording-mode",
         editor.map(|editor| editor.recording_mode.clone()),
@@ -621,36 +722,40 @@ fn recording_audio_section(
         cx,
         |draft| draft.audio_ducking_enabled = !draft.audio_ducking_enabled,
     ))
-    .child(number_row(
-        "Ducked volume",
-        "Percentage of the original playback volume",
-        &format!("{}%", settings.audio_ducking_volume_percent),
-        "settings-input-ducked-volume",
-        editor.map(|editor| editor.audio_ducking_volume_percent.clone()),
-        "%",
-        !settings.audio_ducking_enabled,
-        theme,
-    ))
-    .child(number_row(
-        "Fade out (ms)",
-        "Time to lower playback volume",
-        &format!("{} ms", settings.audio_ducking_fade_out_ms),
-        "settings-input-ducking-fade-out",
-        editor.map(|editor| editor.audio_ducking_fade_out_ms.clone()),
-        "ms",
-        !settings.audio_ducking_enabled,
-        theme,
-    ))
-    .child(number_row(
-        "Fade in (ms)",
-        "Time to restore playback volume",
-        &format!("{} ms", settings.audio_ducking_fade_in_ms),
-        "settings-input-ducking-fade-in",
-        editor.map(|editor| editor.audio_ducking_fade_in_ms.clone()),
-        "ms",
-        !settings.audio_ducking_enabled,
-        theme,
-    ))
+    // Its volume and fades matter only while ducking is on.
+    .when(settings.audio_ducking_enabled, |section| {
+        section
+            .child(number_row(
+                "Ducked volume",
+                "Percentage of the original playback volume",
+                &format!("{}%", settings.audio_ducking_volume_percent),
+                "settings-input-ducked-volume",
+                editor.map(|editor| editor.audio_ducking_volume_percent.clone()),
+                "%",
+                false,
+                theme,
+            ))
+            .child(number_row(
+                "Fade out",
+                "Time to lower playback volume",
+                &format!("{} ms", settings.audio_ducking_fade_out_ms),
+                "settings-input-ducking-fade-out",
+                editor.map(|editor| editor.audio_ducking_fade_out_ms.clone()),
+                "ms",
+                false,
+                theme,
+            ))
+            .child(number_row(
+                "Fade in",
+                "Time to restore playback volume",
+                &format!("{} ms", settings.audio_ducking_fade_in_ms),
+                "settings-input-ducking-fade-in",
+                editor.map(|editor| editor.audio_ducking_fade_in_ms.clone()),
+                "ms",
+                false,
+                theme,
+            ))
+    })
 }
 
 fn delivery_storage_section(
@@ -668,7 +773,11 @@ fn delivery_storage_section(
     )
     .child(select_row(
         "Paste shortcut",
-        "Automatic detects X11/XWayland apps; native Wayland uses Shift+Insert",
+        if cfg!(windows) {
+            "Automatic uses Ctrl+Shift+V in Windows Terminal and Shift+Insert in PuTTY"
+        } else {
+            "Automatic detects X11/XWayland apps; native Wayland uses Shift+Insert"
+        },
         &settings.paste_shortcut,
         "settings-input-paste-shortcut",
         editor.map(|editor| editor.paste_shortcut.clone()),
@@ -694,8 +803,8 @@ fn delivery_storage_section(
         |draft| draft.save_history = !draft.save_history,
     ))
     .child(toggle_row(
-        "Preserve temporary audio",
-        "Keep recordings after successful transcription",
+        "Keep recordings",
+        "Keep the audio file after a successful transcription",
         settings.preserve_temp_audio,
         "toggle-preserve-audio",
         theme,

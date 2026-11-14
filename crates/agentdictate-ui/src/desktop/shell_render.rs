@@ -110,6 +110,7 @@ impl RoutePageModel {
                 shortcut_capture_active: shell.settings.shortcut_capture_active,
                 shortcut_capture_error: shell.settings.shortcut_capture_error.clone(),
                 copilot: shell.copilot.model(),
+                tab: shell.settings.tab,
             })),
         }
     }
@@ -290,9 +291,12 @@ fn main_panel(
     cx: &mut Context<SettingsShell>,
 ) -> gpui::Div {
     let route = viewport.page.route();
-    let footer = match &viewport.page {
-        RoutePageModel::Settings(settings) => settings_page::footer(settings, chrome.theme, cx),
-        _ => None,
+    let (header, footer) = match &viewport.page {
+        RoutePageModel::Settings(settings) => (
+            Some(settings_page::header(settings, chrome.theme, cx)),
+            settings_page::footer(settings, chrome.theme, cx),
+        ),
+        _ => (None, None),
     };
     v_flex()
         .h_full()
@@ -305,6 +309,7 @@ fn main_panel(
             chrome.theme,
             cx,
         ))
+        .when_some(header, |panel, header| panel.child(header))
         .child(route_viewport(viewport, chrome.theme, window, cx))
         .when_some(footer, |panel, footer| panel.child(footer))
 }

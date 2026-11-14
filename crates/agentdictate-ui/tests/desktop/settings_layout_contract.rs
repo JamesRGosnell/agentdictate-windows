@@ -221,8 +221,9 @@ fn maximum_recording_step_buttons_are_real_click_targets(cx: &mut TestAppContext
 #[gpui::test]
 fn settings_sections_form_one_flat_ordered_column(cx: &mut TestAppContext) {
     let mut harness = SettingsHarness::open(cx, Arc::new(Mutex::new(Vec::new())));
+    // API keys have their own tab.
+    assert!(!harness.has("settings-group-account"));
     let sections = [
-        harness.bounds("settings-group-account"),
         harness.bounds("settings-group-dictation"),
         harness.bounds("settings-group-cleanup"),
         harness.bounds("settings-group-recording-audio"),
