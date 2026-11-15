@@ -181,9 +181,78 @@ pub fn only_listening(lines: &[TranscriptLine], now_ms: u64) -> bool {
     echoes >= LISTENING_ECHO_LINES && own_words <= LISTENING_OWN_WORDS
 }
 
+/// How far back a repeated question is looked for.
+const ASKED_AGAIN_WINDOW_MS: u64 = 60_000;
+/// Share of the question's words an earlier line must hold to be the same
+/// question asked before.
+const ASKED_AGAIN_CONTAINMENT: f32 = 0.8;
+/// Questions shorter than this are too generic to count as repeats.
+const ASKED_AGAIN_MIN_WORDS: usize = 3;
+
+/// Whether the other side's latest line, `question`, repeats a question they
+/// asked within the last minute. Asking again means nobody answered, so the
+/// user gets help even when the judge read the first ask as meant for
+/// someone else. `lines` ends with that latest line.
+#[must_use]
+pub fn asked_again(lines: &[TranscriptLine], question: &str) -> bool {
+    let question = question.trim();
+    if !turn_likely_question(question)
+        || spoken_words(&question.to_lowercase()).len() < ASKED_AGAIN_MIN_WORDS
+    {
+        return false;
+    }
+    let Some(latest) = lines
+        .iter()
+        .rposition(|line| line.speaker == Speaker::Them)
+        .filter(|&index| lines[index].text.trim() == question)
+    else {
+        return false;
+    };
+    let asked_at = lines[latest].at_ms;
+    lines[..latest].iter().any(|earlier| {
+        earlier.speaker == Speaker::Them
+            && earlier.at_ms + ASKED_AGAIN_WINDOW_MS >= asked_at
+            && echo_containment(question, &earlier.text) >= ASKED_AGAIN_CONTAINMENT
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_asked_again_within_a_minute_is_answered() {
+        let lines = [
+            line(
+                Speaker::Them,
+                95_000,
+                "Charles asked a question I wouldn't know the answer to. What is the capital of India?",
+            ),
+            line(Speaker::Them, 103_000, "I just kind of go further."),
+            line(Speaker::Them, 109_000, "What is the capital of India?"),
+        ];
+        assert!(asked_again(&lines, "What is the capital of India?"));
+        // Asked once only.
+        assert!(!asked_again(&lines[1..], "What is the capital of India?"));
+        // Too long ago.
+        let mut stale = lines.clone();
+        stale[0].at_ms = 10_000;
+        assert!(!asked_again(&stale, "What is the capital of India?"));
+        // A different question.
+        let mut other = lines.clone();
+        other[2].text = "What is the GDP of Luxembourg?".into();
+        assert!(!asked_again(&other, "What is the GDP of Luxembourg?"));
+        // The user repeating it is not the other side asking again.
+        let mut mine = lines.clone();
+        mine[0].speaker = Speaker::Me;
+        assert!(!asked_again(&mine, "What is the capital of India?"));
+        // Short generic lines do not count.
+        let short = [
+            line(Speaker::Them, 1_000, "Why?"),
+            line(Speaker::Them, 5_000, "Why?"),
+        ];
+        assert!(!asked_again(&short, "Why?"));
+    }
 
     fn span(start_ms: u64) -> HeardSpan<'static> {
         HeardSpan {

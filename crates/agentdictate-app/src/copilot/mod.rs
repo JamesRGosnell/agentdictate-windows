@@ -302,23 +302,13 @@ pub fn copilot_launch_reason(config_file: &std::path::Path) -> Option<String> {
     if !settings.launch_from_dictation_hotkey || win::instance::is_running() {
         return None;
     }
+    // Pressed in a meeting, the shortcut always opens the copilot, even one
+    // the user ended earlier in that meeting: pressing it asks for it.
     let signal = meeting::classify(
         &win::signals::active_microphone_apps(),
         &win::signals::window_titles(),
     );
-    let marker = dismissed_marker(&settings_path);
-    let dismissed_at = std::fs::metadata(&marker)
-        .and_then(|metadata| metadata.modified())
-        .ok();
-    let (launch, clear) = launch_decision(
-        signal.in_meeting,
-        dismissed_at,
-        std::time::SystemTime::now(),
-    );
-    if clear {
-        let _ = std::fs::remove_file(&marker);
-    }
-    launch.then_some(signal.reason)
+    signal.in_meeting.then_some(signal.reason)
 }
 
 /// How often the background app looks for a meeting to open the copilot for.
@@ -362,9 +352,14 @@ pub fn watch_for_meetings() {
                     &win::signals::active_microphone_apps(),
                     &win::signals::window_titles(),
                 );
-                let dismissed_at = std::fs::metadata(dismissed_marker(&settings_path))
+                let marker = dismissed_marker(&settings_path);
+                let dismissed_at = std::fs::metadata(&marker)
                     .and_then(|metadata| metadata.modified())
                     .ok();
+                // The meeting the user ended the copilot in is over.
+                if !signal.in_meeting && dismissed_at.is_some() {
+                    let _ = std::fs::remove_file(&marker);
+                }
                 if should_auto_start(
                     signal.in_meeting,
                     was_in_meeting,
@@ -385,7 +380,7 @@ pub fn watch_for_meetings() {
     }
 }
 
-/// After the user ends the copilot, the dictation shortcut dictates for the
+/// After the user ends the copilot, it does not open by itself again for the
 /// rest of that meeting; this long bounds a meeting.
 const DISMISSED_FOR: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 
@@ -394,9 +389,9 @@ fn dismissed_marker(settings_path: &std::path::Path) -> std::path::PathBuf {
     settings_path.with_file_name("copilot-dismissed")
 }
 
-/// Whether the dictation shortcut opens the copilot, and whether the
-/// "ended during this meeting" mark is spent: it lasts until the shortcut
-/// is pressed outside a meeting, or for at most [`DISMISSED_FOR`].
+/// Whether the copilot may open by itself, and whether the "ended during
+/// this meeting" mark is spent: it lasts until no meeting is detected, or
+/// for at most [`DISMISSED_FOR`].
 fn launch_decision(
     in_meeting: bool,
     dismissed_at: Option<std::time::SystemTime>,
@@ -812,8 +807,8 @@ pub fn run_copilot() -> anyhow::Result<()> {
     tracing::info!("meeting copilot window closed");
     let _ = engine_sender.send(EngineMsg::Action(CopilotAction::End));
     drop(engine_sender);
-    // Ended by the user rather than by the meeting ending: the dictation
-    // shortcut dictates for the rest of this meeting.
+    // Ended by the user rather than by the meeting ending: it does not
+    // open by itself again during this meeting.
     if engine_thread.join().unwrap_or(false) {
         let _ = std::fs::write(&marker, b"");
     }

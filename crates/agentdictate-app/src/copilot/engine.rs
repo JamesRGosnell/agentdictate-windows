@@ -21,15 +21,16 @@ use agentdictate_core::{
     CopilotEffort, CopilotEvent, CopilotInsights, CopilotProvider, CopilotSettings, EmailDraft,
     Grounding, HeardSpan, INSTANT_GUIDANCE, JUDGE_TRANSCRIPT_CHARS, ListenState, ModelChoice,
     NotesExtras, QuickAction, RewriteEngine, RewriteStyle, Scorecard, Speaker, SpeakerLabels,
-    TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt, call_view_system_prompt,
-    call_view_user_prompt, combined_answer, detected_question_instruction, insights_system_prompt,
-    insights_user_prompt_with, is_echo_of, judge_transcript, kept_talking, language_name,
-    meeting_checklist, meeting_notes_with, mentions_name, notes_prompt, only_listening,
-    parse_call_view, parse_insights, parse_self_check, parse_translation, question_pause_ms,
-    render_transcript, researched_guidance, rewrite_instruction, self_check_system_prompt,
-    self_check_user_prompt, since_user_spoke_ms, split_follow_up, split_grounding, states_a_figure,
-    translation_system_prompt, turn_candidate, turn_judge_system_prompt, turn_judge_user_prompt,
-    turn_likely_question, typed_note, typed_question_instruction, utterance_similarity,
+    TranscriptLine, TurnContext, answer_system_prompt, answer_user_prompt, asked_again,
+    call_view_system_prompt, call_view_user_prompt, combined_answer, detected_question_instruction,
+    insights_system_prompt, insights_user_prompt_with, is_echo_of, judge_transcript, kept_talking,
+    language_name, meeting_checklist, meeting_notes_with, mentions_name, notes_prompt,
+    only_listening, parse_call_view, parse_insights, parse_self_check, parse_translation,
+    question_pause_ms, render_transcript, researched_guidance, rewrite_instruction,
+    self_check_system_prompt, self_check_user_prompt, since_user_spoke_ms, split_follow_up,
+    split_grounding, states_a_figure, translation_system_prompt, turn_candidate,
+    turn_judge_system_prompt, turn_judge_user_prompt, turn_likely_question, typed_note,
+    typed_question_instruction, utterance_similarity,
 };
 
 use agentdictate_core::ENDED_TURN_PAUSE_MS;
@@ -2481,6 +2482,14 @@ impl Engine {
             Some(respond) => respond,
             None if turn.heard.elapsed() >= verdict_wait => turn.likely,
             None => return,
+        };
+        // Asking again means nobody answered the first time.
+        let respond = respond || {
+            let again = asked_again(&self.transcript, &turn.text);
+            if again {
+                tracing::info!("the other side asked again; answering");
+            }
+            again
         };
         if !respond {
             tracing::info!("the line was not aimed at the user; not answering");
@@ -5005,6 +5014,54 @@ mod tests {
         ask(&mut engine);
         assert_eq!(answers_started(&events), 1);
         assert!(engine.pending_turn.is_none());
+    }
+
+    #[test]
+    fn a_question_asked_again_is_answered_despite_the_judge() {
+        let (mut engine, _incoming, events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        after_a_pause(&mut engine);
+        let them = |id, at_ms, text: &str| TranscriptLine {
+            id,
+            speaker: Speaker::Them,
+            text: text.into(),
+            at_ms,
+            voice: None,
+        };
+        engine.publish(TranscriptLine {
+            id: 1,
+            speaker: Speaker::Me,
+            text: "Go ahead, ask it anything.".into(),
+            at_ms: 2_000,
+            voice: None,
+        });
+        let ask = |engine: &mut Engine| {
+            engine.pending_turn = Some(PendingTurn {
+                id: 1,
+                text: "What is the capital of India?".into(),
+                end_ms: 20_000,
+                voice: None,
+                verdict: Some(false),
+                likely: true,
+                draft: None,
+                heard: Instant::now(),
+                awaiting_final: false,
+                ended: false,
+            });
+            engine.evaluate_turn();
+        };
+        // Asked once, the judge's no stands.
+        engine.publish(them(3, 18_000, "What is the capital of India?"));
+        ask(&mut engine);
+        assert_eq!(answers_started(&events), 0);
+        // Asked a second time, the user gets help.
+        engine.publish(them(
+            2,
+            5_000,
+            "Charles asked one I wouldn't know. What is the capital of India?",
+        ));
+        ask(&mut engine);
+        assert_eq!(answers_started(&events), 1);
     }
 
     fn provisional(samples: usize) -> Utterance {
