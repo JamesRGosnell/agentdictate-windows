@@ -150,6 +150,11 @@ try {
         }
     }
     $taskTimings | Format-Table -AutoSize
+    # GPUI logs this when a native window event arrives while it holds its app
+    # state, and drops the event; the overlay must not move itself then.
+    $taskReentry = Get-ChildItem (Join-Path $taskProbeData 'logs') -File -Filter 'agentdictated.log*' -ErrorAction SilentlyContinue |
+        Select-String -SimpleMatch 'RefCell already borrowed' | Select-Object -First 1
+    if ($taskReentry) { throw "Overlay helper re-entered GPUI while it was busy: $($taskReentry.Line)" }
     if ($TimingsPath) { $taskTimings | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $TimingsPath -Encoding UTF8 }
     Write-Host "Native window capture: $taskProbeData\overlay.png"
 } finally { $env:AGENTDICTATE_DATA_HOME = $previousDataHome }

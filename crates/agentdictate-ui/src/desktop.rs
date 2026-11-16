@@ -215,7 +215,8 @@ pub fn run_recording_overlay(
                 ))),
                 titlebar: None,
                 focus: false,
-                show: true,
+                // Windows shows the overlay as it is placed (see below).
+                show: !cfg!(windows),
                 kind: WindowKind::PopUp,
                 is_movable: false,
                 is_resizable: false,
@@ -229,8 +230,14 @@ pub fn run_recording_overlay(
                 window_decorations: None,
                 tabbing_identifier: None,
             };
+            // On Windows, moving the window makes Windows report the move
+            // back to GPUI synchronously. While this startup code runs GPUI
+            // holds its app state, so it would log "RefCell already borrowed"
+            // and drop the move. The overlay therefore opens hidden and is
+            // placed, and shown, by a task that runs once startup returns.
+            let created = std::cell::Cell::new(None);
             let overlay_window = cx
-                .open_window(options, move |window, cx| {
+                .open_window(options, |window, cx| {
                     let handle = HasWindowHandle::window_handle(window)
                         .expect("overlay native window handle should exist");
                     let id = match handle.as_raw() {
@@ -240,13 +247,25 @@ pub fn run_recording_overlay(
                         RawWindowHandle::Win32(handle) => handle.hwnd.get() as usize,
                         _ => panic!("unsupported overlay window backend"),
                     };
-                    on_created(id, window.scale_factor());
+                    created.set(Some((id, window.scale_factor())));
                     cx.new(|_| {
                         RecordingOverlay::from_presentation(initial)
                             .on_frame_submitted(on_frame_submitted)
                     })
                 })
                 .expect("recording overlay should open");
+            let created = created.take();
+            #[cfg(windows)]
+            cx.spawn(async move |_| {
+                if let Some((id, scale)) = created {
+                    on_created(id, scale);
+                }
+            })
+            .detach();
+            #[cfg(not(windows))]
+            if let Some((id, scale)) = created {
+                on_created(id, scale);
+            }
 
             cx.spawn(async move |cx| {
                 while let Some(presentation) = receiver.next().await {
