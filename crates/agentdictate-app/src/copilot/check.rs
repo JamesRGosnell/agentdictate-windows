@@ -1211,7 +1211,19 @@ pub(crate) fn bakeoff(rounds: usize, models: &[String]) -> anyhow::Result<usize>
 
     let mut report = Report { failures: 0 };
     let paths = crate::AppPaths::from_environment()?;
-    let settings = store::load(&store::settings_path(&paths.config_file));
+    let mut settings = store::load(&store::settings_path(&paths.config_file));
+    // "--mode=sales" tries a meeting type other than the saved one.
+    let (modes, models): (Vec<String>, Vec<String>) = models
+        .iter()
+        .cloned()
+        .partition(|arg| arg.starts_with("--mode="));
+    if let Some(mode) = modes.last() {
+        let name = mode.trim_start_matches("--mode=");
+        settings.mode = serde_json::from_value(serde_json::Value::String(name.to_owned()))
+            .map_err(|_| anyhow::anyhow!("unknown meeting type: {name}"))?;
+        println!("Meeting type: {}", settings.mode.label());
+    }
+    let models = models.as_slice();
     let chatgpt = Arc::new(ChatGptCredentials::discover());
     let quick: Vec<String> = if models.is_empty() {
         [
@@ -1495,6 +1507,11 @@ and annual billing saves you a fair bit compared with paying monthly.";
         }
     };
 
+    // On sales calls the two pushbacks below are objections, which CLOSER
+    // answers with a question back.
+    let sales = settings.mode == agentdictate_core::CopilotMode::Sales;
+    let objection = |question: &str| question.contains("Acme") || question.contains("two years");
+
     for round in 1..=rounds {
         println!("\n== Round {round} ==");
         for model in &quick {
@@ -1565,17 +1582,19 @@ and annual billing saves you a fair bit compared with paying monthly.";
                             .promises
                             .iter()
                             .any(|promise| promise.to_lowercase().contains("pricing"));
-                        // Budget is the second item; the decision maker and
-                        // the timeline, third and fourth, never came up.
-                        // Sending the pricing sheet is a next step, so the
-                        // fifth may be ticked. A trial was only floated.
+                        // Stockouts costing them every week is their
+                        // problem, the second CLOSER item. What they have
+                        // tried (third) and their concerns (fifth) never
+                        // came up. Sending the pricing sheet is a next step,
+                        // so the sixth may be ticked. A trial was only
+                        // floated.
                         if !promised {
                             Some("missed the promise".to_owned())
                         } else if insights.promises.len() > 1 {
                             Some(format!("invented promises: {:?}", insights.promises))
                         } else if !insights.covered.contains(&2) {
-                            Some("did not tick Budget".to_owned())
-                        } else if insights.covered.contains(&3) || insights.covered.contains(&4) {
+                            Some("did not tick Their problem".to_owned())
+                        } else if insights.covered.contains(&3) || insights.covered.contains(&5) {
                             Some(format!(
                                 "ticked what was not covered: {:?}",
                                 insights.covered
@@ -1593,13 +1612,14 @@ and annual billing saves you a fair bit compared with paying monthly.";
                     user: format!(
                         "{}
 
-{}",
+{}{}",
                         answer_user_prompt(
                             &transcript,
                             &detected_question_instruction(question),
                             false,
                             "",
                         ),
+                        settings.mode.instant_note(),
                         agentdictate_core::INSTANT_GUIDANCE
                     ),
                     image_jpeg: None,
@@ -1624,6 +1644,9 @@ and annual billing saves you a fair bit compared with paying monthly.";
                             Some("no source marker".to_owned())
                         } else if grounding != Some(expected) {
                             Some(format!("marked {grounding:?}, expected {expected:?}"))
+                        } else if sales && objection(question) && !shown.contains('?') {
+                            // CLOSER: answer, then ask what moves them on.
+                            Some("answers an objection without asking anything".to_owned())
                         } else {
                             plain_line(&shown)
                         }

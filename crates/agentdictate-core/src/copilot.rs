@@ -295,9 +295,7 @@ impl CopilotMode {
             Self::General => {
                 "Help the user participate confidently: answer questions, supply facts, and suggest crisp next lines."
             }
-            Self::Sales => {
-                "The user is selling. Handle objections with empathy and evidence, quantify value, surface discovery questions, and always suggest a clear next step."
-            }
+            Self::Sales => SALES_GUIDANCE,
             Self::Interview => {
                 "The user is the candidate in a job interview. Give answers in the user's voice using the STAR pattern where useful, keep them specific and honest, and highlight relevant experience from the user's background."
             }
@@ -313,17 +311,37 @@ impl CopilotMode {
         }
     }
 
+    /// Said before the instant draft's guidance: the quick draft is short,
+    /// so a meeting type that changes its shape says so here.
+    #[must_use]
+    pub const fn instant_note(self) -> &'static str {
+        match self {
+            Self::Sales => {
+                "This is a sales call. When they object or push on price, the line answers in one \
+sentence, then asks one short question that moves them toward a decision, such as what the \
+problem is costing them or what would need to be true to go ahead.\n"
+            }
+            Self::General
+            | Self::Interview
+            | Self::Recruiting
+            | Self::Lecture
+            | Self::Negotiation => "",
+        }
+    }
+
     /// What a meeting of this type should cover, ticked off as it is heard.
     #[must_use]
     pub const fn checklist(self) -> &'static [&'static str] {
         match self {
             Self::General | Self::Lecture => &[],
+            // One item per CLOSER stage, in call order.
             Self::Sales => &[
+                "Why they're on the call",
                 "Their problem",
-                "Budget",
-                "Decision maker",
-                "Timeline",
-                "Next step agreed",
+                "What they've tried",
+                "The result they want",
+                "Concerns handled",
+                "Decision and next step",
             ],
             Self::Interview => &[
                 "Why this role",
@@ -354,7 +372,7 @@ impl CopilotMode {
         match self {
             Self::General => "",
             Self::Sales => {
-                "**Deal notes**: one bullet each for their problem, budget, decision maker, timeline, competitors mentioned, and the agreed next step, writing \"Not discussed\" where the transcript says nothing"
+                "**Deal notes**: one bullet per CLOSER stage (why they came to the call, their problem in their words, what they have tried and why it fell short, the result they want, each concern raised and how it was answered, and the decision or agreed next step), then one each for budget, decision maker, timeline and competitors mentioned, writing \"Not discussed\" where the transcript says nothing"
             }
             Self::Interview => {
                 "**Interview review**: each question they asked with one line on how you answered, then up to three things to do better next time"
@@ -371,6 +389,20 @@ impl CopilotMode {
         }
     }
 }
+
+/// How sales answers follow the CLOSER framework (Clarify, Label, Overview
+/// past pain, Sell the outcome, Explain away concerns, Reinforce).
+const SALES_GUIDANCE: &str = "The user is selling and runs the call with the CLOSER framework: \
+Clarify why the prospect is on the call; Label their problem back to them in their own words and \
+get them to agree; Overview their past pain, meaning what they have already tried and why it fell \
+short; Sell the result they will have, not the process of getting there; Explain away their \
+concerns; and Reinforce the decision once they commit. When they ask something, answer it in a \
+sentence, then give the one question that moves the call to the next stage not yet covered. \
+Prefer asking to telling, and use their words. For an objection, find the real one first: their \
+circumstances (time, money, fit), other people (a partner or boss who decides), or their own \
+doubt. Acknowledge it, weigh it against what the problem is costing them, and ask a question \
+that lets them resolve it themselves. Never invent urgency, scarcity or discounts the user's \
+material does not state, and end with a clear next step.";
 
 /// Languages offered for transcription and translation: ISO-639-1 code and
 /// name.
@@ -1336,7 +1368,8 @@ pub fn meeting_checklist(mode: CopilotMode, goal: &str) -> Vec<String> {
             }
         }
     }
-    items.truncate(8);
+    // Room for every CLOSER stage and three goals of the user's own.
+    items.truncate(9);
     items
 }
 
@@ -3260,10 +3293,10 @@ mod tests {
             CopilotMode::Sales,
             "get a second meeting, ask about budget and meet their CTO",
         );
-        assert_eq!(items[0], "Their problem");
+        assert_eq!(items[0], "Why they're on the call");
         assert!(items.contains(&"Get a second meeting".to_owned()));
         assert!(items.contains(&"Meet their CTO".to_owned()));
-        assert!(items.len() <= 8);
+        assert!(items.len() <= 9);
         assert_eq!(
             meeting_checklist(CopilotMode::General, "agree on a launch date"),
             ["Agree on a launch date"]
@@ -3361,6 +3394,7 @@ mod tests {
         let sales = notes_prompt(CopilotMode::Sales);
         assert!(sales.starts_with(notes_system_prompt()));
         assert!(sales.contains("**Deal notes**"));
+        assert!(sales.contains("CLOSER"));
         assert!(sales.contains("**Open questions**"));
         assert!(!notes_prompt(CopilotMode::General).contains("**Deal notes**"));
     }

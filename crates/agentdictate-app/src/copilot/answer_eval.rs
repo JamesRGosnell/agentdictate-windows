@@ -248,7 +248,10 @@ pub(crate) fn run(files: &[PathBuf], fresh: bool, samples: usize) -> anyhow::Res
                         question: line.text.clone(),
                         sample,
                         system: system.clone(),
-                        user: format!("{user}\n\n{INSTANT_GUIDANCE}"),
+                        user: format!(
+                            "{user}\n\n{}{INSTANT_GUIDANCE}",
+                            settings.mode.instant_note()
+                        ),
                         transcript: transcript.clone(),
                     });
                 }

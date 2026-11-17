@@ -2832,7 +2832,10 @@ impl Engine {
                     fast_settings.set_answer_model(fast_model.clone());
                     let request = AnswerRequest {
                         system: system.clone(),
-                        user: format!("{user}\n\n{INSTANT_GUIDANCE}"),
+                        user: format!(
+                            "{user}\n\n{}{INSTANT_GUIDANCE}",
+                            settings.mode.instant_note()
+                        ),
                         image_jpeg: image.clone(),
                         model: fast_model,
                         // The first words matter most: no reasoning first.
