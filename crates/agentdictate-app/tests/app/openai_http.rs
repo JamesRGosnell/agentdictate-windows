@@ -297,6 +297,171 @@ fn a_future_unverified_transcription_model_is_sent_using_the_safe_standard_profi
     assert!(!request.contains("Transcribe the entire recording"));
 }
 
+fn transcription_request(audio_path: &std::path::Path) -> TranscriptionRequest<'_> {
+    TranscriptionRequest {
+        keywords: &[],
+        audio_path,
+        provider: TranscriptionProvider::OpenAiApi,
+        model: "gpt-transcribe",
+        language: "en",
+        prompt: "",
+        duration_seconds: 1.0,
+    }
+}
+
+fn respond(stream: &mut impl Write, status: &str, body: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
+}
+
+/// True when another connection arrives within a second, longer than any
+/// retry pause.
+fn another_connection_arrives(listener: &TcpListener) -> bool {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        if listener.accept().is_ok() {
+            return true;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+fn short_recording() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempdir().unwrap();
+    let audio_path = directory.path().join("recording.wav");
+    std::fs::write(&audio_path, b"RIFFrecorded speech").unwrap();
+    (directory, audio_path)
+}
+
+#[test]
+fn a_connection_dropped_before_any_status_is_retried_once_on_a_fresh_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut dropped, _) = listener.accept().unwrap();
+        read_http_request(&mut dropped);
+        drop(dropped);
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_http_request(&mut stream);
+        respond(&mut stream, "200 OK", r#"{"text":"Recovered words."}"#);
+        request
+    });
+    let (_directory, audio_path) = short_recording();
+    let mut transport =
+        ReqwestOpenAiTransport::with_api_base("sk-test", format!("http://{address}/v1"));
+
+    let text = transport
+        .transcribe_audio(transcription_request(&audio_path))
+        .unwrap();
+
+    let retried = server.join().unwrap();
+    assert_eq!(text, "Recovered words.");
+    assert!(
+        retried.contains("RIFFrecorded speech"),
+        "the retry lost the audio"
+    );
+}
+
+#[test]
+fn a_transient_status_is_retried_once_after_a_short_pause() {
+    for status in ["503 Service Unavailable", "429 Too Many Requests"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            respond(&mut stream, status, r#"{"error":{"message":"overloaded"}}"#);
+            drop(stream);
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            respond(&mut stream, "200 OK", r#"{"text":"Second try."}"#);
+            request
+        });
+        let (_directory, audio_path) = short_recording();
+        let mut transport =
+            ReqwestOpenAiTransport::with_api_base("sk-test", format!("http://{address}/v1"));
+
+        let text = transport
+            .transcribe_audio(transcription_request(&audio_path))
+            .unwrap();
+
+        let retried = server.join().unwrap();
+        assert_eq!(text, "Second try.", "after {status}");
+        assert!(retried.contains("RIFFrecorded speech"));
+    }
+}
+
+#[test]
+fn a_repeated_transient_status_is_retried_only_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            respond(
+                &mut stream,
+                "503 Service Unavailable",
+                r#"{"error":{"message":"overloaded"}}"#,
+            );
+        }
+        another_connection_arrives(&listener)
+    });
+    let (_directory, audio_path) = short_recording();
+    let mut transport =
+        ReqwestOpenAiTransport::with_api_base("sk-test", format!("http://{address}/v1"));
+
+    let error = transport
+        .transcribe_audio(transcription_request(&audio_path))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("overloaded"), "{error}");
+    assert!(!server.join().unwrap(), "a third attempt was sent");
+}
+
+#[test]
+fn a_client_error_status_is_never_retried() {
+    for (status, body, expected) in [
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Unsupported language"}}"#,
+            "Unsupported language",
+        ),
+        (
+            "401 Unauthorized",
+            r#"{"error":{"message":"Incorrect API key"}}"#,
+            "authentication failed",
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            respond(&mut stream, status, body);
+            drop(stream);
+            another_connection_arrives(&listener)
+        });
+        let (_directory, audio_path) = short_recording();
+        let mut transport =
+            ReqwestOpenAiTransport::with_api_base("sk-test", format!("http://{address}/v1"));
+
+        let error = transport
+            .transcribe_audio(transcription_request(&audio_path))
+            .unwrap_err();
+
+        assert!(error.to_string().contains(expected), "{status}: {error}");
+        assert!(!server.join().unwrap(), "{status} was sent again");
+    }
+}
+
 fn read_http_request(stream: &mut impl Read) -> String {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];

@@ -221,6 +221,96 @@ fn wav_upload(audio_path: &Path) -> Result<UploadAudio, ExternalError> {
     })
 }
 
+/// Builds the multipart body for one transcription attempt. Sending consumes
+/// a form, so every attempt builds its own.
+fn transcription_form(
+    request: &TranscriptionRequest<'_>,
+    profile: TranscriptionProfile,
+    upload: &UploadAudio,
+) -> Result<reqwest::blocking::multipart::Form, ExternalError> {
+    let file = reqwest::blocking::multipart::Part::bytes(upload.bytes.clone())
+        .file_name(upload.file_name.clone())
+        .mime_str(upload.mime)
+        .map_err(|error| ExternalError::new(format!("Invalid audio upload: {error}")))?;
+    let mut form = reqwest::blocking::multipart::Form::new()
+        .text("model", request.model.to_owned())
+        .part("file", file);
+    let language = request.language.trim();
+    let prompt = request.prompt.trim();
+    match profile {
+        TranscriptionProfile::AgentDictateGpt => {
+            form = form.text("response_format", "json");
+            for language in language.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                form = form.text("languages[]", language.to_owned());
+            }
+            for keyword in request.keywords {
+                form = form.text("keywords[]", keyword.clone());
+            }
+        }
+        TranscriptionProfile::OpenAiGpt => {
+            form = form.text("response_format", "json");
+            if !language.is_empty() {
+                form = form.text("language", language.to_owned());
+            }
+        }
+        TranscriptionProfile::Standard => {
+            form = form.text("response_format", "text");
+            if !language.is_empty() {
+                form = form.text("language", language.to_owned());
+            }
+        }
+    }
+    if !prompt.is_empty() {
+        form = form.text("prompt", prompt.to_owned());
+    }
+    Ok(form)
+}
+
+/// The shared HTTP client configuration for OpenAI requests.
+fn http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .expect("the rustls HTTP client must be constructible")
+}
+
+/// True when a request failed before OpenAI returned any status, so OpenAI
+/// cannot have answered it. The total 180 s timeout is excluded: the upload
+/// may already be processing, and a second full wait under the daemon's lock
+/// is worse than handing the audio to Recovery.
+fn failed_before_status(error: &reqwest::Error) -> bool {
+    (error.is_request() || error.is_body()) && (error.is_connect() || !error.is_timeout())
+}
+
+/// Statuses where OpenAI timed out, throttled or failed without producing a
+/// transcript, so sending the same durable audio again is safe.
+fn is_transient_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// A first attempt slower than this is not repeated: the daemon holds its
+/// global lock throughout, and Recovery can retry a long request later.
+const RETRY_ONLY_WITHIN: Duration = Duration::from_secs(30);
+
+/// A short pause of 200 to 600 ms before resending after a transient status,
+/// jittered so that clients throttled together do not return together.
+fn transient_retry_delay() -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    Duration::from_millis(200 + random % 400)
+}
+
 fn cleanup_reasoning_effort(value: &str) -> Option<&str> {
     ReasoningEffort::from_settings_value(value).and_then(ReasoningEffort::openai_value)
 }
@@ -474,11 +564,7 @@ impl ReqwestOpenAiTransport {
     #[must_use]
     pub fn with_api_base(api_key: impl Into<String>, api_base: impl Into<String>) -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
-                .connect_timeout(Duration::from_secs(20))
-                .timeout(Duration::from_secs(180))
-                .build()
-                .expect("the rustls HTTP client must be constructible"),
+            client: http_client(),
             api_key: api_key.into().trim().to_owned(),
             api_base: api_base.into().trim_end_matches('/').to_owned(),
             actual_model: None,
@@ -517,6 +603,62 @@ impl ReqwestOpenAiTransport {
             ));
         }
         Ok(format!("Bearer {}", self.api_key))
+    }
+
+    /// Posts one transcription and returns OpenAI's status and body, retrying
+    /// once. A failure before any status arrives (connecting, sending the
+    /// request, or streaming its body) is retried at once on a fresh
+    /// connection pool; the usual cause is a pooled keep-alive connection the
+    /// network dropped. A transient status (408, 429, 500, 502, 503, 504) is
+    /// retried after a short jittered pause. Any other status, success or
+    /// not, is returned as is, and nothing is retried after a first attempt
+    /// slower than `RETRY_ONLY_WITHIN`.
+    fn send_transcription(
+        &mut self,
+        form: impl Fn() -> Result<reqwest::blocking::multipart::Form, ExternalError>,
+    ) -> Result<(StatusCode, String), ExternalError> {
+        let url = format!("{}/audio/transcriptions", self.api_base);
+        let authorization = self.authorization()?;
+        let mut may_retry = true;
+        loop {
+            let attempt_started = Instant::now();
+            let sent = self
+                .client
+                .post(&url)
+                .header("Authorization", &authorization)
+                .multipart(form()?)
+                .send();
+            let retry_allowed = may_retry && attempt_started.elapsed() < RETRY_ONLY_WITHIN;
+            may_retry = false;
+            let response = match sent {
+                Ok(response) => response,
+                Err(error) if retry_allowed && failed_before_status(&error) => {
+                    tracing::warn!(%error, "transcription request retried");
+                    self.client = http_client();
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ExternalError::new(format!(
+                        "Could not reach OpenAI: {error}"
+                    )));
+                }
+            };
+            let status = response.status();
+            let body = response.text().map_err(|error| {
+                ExternalError::new(format!("Could not read OpenAI's response: {error}"))
+            })?;
+            if retry_allowed && is_transient_status(status) {
+                let delay = transient_retry_delay();
+                tracing::warn!(
+                    %status,
+                    delay_ms = delay.as_millis() as u64,
+                    "transcription request retried"
+                );
+                std::thread::sleep(delay);
+                continue;
+            }
+            return Ok((status, body));
+        }
     }
 
     fn response_error(status: StatusCode, body: &str) -> ExternalError {
@@ -631,56 +773,9 @@ impl SpeechTransport for ReqwestOpenAiTransport {
             ));
         }
         let upload = upload_audio(&self.encoder, request.audio_path, request.duration_seconds)?;
-        let upload_bytes = upload.bytes.len();
-        let file = reqwest::blocking::multipart::Part::bytes(upload.bytes)
-            .file_name(upload.file_name)
-            .mime_str(upload.mime)
-            .map_err(|error| ExternalError::new(format!("Invalid audio upload: {error}")))?;
-        let mut form = reqwest::blocking::multipart::Form::new()
-            .text("model", request.model.to_owned())
-            .part("file", file);
-        let language = request.language.trim();
-        let prompt = request.prompt.trim();
-        match profile {
-            TranscriptionProfile::AgentDictateGpt => {
-                form = form.text("response_format", "json");
-                if !language.is_empty() {
-                    for language in language.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                        form = form.text("languages[]", language.to_owned());
-                    }
-                }
-                for keyword in request.keywords {
-                    form = form.text("keywords[]", keyword.clone());
-                }
-            }
-            TranscriptionProfile::OpenAiGpt => {
-                form = form.text("response_format", "json");
-                if !language.is_empty() {
-                    form = form.text("language", language.to_owned());
-                }
-            }
-            TranscriptionProfile::Standard => {
-                form = form.text("response_format", "text");
-                if !language.is_empty() {
-                    form = form.text("language", language.to_owned());
-                }
-            }
-        }
-        if !prompt.is_empty() {
-            form = form.text("prompt", prompt.to_owned());
-        }
         let request_started = Instant::now();
-        let response = self
-            .client
-            .post(format!("{}/audio/transcriptions", self.api_base))
-            .header("Authorization", self.authorization()?)
-            .multipart(form)
-            .send()
-            .map_err(|error| ExternalError::new(format!("Could not reach OpenAI: {error}")))?;
-        let status = response.status();
-        let body = response.text().map_err(|error| {
-            ExternalError::new(format!("Could not read OpenAI's response: {error}"))
-        })?;
+        let (status, body) =
+            self.send_transcription(|| transcription_form(&request, profile, &upload))?;
         let request_ms = request_started.elapsed().as_millis() as u64;
         if !status.is_success() {
             return Err(Self::response_error(status, &body));
@@ -705,7 +800,7 @@ impl SpeechTransport for ReqwestOpenAiTransport {
         tracing::info!(
             model = request.model,
             audio_seconds = request.duration_seconds,
-            upload_bytes,
+            upload_bytes = upload.bytes.len(),
             encode_ms = upload.encode_ms,
             request_ms,
             transcript_chars = text.chars().count(),
