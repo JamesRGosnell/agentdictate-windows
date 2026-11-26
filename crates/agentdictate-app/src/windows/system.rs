@@ -499,6 +499,32 @@ fn paste_decision(stopped_in: Option<FocusedWindow>, now: Option<FocusedWindow>)
         Some(_) => PasteDecision::CopyOnly,
     }
 }
+/// Whether `pid` is this daemon or another AgentDictate executable.
+fn process_is_ours(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    // SAFETY: the handle is checked for null, used only to read the image
+    // path into a buffer of the length passed, and closed before returning.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut name = vec![0u16; 32768];
+        let mut len = name.len() as u32;
+        let ours = QueryFullProcessImageNameW(process, 0, name.as_mut_ptr(), &mut len) != 0
+            && PathBuf::from(String::from_utf16_lossy(&name[..len as usize]))
+                .file_name()
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("agentdictate.exe")
+                        || name.eq_ignore_ascii_case("agentdictated.exe")
+                });
+        CloseHandle(process);
+        ours
+    }
+}
+
 fn foreground_window() -> Option<FocusedWindow> {
     // SAFETY: only queries the foreground HWND and its owning process id.
     let window = unsafe { GetForegroundWindow() };
@@ -543,7 +569,9 @@ impl Deliverer for SystemDeliverer {
         self.deliver_to(job, None)
     }
     fn focused_window(&mut self) -> Option<FocusedWindow> {
-        foreground_window()
+        // A stop from the tray menu or Settings focuses AgentDictate itself;
+        // that is no paste target, so delivery uses the window focused then.
+        foreground_window().filter(|focused| !process_is_ours(focused.process_id))
     }
     /// Pastes with one injected shortcut. Every failure before any key is
     /// injected is `NotSent`, so the text can be pasted again safely.
@@ -583,23 +611,7 @@ impl Deliverer for SystemDeliverer {
         }
         let target = focused.window as usize as HWND;
         let pid = focused.process_id;
-        let mut destination_is_ours = pid == std::process::id();
-        unsafe {
-            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if !process.is_null() {
-                let mut name = vec![0u16; 32768];
-                let mut len = name.len() as u32;
-                if QueryFullProcessImageNameW(process, 0, name.as_mut_ptr(), &mut len) != 0 {
-                    let path = PathBuf::from(String::from_utf16_lossy(&name[..len as usize]));
-                    destination_is_ours |= path.file_name().is_some_and(|name| {
-                        name.eq_ignore_ascii_case("agentdictate.exe")
-                            || name.eq_ignore_ascii_case("agentdictated.exe")
-                    });
-                }
-                CloseHandle(process);
-            }
-        }
-        if destination_is_ours {
+        if process_is_ours(pid) {
             return Ok(not_sent(
                 false,
                 "Focus the destination application before stopping dictation",
@@ -764,6 +776,12 @@ mod tests {
         assert!(!paste_blocked_by_integrity(Level(MEDIUM), Level(HIGH)));
         assert!(!paste_blocked_by_integrity(Unknown, Level(MEDIUM)));
         assert!(!paste_blocked_by_integrity(Level(HIGH), Unknown));
+    }
+    #[test]
+    fn agentdictate_itself_is_never_a_paste_target() {
+        assert!(process_is_ours(std::process::id()));
+        // Process id 4 is the System process: never ours, and unreadable.
+        assert!(!process_is_ours(4));
     }
     #[test]
     fn own_process_integrity_is_readable_and_never_blocks_itself() {
