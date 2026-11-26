@@ -6,10 +6,10 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agentdictate_core::{CopilotEffort, CopilotProvider, CopilotSettings};
@@ -109,7 +109,9 @@ pub(crate) fn judge_turn(
 }
 
 /// The process-wide HTTP client. Sharing it keeps connections open between
-/// requests, so answers after the first skip the TLS handshake.
+/// requests, so answers after the first skip the TLS handshake. Idle
+/// connections are let go after a minute: one kept longer is more likely
+/// to have been dropped by the network without either end knowing.
 pub(crate) fn http_client() -> reqwest::blocking::Client {
     static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
     CLIENT
@@ -117,11 +119,169 @@ pub(crate) fn http_client() -> reqwest::blocking::Client {
             reqwest::blocking::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(240))
-                .pool_idle_timeout(Duration::from_secs(600))
+                .pool_idle_timeout(Duration::from_secs(60))
                 .build()
                 .expect("the rustls HTTP client must be constructible")
         })
         .clone()
+}
+
+/// A client that opens a new connection for every request, for the one
+/// retry of a request that got no reply on a kept-open connection.
+fn fresh_client() -> reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(240))
+                .pool_max_idle_per_host(0)
+                .build()
+                .expect("the rustls HTTP client must be constructible")
+        })
+        .clone()
+}
+
+/// How long a model request may go without a word from the service before
+/// it is given up on, rather than leaving its lane stuck for minutes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Deadlines {
+    /// From sending the request to the reply's headers.
+    pub first_byte: Duration,
+    /// Between any two pieces of a streamed reply.
+    pub idle: Duration,
+}
+
+/// Judgments, instant drafts and other quick side jobs: their services
+/// reply in well under a second.
+const QUICK_DEADLINES: Deadlines = Deadlines {
+    first_byte: Duration::from_secs(5),
+    idle: Duration::from_secs(20),
+};
+/// Researched answers and summaries, which may search the web or reason
+/// for a while between streamed pieces.
+const RESEARCH_DEADLINES: Deadlines = Deadlines {
+    first_byte: Duration::from_secs(15),
+    idle: Duration::from_secs(45),
+};
+
+/// A request carrying a screenshot also gets the longer wait, for the
+/// upload.
+fn deadlines_for(request: &AnswerRequest) -> Deadlines {
+    let research = request.web_search
+        || request.image_jpeg.is_some()
+        || matches!(request.effort, CopilotEffort::Medium | CopilotEffort::High)
+        || request.max_output_tokens >= 2_048;
+    if research {
+        RESEARCH_DEADLINES
+    } else {
+        QUICK_DEADLINES
+    }
+}
+
+/// How often a request waiting on the network looks for a cancel.
+const CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// Why a request got no reply.
+enum NoReply {
+    Failed(reqwest::Error),
+    TimedOut(Duration),
+}
+
+impl NoReply {
+    fn describe(&self, service: &str) -> String {
+        match self {
+            Self::Failed(error) => format!("Could not reach {service}: {error}"),
+            Self::TimedOut(after) => format!(
+                "Could not reach {service}: no reply within {} s",
+                after.as_secs_f32()
+            ),
+        }
+    }
+}
+
+/// Sends on a thread of its own, so a service that never answers is given
+/// up on after `deadline` and a cancel is seen at once. `Ok(None)` when
+/// cancelled.
+fn send_within(
+    send: impl FnOnce() -> reqwest::Result<reqwest::blocking::Response> + Send + 'static,
+    deadline: Duration,
+    cancel: &AtomicBool,
+) -> Result<Option<reqwest::blocking::Response>, NoReply> {
+    let (replied, reply) = mpsc::sync_channel(1);
+    // A reply that comes after the deadline is dropped with its thread.
+    std::thread::Builder::new()
+        .name("copilot-request".into())
+        .spawn(move || {
+            let _ = replied.send(send());
+        })
+        .map_err(|_| NoReply::TimedOut(Duration::ZERO))?;
+    let until = Instant::now() + deadline;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(NoReply::TimedOut(deadline));
+        }
+        match reply.recv_timeout(left.min(CANCEL_POLL)) {
+            Ok(Ok(response)) => return Ok(Some(response)),
+            Ok(Err(error)) => return Err(NoReply::Failed(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(NoReply::TimedOut(deadline));
+            }
+        }
+    }
+}
+
+/// Sends a request, trying once more on a new connection when nothing at
+/// all came back: a connection kept open between answers can go dead
+/// without either end knowing. `Ok(None)` when cancelled.
+fn send_request(
+    builder: reqwest::blocking::RequestBuilder,
+    deadline: Duration,
+    cancel: &AtomicBool,
+    service: &str,
+) -> Result<Option<reqwest::blocking::Response>, String> {
+    let retry = builder.try_clone().and_then(|retry| retry.build().ok());
+    let error = match send_within(move || builder.send(), deadline, cancel) {
+        Ok(response) => return Ok(response),
+        Err(error) => error,
+    };
+    let Some(request) = retry else {
+        return Err(error.describe(service));
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    tracing::warn!(
+        service,
+        error = %error.describe(service),
+        "no reply from the model service; trying once more on a new connection"
+    );
+    let client = fresh_client();
+    send_within(move || client.execute(request), deadline, cancel)
+        .map_err(|error| error.describe(service))
+}
+
+/// A reader that notes when it last received anything.
+struct Heard<R> {
+    inner: R,
+    started: Instant,
+    last_ms: Arc<AtomicU64>,
+}
+
+impl<R: std::io::Read> std::io::Read for Heard<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 {
+            self.last_ms
+                .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+        Ok(read)
+    }
 }
 
 /// Builds the provider selected in settings.
@@ -137,6 +297,7 @@ pub(crate) fn provider_for(
             endpoint: CHATGPT_RESPONSES_ENDPOINT,
             auth: ResponsesAuth::ChatGpt(Arc::clone(chatgpt)),
             fallback_models: chatgpt_models.to_vec(),
+            deadlines: None,
         })),
         CopilotProvider::OpenaiApi => {
             let key = openai_key(settings, fallback_openai_key);
@@ -148,6 +309,7 @@ pub(crate) fn provider_for(
                 endpoint: OPENAI_RESPONSES_ENDPOINT,
                 auth: ResponsesAuth::ApiKey(key.to_owned()),
                 fallback_models: Vec::new(),
+                deadlines: None,
             }))
         }
         CopilotProvider::AnthropicApi => {
@@ -164,6 +326,7 @@ pub(crate) fn provider_for(
                 client: http_client(),
                 api_key: key.to_owned(),
                 decider: openai_decider(settings, fallback_openai_key),
+                deadlines: None,
             }))
         }
         CopilotProvider::ClaudeCode => {
@@ -183,6 +346,7 @@ fn openai_decider(settings: &CopilotSettings, fallback: &str) -> Option<Response
         endpoint: OPENAI_RESPONSES_ENDPOINT,
         auth: ResponsesAuth::ApiKey(key.to_owned()),
         fallback_models: Vec::new(),
+        deadlines: None,
     })
 }
 
@@ -207,6 +371,8 @@ struct ResponsesProvider {
     endpoint: &'static str,
     auth: ResponsesAuth,
     fallback_models: Vec<String>,
+    /// Set in tests; otherwise chosen by the request.
+    deadlines: Option<Deadlines>,
 }
 
 fn responses_body(request: &AnswerRequest, model: &str) -> Value {
@@ -395,21 +561,61 @@ fn wait_label(seconds: u64) -> String {
     }
 }
 
-/// Reads an SSE body, forwarding mapped events until completion.
+/// Reads an SSE body, forwarding mapped events until completion. The body
+/// is read on a thread of its own, so a stream that goes quiet for `idle`
+/// fails instead of hanging, and a cancel is seen at once.
 fn pump_sse(
     response: reqwest::blocking::Response,
     cancel: &AtomicBool,
     sink: &mut dyn FnMut(StreamEvent),
+    idle: Duration,
     mut map: impl FnMut(&Value) -> Vec<StreamEvent>,
 ) -> Result<(), String> {
-    let mut reader = BufReader::new(response);
+    let started = Instant::now();
+    let last_ms = Arc::new(AtomicU64::new(0));
+    let (messages, incoming) = mpsc::sync_channel(64);
+    {
+        let last_ms = Arc::clone(&last_ms);
+        // Left behind on a stall, it ends with the client's own timeout.
+        std::thread::Builder::new()
+            .name("copilot-stream".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(Heard {
+                    inner: response,
+                    started,
+                    last_ms,
+                });
+                loop {
+                    let message = next_sse_message(&mut reader);
+                    let more = matches!(message, Ok(Some(_)));
+                    if messages.send(message).is_err() || !more {
+                        return;
+                    }
+                }
+            })
+            .map_err(|error| format!("Stream interrupted: {error}"))?;
+    }
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let Some(message) = next_sse_message(&mut reader)
-            .map_err(|error| format!("Stream interrupted: {error}"))?
-        else {
+        let message = match incoming.recv_timeout(CANCEL_POLL) {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let heard = Duration::from_millis(last_ms.load(Ordering::Relaxed));
+                if started.elapsed().saturating_sub(heard) >= idle {
+                    return Err(format!(
+                        "Stream stalled: nothing arrived for {} s.",
+                        idle.as_secs_f32()
+                    ));
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Stream interrupted.".to_owned());
+            }
+        };
+        let Some(message) = message.map_err(|error| format!("Stream interrupted: {error}"))? else {
             sink(StreamEvent::Done);
             return Ok(());
         };
@@ -455,6 +661,7 @@ impl AnswerProvider for ResponsesProvider {
             ResponsesAuth::ChatGpt(_) => "ChatGPT",
             ResponsesAuth::ApiKey(_) => "OpenAI",
         };
+        let deadlines = self.deadlines.unwrap_or_else(|| deadlines_for(request));
         let mut refreshed = false;
         let mut index = 0;
         let mut rejected_here: Vec<String> = Vec::new();
@@ -483,13 +690,20 @@ impl AnswerProvider for ResponsesProvider {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            let response = builder
-                .send()
-                .map_err(|error| format!("Could not reach {service}: {error}"))?;
+            let Some(response) = send_request(builder, deadlines.first_byte, cancel, service)?
+            else {
+                return Ok(());
+            };
             let status = response.status();
             if status.is_success() {
                 remember_replacements(&rejected_here, model);
-                return pump_sse(response, cancel, sink, parse_responses_event);
+                return pump_sse(
+                    response,
+                    cancel,
+                    sink,
+                    deadlines.idle,
+                    parse_responses_event,
+                );
             }
             let body = response.text().unwrap_or_default();
             if status == StatusCode::UNAUTHORIZED
@@ -615,6 +829,8 @@ struct AnthropicProvider {
     api_key: String,
     /// OpenAI's decision service, when an OpenAI key is saved.
     decider: Option<ResponsesProvider>,
+    /// Set in tests; otherwise chosen by the request.
+    deadlines: Option<Deadlines>,
 }
 
 /// Claude's basic web search. The newer dynamic-filtering search runs code
@@ -695,6 +911,7 @@ impl AnswerProvider for AnthropicProvider {
         cancel: &AtomicBool,
         sink: &mut dyn FnMut(StreamEvent),
     ) -> Result<(), String> {
+        let deadlines = self.deadlines.unwrap_or_else(|| deadlines_for(request));
         // The first attempt opts into effort control and server-side refusal
         // fallbacks; a plain request is retried if the account rejects them.
         for full in [true, false] {
@@ -714,13 +931,16 @@ impl AnswerProvider for AnthropicProvider {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            let response = builder
-                .send()
-                .map_err(|error| format!("Could not reach Anthropic: {error}"))?;
+            let Some(response) = send_request(builder, deadlines.first_byte, cancel, "Anthropic")?
+            else {
+                return Ok(());
+            };
             let status = response.status();
             if status.is_success() {
                 let mut stream = AnthropicStream::default();
-                return pump_sse(response, cancel, sink, |value| stream.parse(value));
+                return pump_sse(response, cancel, sink, deadlines.idle, |value| {
+                    stream.parse(value)
+                });
             }
             let body = response.text().unwrap_or_default();
             if full && status == StatusCode::BAD_REQUEST {
@@ -974,6 +1194,7 @@ pub(crate) fn openrouter_provider(key: &str) -> Box<dyn AnswerProvider> {
         endpoint: OPENROUTER_RESPONSES_ENDPOINT,
         auth: ResponsesAuth::ApiKey(key.to_owned()),
         fallback_models: Vec::new(),
+        deadlines: None,
     })
 }
 
@@ -1170,6 +1391,138 @@ mod tests {
         }
     }
 
+    /// A local service that takes requests and answers each with
+    /// `reply`, then holds the connection open without another byte.
+    fn stalling_service(reply: &'static str) -> (&'static str, mpsc::Receiver<()>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint: &'static str = Box::leak(
+            format!("http://{}/v1/responses", listener.local_addr().unwrap()).into_boxed_str(),
+        );
+        let (accepted, connections) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().take(4) {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = accepted.send(());
+                held.push(stream);
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        (endpoint, connections)
+    }
+
+    fn stalling_provider(endpoint: &'static str, deadlines: Deadlines) -> ResponsesProvider {
+        ResponsesProvider {
+            client: http_client(),
+            endpoint,
+            auth: ResponsesAuth::ApiKey("test-key".into()),
+            fallback_models: vec![],
+            deadlines: Some(deadlines),
+        }
+    }
+
+    const STREAM_HEADERS: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"type\":\"response.created\"}\n\n";
+
+    #[test]
+    fn a_stream_that_stalls_after_its_headers_fails_within_the_idle_deadline() {
+        let (endpoint, _connections) = stalling_service(STREAM_HEADERS);
+        let provider = stalling_provider(
+            endpoint,
+            Deadlines {
+                first_byte: Duration::from_secs(2),
+                idle: Duration::from_millis(300),
+            },
+        );
+        let started = Instant::now();
+        let result = provider.stream(&request(), &AtomicBool::new(false), &mut |_| {});
+        let error = result.expect_err("a stalled stream fails");
+        assert!(error.contains("stalled"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_service_that_never_replies_is_tried_once_more_then_given_up() {
+        let (endpoint, connections) = stalling_service("");
+        let provider = stalling_provider(
+            endpoint,
+            Deadlines {
+                first_byte: Duration::from_millis(300),
+                idle: Duration::from_secs(5),
+            },
+        );
+        let started = Instant::now();
+        let error = provider
+            .stream(&request(), &AtomicBool::new(false), &mut |_| {})
+            .expect_err("no reply fails");
+        assert!(error.starts_with("Could not reach OpenAI"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // The retry went out on a connection of its own.
+        for _ in 0..2 {
+            connections.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    }
+
+    #[test]
+    fn cancelling_a_stalled_stream_returns_at_once() {
+        let (endpoint, _connections) = stalling_service(STREAM_HEADERS);
+        let provider = stalling_provider(
+            endpoint,
+            Deadlines {
+                first_byte: Duration::from_secs(5),
+                idle: Duration::from_secs(30),
+            },
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::Relaxed);
+            });
+        }
+        let started = Instant::now();
+        provider.stream(&request(), &cancel, &mut |_| {}).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn researched_answers_get_longer_deadlines_than_quick_ones() {
+        let mut quick = request();
+        quick.web_search = false;
+        quick.image_jpeg = None;
+        quick.max_output_tokens = 200;
+        assert_eq!(deadlines_for(&quick), QUICK_DEADLINES);
+        quick.image_jpeg = request().image_jpeg;
+        assert_eq!(
+            deadlines_for(&quick),
+            RESEARCH_DEADLINES,
+            "a screenshot uploads"
+        );
+        assert_eq!(deadlines_for(&request()), RESEARCH_DEADLINES);
+    }
+
     #[test]
     fn cancelled_requests_do_not_start_http_or_cli_work() {
         let providers: Vec<Box<dyn AnswerProvider>> = vec![
@@ -1178,11 +1531,13 @@ mod tests {
                 endpoint: "http://127.0.0.1:1",
                 auth: ResponsesAuth::ApiKey("unused".into()),
                 fallback_models: vec![],
+                deadlines: None,
             }),
             Box::new(AnthropicProvider {
                 client: http_client(),
                 api_key: "unused".into(),
                 decider: None,
+                deadlines: None,
             }),
             Box::new(ClaudeCodeProvider {
                 binary: "missing-claude-must-not-start".into(),

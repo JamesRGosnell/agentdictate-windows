@@ -138,6 +138,8 @@ const STILL_TALKING: Duration = Duration::from_secs(20);
 /// is sound, even if not speech; below it is the near silence of audio
 /// that no longer reaches the copilot.
 const THEM_SOUND_LEVEL: f32 = 0.15;
+/// An insights request out this long is given up on and asked again.
+const INSIGHTS_GIVE_UP: Duration = Duration::from_secs(60);
 /// Insights failures in a row before the bar says so.
 const INSIGHTS_FAILURES_SHOWN: u8 = 3;
 /// The least time between two alerts that the user was mentioned.
@@ -328,7 +330,11 @@ pub(crate) enum EngineMsg {
         title: String,
         text: String,
     },
-    InsightsFinished(Result<Option<CopilotInsights>, String>),
+    InsightsFinished {
+        /// Which request this answers; a request given up on is ignored.
+        id: u64,
+        result: Result<Option<CopilotInsights>, String>,
+    },
     /// Whether the user should respond to a turn; `None` when the judge failed.
     TurnVerdict {
         id: u64,
@@ -638,6 +644,8 @@ pub(crate) struct Engine {
     rewrite_cancel: Option<Arc<AtomicBool>>,
     last_auto_question: Option<(String, Instant)>,
     insights_in_flight: bool,
+    /// The insights request in flight, by number.
+    insights_request: u64,
     last_insights_at: Option<Instant>,
     lines_at_last_insights: usize,
     insights: CopilotInsights,
@@ -724,6 +732,7 @@ impl Engine {
             rewrite_cancel: None,
             last_auto_question: None,
             insights_in_flight: false,
+            insights_request: 0,
             last_insights_at: None,
             lines_at_last_insights: 0,
             insights: CopilotInsights::default(),
@@ -1091,7 +1100,7 @@ impl Engine {
             EngineMsg::AnswerFinished { id, title, text } => {
                 self.handle_answer_finished(id, title, text);
             }
-            EngineMsg::InsightsFinished(result) => self.handle_insights(result),
+            EngineMsg::InsightsFinished { id, result } => self.handle_insights(id, result),
             EngineMsg::TurnVerdict { id, respond } => {
                 if let Some(turn) = self.pending_turn.as_mut().filter(|turn| turn.id == id) {
                     // Without a verdict, the wording decides.
@@ -3656,8 +3665,23 @@ impl Engine {
     }
 
     fn maybe_request_insights(&mut self) {
-        if !self.settings.live_insights || self.insights_in_flight || self.ending {
+        if !self.settings.live_insights || self.ending {
             return;
+        }
+        if self.insights_in_flight {
+            // A request that never came back would freeze the panel for
+            // the rest of the call.
+            if self
+                .last_insights_at
+                .is_some_and(|at| at.elapsed() < INSIGHTS_GIVE_UP)
+            {
+                return;
+            }
+            tracing::warn!(
+                waited_secs = INSIGHTS_GIVE_UP.as_secs(),
+                "copilot insights request never finished; asking again"
+            );
+            self.insights_in_flight = false;
         }
         let new_lines = self
             .transcript
@@ -3673,6 +3697,8 @@ impl Engine {
             return;
         }
         self.insights_in_flight = true;
+        self.insights_request += 1;
+        let id = self.insights_request;
         self.last_insights_at = Some(Instant::now());
         self.lines_at_last_insights = self.transcript.len();
         let mut settings = self.settings.clone();
@@ -3707,11 +3733,19 @@ impl Engine {
                 let result = providers(&settings)
                     .and_then(|provider| complete(provider.as_ref(), &request, &cancel))
                     .map(|text| parse_insights(&text));
-                let _ = messages.send(EngineMsg::InsightsFinished(result));
+                let _ = messages.send(EngineMsg::InsightsFinished { id, result });
             });
     }
 
-    fn handle_insights(&mut self, result: Result<Option<CopilotInsights>, String>) {
+    fn handle_insights(&mut self, id: u64, result: Result<Option<CopilotInsights>, String>) {
+        if id != self.insights_request || !self.insights_in_flight {
+            tracing::info!("ignored insights from a request given up on");
+            return;
+        }
+        self.apply_insights(result);
+    }
+
+    fn apply_insights(&mut self, result: Result<Option<CopilotInsights>, String>) {
         self.insights_in_flight = false;
         let insights = match result {
             Ok(Some(insights)) => insights,
@@ -5819,7 +5853,7 @@ mod tests {
         let (mut engine, incoming, events, requests, _directory) =
             harness(CopilotSettings::default());
         after_a_pause(&mut engine);
-        engine.handle_insights(Ok(Some(CopilotInsights {
+        engine.apply_insights(Ok(Some(CopilotInsights {
             topic: "Scaling a service business".into(),
             situation: Situation::Media,
             ..CopilotInsights::default()
@@ -5834,7 +5868,7 @@ mod tests {
         assert_eq!(answers_started(&events), 0);
         assert!(requests.lock().unwrap().is_empty(), "nothing is judged");
         // Back in a conversation, questions are judged again.
-        engine.handle_insights(Ok(Some(CopilotInsights {
+        engine.apply_insights(Ok(Some(CopilotInsights {
             situation: Situation::Conversation,
             ..CopilotInsights::default()
         })));
@@ -5852,7 +5886,7 @@ mod tests {
     fn detected_insight_questions_are_offered_but_not_answered() {
         let (mut engine, incoming, events, _requests, _directory) =
             harness(CopilotSettings::default());
-        engine.handle_insights(Ok(Some(CopilotInsights {
+        engine.apply_insights(Ok(Some(CopilotInsights {
             topic: "Sales cadence".into(),
             summary: vec!["Advice on daily check-ins".into()],
             question: Some("Instead of weekly, meet with them every single day".into()),
@@ -6397,6 +6431,51 @@ mod tests {
     }
 
     #[test]
+    fn insights_that_never_come_back_are_asked_for_again() {
+        let (mut engine, incoming, events, requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        for id in 1..=2 {
+            engine.publish(TranscriptLine {
+                id,
+                speaker: Speaker::Them,
+                text: "We need this live by spring.".into(),
+                at_ms: id * 1_000,
+                voice: None,
+            });
+        }
+        // A request that has hung for a minute.
+        engine.insights_in_flight = true;
+        engine.insights_request = 7;
+        engine.last_insights_at = Some(Instant::now() - INSIGHTS_GIVE_UP);
+        engine.maybe_request_insights();
+        assert_eq!(engine.insights_request, 8);
+        wait_for_requests(&requests, 1);
+        // The hung request answering late changes nothing.
+        engine.handle(EngineMsg::InsightsFinished {
+            id: 7,
+            result: Ok(Some(CopilotInsights {
+                topic: "Stale".into(),
+                ..CopilotInsights::default()
+            })),
+        });
+        assert!(engine.insights_in_flight);
+        assert_ne!(engine.insights.topic, "Stale");
+        let message = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        engine.handle(message);
+        assert!(!engine.insights_in_flight);
+        assert_eq!(engine.insights.topic, "Pricing");
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, CopilotEvent::Insights(_)))
+        );
+    }
+
+    #[test]
     fn insights_are_requested_with_the_fast_model_and_forwarded() {
         let (mut engine, incoming, events, requests, _directory) = harness(CopilotSettings {
             auto_answer: false,
@@ -6596,12 +6675,12 @@ mod tests {
             ..CopilotSettings::default()
         });
         engine.handle_transcribed(Speaker::Them, 0, 1_000, Ok("Hi, I'm Sam from Acme.".into()));
-        engine.handle_insights(Ok(Some(CopilotInsights {
+        engine.apply_insights(Ok(Some(CopilotInsights {
             speakers: [("Them".to_owned(), "Sam".to_owned())].into(),
             ..CopilotInsights::default()
         })));
         // Labels for voices nobody heard are ignored.
-        engine.handle_insights(Ok(Some(CopilotInsights {
+        engine.apply_insights(Ok(Some(CopilotInsights {
             speakers: [("Them C".to_owned(), "Joey".to_owned())].into(),
             ..CopilotInsights::default()
         })));
@@ -6621,11 +6700,11 @@ mod tests {
             voice: 0,
             name: "Samuel Lee".into(),
         });
-        engine.handle_insights(Ok(Some(CopilotInsights {
+        engine.apply_insights(Ok(Some(CopilotInsights {
             speakers: [("Them (Samuel Lee)".to_owned(), "Pam".to_owned())].into(),
             ..CopilotInsights::default()
         })));
-        engine.handle_insights(Ok(Some(CopilotInsights {
+        engine.apply_insights(Ok(Some(CopilotInsights {
             speakers: [("Them (Samuel Lee)".to_owned(), "Pam".to_owned())].into(),
             ..CopilotInsights::default()
         })));
