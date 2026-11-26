@@ -15,11 +15,19 @@ use std::time::{Duration, SystemTime};
 use agentdictate_core::{JobId, Settings};
 use rusqlite::{OptionalExtension, params};
 
+use crate::schema::timestamp;
 use crate::{Runtime, RuntimeError};
 
 /// Recordings younger than this are never orphans: they may belong to a
 /// dictation that is still being written or cleaned up.
 const ORPHAN_RECORDING_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// An Esc-cancelled recording longer than this many seconds is kept as a
+/// `Canceled` Recovery item; a shorter one is deleted at once.
+pub(crate) const KEPT_CANCEL_SECONDS: f64 = 5.0;
+
+/// How long a `Canceled` Recovery item stays after it was cancelled.
+const CANCELED_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 
 const QUARANTINE_PREFIX: &str = ".agentdictate-delete-";
 const QUARANTINE_SUFFIX: &str = ".pending";
@@ -85,12 +93,20 @@ impl Runtime {
     /// `preserve_temp_audio` off, `.wav` files in `recordings` that no job
     /// owns and that are older than an hour are deleted too; a live
     /// recording always owns a job row, so it is never one of them.
+    /// `Canceled` Recovery items older than `CANCELED_LIFETIME` are deleted
+    /// with their audio through the quarantine path.
     pub fn clean_up_finished_jobs(
         &mut self,
         settings: &Settings,
         recordings: &Path,
     ) -> Result<FinishedJobCleanup, RuntimeError> {
         let mut cleanup = FinishedJobCleanup::default();
+        for id in self.expired_cancellations(chrono::Utc::now())? {
+            match self.delete_recovery(id) {
+                Ok(_) => cleanup.removed_jobs += 1,
+                Err(_) => cleanup.failed_removals += 1,
+            }
+        }
         for (id, stage, audio_path) in self.finished_jobs()? {
             if stage == FinishedStage::Deleted || !settings.preserve_temp_audio {
                 match remove_if_present(&audio_path) {
@@ -121,6 +137,23 @@ impl Runtime {
             self.remove_orphan_recordings(recordings, &mut cleanup)?;
         }
         Ok(cleanup)
+    }
+
+    fn expired_cancellations(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<JobId>, RuntimeError> {
+        let mut statement = self.connection.prepare(
+            "SELECT runtime_id FROM dictation_jobs WHERE stage = 'canceled' AND updated_at < ?1",
+        )?;
+        let ids = statement
+            .query_map([timestamp(now - CANCELED_LIFETIME)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| id.parse().map_err(|_| RuntimeError::InvalidJobId(id)))
+            .collect()
     }
 
     fn finished_jobs(&self) -> Result<Vec<(JobId, FinishedStage, PathBuf)>, RuntimeError> {

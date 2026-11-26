@@ -959,7 +959,7 @@ fn capture_finalization_failure_can_interrupt_the_recording_durably() {
 }
 
 #[test]
-fn explicit_discard_deletes_the_captured_job_and_its_audio() {
+fn explicit_discard_of_a_short_recording_deletes_the_job_and_its_audio() {
     let directory = TempDir::new().unwrap();
     let database_path = directory.path().join("agentdictate.db");
     let mut runtime = Runtime::open(&database_path).unwrap();
@@ -976,9 +976,9 @@ fn explicit_discard_deletes_the_captured_job_and_its_audio() {
             &mut recorder,
         )
         .unwrap();
-    runtime.capture_recording(job.id, 12.0).unwrap();
+    runtime.capture_recording(job.id, 5.0).unwrap();
 
-    let discarded = runtime.discard_recording(job.id).unwrap();
+    let discarded = runtime.discard_recording(job.id, false).unwrap();
 
     assert_eq!(discarded.stage, JobStage::Deleted);
     assert!(!discarded.audio_path.exists());
@@ -988,6 +988,123 @@ fn explicit_discard_deletes_the_captured_job_and_its_audio() {
     let restarted = Runtime::open(&database_path).unwrap();
     assert!(restarted.job(job.id).unwrap().is_none());
     assert!(restarted.recovery_entries().unwrap().is_empty());
+}
+
+#[test]
+fn explicit_discard_of_a_long_recording_keeps_it_canceled_and_retranscribable() {
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("agentdictate.db");
+    let mut runtime = Runtime::open(&database_path).unwrap();
+    let audio_path = directory.path().join("recordings/long-cancel.wav");
+    std::fs::create_dir_all(audio_path.parent().unwrap()).unwrap();
+    std::fs::write(&audio_path, b"audio").unwrap();
+    let job = runtime
+        .start_recording(
+            request(&audio_path, TRANSCRIPTION_MODEL),
+            &mut crate::support::ReadyRecorder,
+        )
+        .unwrap();
+    runtime.capture_recording(job.id, 5.5).unwrap();
+
+    let canceled = runtime.discard_recording(job.id, false).unwrap();
+
+    assert_eq!(canceled.stage, JobStage::Canceled);
+    assert!(audio_path.is_file());
+    drop(runtime);
+    let mut runtime = Runtime::open(&database_path).unwrap();
+    let entries = runtime.recovery_entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].stage, JobStage::Canceled);
+    assert!(entries[0].audio_present);
+    let mut deliverer = CountingSubmittedDeliverer { attempts: 0 };
+    let delivered = runtime
+        .retry_transcription(
+            job.id,
+            &mut FixedTranscriber,
+            &mut HeadlessDeliveryGate,
+            &mut deliverer,
+        )
+        .unwrap();
+    assert_eq!(delivered.stage, JobStage::Delivered);
+    assert_eq!(deliverer.attempts, 1);
+}
+
+#[test]
+fn explicit_discard_of_a_short_recording_keeps_only_its_audio_when_asked() {
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("agentdictate.db");
+    let mut runtime = Runtime::open(&database_path).unwrap();
+    let audio_path = directory.path().join("recordings/short-kept.wav");
+    std::fs::create_dir_all(audio_path.parent().unwrap()).unwrap();
+    std::fs::write(&audio_path, b"audio").unwrap();
+    let job = runtime
+        .start_recording(
+            request(&audio_path, TRANSCRIPTION_MODEL),
+            &mut crate::support::ReadyRecorder,
+        )
+        .unwrap();
+    runtime.capture_recording(job.id, 2.0).unwrap();
+
+    let discarded = runtime.discard_recording(job.id, true).unwrap();
+
+    assert_eq!(discarded.stage, JobStage::Deleted);
+    assert!(audio_path.is_file());
+    assert!(runtime.job(job.id).unwrap().is_none());
+    assert!(runtime.recovery_entries().unwrap().is_empty());
+}
+
+#[test]
+fn startup_cleanup_expires_canceled_recordings_after_a_day() {
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("agentdictate.db");
+    let recordings = directory.path().join("recordings");
+    std::fs::create_dir_all(&recordings).unwrap();
+    let mut runtime = Runtime::open(&database_path).unwrap();
+    let cancel = |runtime: &mut Runtime, name: &str| {
+        let audio_path = recordings.join(name);
+        std::fs::write(&audio_path, b"audio").unwrap();
+        let job = runtime
+            .start_recording(
+                request(&audio_path, TRANSCRIPTION_MODEL),
+                &mut crate::support::ReadyRecorder,
+            )
+            .unwrap();
+        runtime.capture_recording(job.id, 30.0).unwrap();
+        runtime.discard_recording(job.id, false).unwrap();
+        (job.id, audio_path)
+    };
+    let (old, old_audio) = cancel(&mut runtime, "old-cancel.wav");
+    let (recent, recent_audio) = cancel(&mut runtime, "recent-cancel.wav");
+    let day_and_hour_ago = (chrono::Utc::now() - chrono::TimeDelta::hours(25))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    rusqlite::Connection::open(&database_path)
+        .unwrap()
+        .execute(
+            "UPDATE dictation_jobs SET updated_at = ?1 WHERE runtime_id = ?2",
+            [day_and_hour_ago, old.to_string()],
+        )
+        .unwrap();
+
+    let cleanup = runtime
+        .clean_up_finished_jobs(&agentdictate_core::Settings::default(), &recordings)
+        .unwrap();
+
+    assert_eq!(cleanup.removed_jobs, 1);
+    assert!(runtime.job(old).unwrap().is_none());
+    assert!(!old_audio.exists());
+    assert_eq!(
+        runtime.job(recent).unwrap().unwrap().stage,
+        JobStage::Canceled
+    );
+    assert!(recent_audio.is_file());
+    let leftovers: Vec<_> = std::fs::read_dir(&recordings)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        leftovers,
+        vec![std::ffi::OsString::from("recent-cancel.wav")]
+    );
 }
 
 #[test]

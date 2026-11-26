@@ -122,9 +122,7 @@ where
         transcriber: T,
         deliverer: D,
     ) -> Self {
-        let recoverable_count = runtime
-            .recovery_entries()
-            .map_or(0, |entries| entries.len());
+        let recoverable_count = attention_recovery_count(&runtime).unwrap_or(0);
         Self {
             runtime,
             settings,
@@ -349,8 +347,11 @@ where
     }
 
     /// Discards the active recording because the user explicitly pressed
-    /// Escape. Shutdown and platform failures must use the separate recovery
-    /// preservation path below.
+    /// Escape. A recording longer than a few seconds waits in Recovery as
+    /// `Canceled` for a day; a shorter one is deleted with its audio unless
+    /// "Preserve temporary audio" is on. Either way the workflow returns to
+    /// Ready without asking for attention. Shutdown and platform failures
+    /// must use the separate recovery preservation path below.
     pub fn discard_recording(&mut self) -> Result<RecordingJob, DaemonError> {
         let id = self.active_job.ok_or(DaemonError::NotRecording)?;
         self.transcriber.cancel_recording(id);
@@ -383,7 +384,10 @@ where
             self.recover_after_capture_checkpoint_failure(id, &error);
             return Err(error.into());
         }
-        let discarded = match self.runtime.discard_recording(id) {
+        let discarded = match self
+            .runtime
+            .discard_recording(id, self.settings.preserve_temp_audio)
+        {
             Ok(discarded) => discarded,
             Err(error) => {
                 self.settle(
@@ -397,7 +401,12 @@ where
             }
         };
         self.settle(id, WorkflowSignal::DiscardCommitted { job_id: id });
-        tracing::info!(job_id = %id, "dictation discarded");
+        tracing::info!(
+            job_id = %id,
+            duration_seconds = capture.duration_seconds,
+            kept_in_recovery = discarded.stage == JobStage::Canceled,
+            "dictation discarded"
+        );
         Ok(discarded)
     }
 
@@ -790,7 +799,7 @@ where
     }
 
     fn attention_recovery_count(&self) -> Result<usize, RuntimeError> {
-        Ok(self.runtime.recovery_entries()?.len())
+        attention_recovery_count(&self.runtime)
     }
 
     fn overlay_update(&self) -> OverlayUpdate {
@@ -858,6 +867,16 @@ where
             weekly_activity,
         })
     }
+}
+
+/// Recovery items that need the user. An Esc-cancelled recording is kept
+/// only in case the cancel was a mistake, so it never demands attention.
+fn attention_recovery_count(runtime: &Runtime) -> Result<usize, RuntimeError> {
+    Ok(runtime
+        .recovery_entries()?
+        .iter()
+        .filter(|entry| entry.stage != JobStage::Canceled)
+        .count())
 }
 
 fn usage_totals(aggregate: UsageAggregate) -> UsageTotalsSnapshot {

@@ -13,7 +13,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use crate::history::serialize_replacements;
 use crate::history_search;
 use crate::schema::{SCHEMA, row_to_job, stage_name, state_for_stage, timestamp};
-use crate::startup_cleanup::recovery_delete_path;
+use crate::startup_cleanup::{KEPT_CANCEL_SECONDS, recovery_delete_path};
 use crate::{
     Deliverer, DeliveryDisposition, DeliveryGate, DeliveryStatus, ExternalError, JobId, JobStage,
     Recorder, RecordingJob, RecordingRequest, ReplacementRule, RuntimeError, RuntimeEvent,
@@ -199,11 +199,21 @@ impl Runtime {
         Ok(interrupted)
     }
 
-    /// Permanently discards a recording after its audio has reached the
-    /// durable captured checkpoint. The shared recovery deletion path moves
-    /// the audio into quarantine before deleting the job row, so a failed
-    /// delete never strands a retryable row without its only audio copy.
-    pub fn discard_recording(&mut self, id: JobId) -> Result<RecordingJob, RuntimeError> {
+    /// Discards a recording the user cancelled, after its audio has reached
+    /// the durable captured checkpoint. One longer than `KEPT_CANCEL_SECONDS`
+    /// becomes a `Canceled` Recovery item with its audio, which startup
+    /// cleanup expires after `CANCELED_LIFETIME`, so a mistaken Esc after a
+    /// long take loses nothing. A shorter one is deleted: with `keep_audio`
+    /// (the "Preserve temporary audio" setting) only the job row goes and
+    /// the WAV stays, like a completed dictation's audio. Otherwise the
+    /// shared recovery deletion path quarantines the audio before deleting
+    /// the row, so a failed delete never strands a retryable row without
+    /// its only audio copy.
+    pub fn discard_recording(
+        &mut self,
+        id: JobId,
+        keep_audio: bool,
+    ) -> Result<RecordingJob, RuntimeError> {
         let current = self.job(id)?.ok_or(RuntimeError::JobNotFound(id))?;
         if current.stage != JobStage::Captured {
             return Err(RuntimeError::InvalidStage {
@@ -212,7 +222,27 @@ impl Runtime {
                 actual: current.stage,
             });
         }
-        self.delete_recovery(id)
+        if current.duration_seconds > KEPT_CANCEL_SECONDS {
+            self.update_stage(id, JobStage::Canceled, None)?;
+            let canceled = self.job(id)?.expect("updated job must be readable");
+            self.publish(RuntimeEvent::JobUpdated(canceled.clone()));
+            return Ok(canceled);
+        }
+        if !keep_audio {
+            return self.delete_recovery(id);
+        }
+        self.connection.execute(
+            "DELETE FROM dictation_jobs WHERE runtime_id = ?1",
+            [id.to_string()],
+        )?;
+        let deleted = RecordingJob {
+            stage: JobStage::Deleted,
+            updated_at: Utc::now(),
+            error_message: None,
+            ..current
+        };
+        self.publish(RuntimeEvent::JobUpdated(deleted.clone()));
+        Ok(deleted)
     }
 
     pub fn process_captured(

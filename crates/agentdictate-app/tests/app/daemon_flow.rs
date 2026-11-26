@@ -39,6 +39,24 @@ impl RecordingController for PreservingRecorder {
     }
 }
 
+/// Records a take of the given length in seconds, writing a WAV so audio retention is observable.
+struct TimedRecorder(f64);
+
+impl Recorder for TimedRecorder {
+    fn start(&mut self, job: &RecordingJob) -> Result<(), ExternalError> {
+        std::fs::write(&job.audio_path, b"RIFFtimed audio").unwrap();
+        Ok(())
+    }
+}
+
+impl RecordingController for TimedRecorder {
+    fn finish(&mut self, _job: &RecordingJob) -> Result<CapturedRecording, ExternalError> {
+        Ok(CapturedRecording {
+            duration_seconds: self.0,
+        })
+    }
+}
+
 impl Recorder for FailingFinishRecorder {
     fn start(&mut self, job: &RecordingJob) -> Result<(), ExternalError> {
         std::fs::write(&job.audio_path, b"RIFFpartial audio").unwrap();
@@ -468,31 +486,67 @@ fn deleting_another_recovery_item_keeps_a_live_recording_stoppable() {
 }
 
 #[test]
-fn escape_discards_audio_and_returns_ready_even_when_audio_retention_is_enabled() {
+fn escape_on_a_short_recording_keeps_its_audio_only_when_audio_retention_is_enabled() {
+    for preserve_temp_audio in [false, true] {
+        let directory = tempdir().unwrap();
+        let paths = app_paths(directory.path());
+        std::fs::create_dir_all(paths.database_file.parent().unwrap()).unwrap();
+        let runtime = Runtime::open(&paths.database_file).unwrap();
+        let settings = Settings {
+            preserve_temp_audio,
+            ..Settings::default()
+        };
+        let mut daemon = Daemon::new(
+            runtime,
+            settings,
+            paths.clone(),
+            TimedRecorder(5.0),
+            FixedTranscriber,
+            SubmittedDelivery::default(),
+        );
+        let started = daemon.start_recording().unwrap();
+
+        let discarded = daemon.discard_recording().unwrap();
+
+        assert_eq!(discarded.stage, JobStage::Deleted);
+        assert_eq!(started.audio_path.exists(), preserve_temp_audio);
+        assert_eq!(daemon.snapshot().workflow.phase, WorkflowPhase::Ready);
+        assert_eq!(daemon.snapshot().recoverable_count, 0);
+        assert!(daemon.workspace_snapshot().unwrap().recoveries.is_empty());
+    }
+}
+
+#[test]
+fn escape_on_a_long_recording_keeps_it_in_recovery_without_demanding_attention() {
     let directory = tempdir().unwrap();
     let paths = app_paths(directory.path());
     std::fs::create_dir_all(paths.database_file.parent().unwrap()).unwrap();
     let runtime = Runtime::open(&paths.database_file).unwrap();
-    let settings = Settings {
-        preserve_temp_audio: true,
-        ..Settings::default()
-    };
     let mut daemon = Daemon::new(
         runtime,
-        settings,
+        Settings::default(),
         paths.clone(),
-        PreservingRecorder::default(),
+        TimedRecorder(42.0),
         FixedTranscriber,
         SubmittedDelivery::default(),
     );
     let started = daemon.start_recording().unwrap();
 
-    let discarded = daemon.discard_recording().unwrap();
+    let canceled = daemon.discard_recording().unwrap();
 
-    assert_eq!(discarded.stage, JobStage::Deleted);
-    assert!(!started.audio_path.exists());
+    assert_eq!(canceled.stage, JobStage::Canceled);
+    assert!(started.audio_path.is_file());
     assert_eq!(daemon.snapshot().workflow.phase, WorkflowPhase::Ready);
     assert_eq!(daemon.snapshot().recoverable_count, 0);
+    let recoveries = daemon.workspace_snapshot().unwrap().recoveries;
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(recoveries[0].job_id, started.id);
+    assert_eq!(recoveries[0].stage, JobStage::Canceled);
+    assert!(recoveries[0].audio_present);
+
+    let delivered = daemon.retry_transcription(started.id).unwrap();
+    assert_eq!(delivered.stage, JobStage::Delivered);
+    assert_eq!(daemon.deliverer().attempts, 1);
     assert!(daemon.workspace_snapshot().unwrap().recoveries.is_empty());
 }
 
@@ -506,7 +560,7 @@ fn failed_escape_delete_restores_audio_and_surfaces_recovery_attention() {
         runtime,
         Settings::default(),
         paths.clone(),
-        PreservingRecorder::default(),
+        TimedRecorder(2.0),
         FixedTranscriber,
         SubmittedDelivery::default(),
     );
