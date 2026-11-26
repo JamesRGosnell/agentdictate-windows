@@ -5,7 +5,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
 };
@@ -15,6 +16,95 @@ use windows_sys::Win32::{
     UI::{Shell::*, WindowsAndMessaging::*},
 };
 static TRAY_REQUEST_ID: AtomicU64 = AtomicU64::new(10_000);
+/// The tray window while its thread runs, or 0.
+static TRAY_WINDOW: AtomicUsize = AtomicUsize::new(0);
+/// The newest notification waiting for the tray thread; a newer one
+/// replaces it.
+static PENDING_BALLOON: Mutex<Option<String>> = Mutex::new(None);
+/// Posted to the tray window when `PENDING_BALLOON` holds a notification.
+const WM_TRAY_BALLOON: u32 = WM_APP + 2;
+const BALLOON_TITLE: &str = "AgentDictate";
+
+/// Shows the tray notifications for dictations that were not pasted. It
+/// only queues the text and posts a message, so the daemon never waits on
+/// Explorer; the tray thread calls the shell. Without a tray icon the
+/// notification is dropped.
+#[must_use]
+pub fn tray_notice_sink() -> crate::NoticeSink {
+    Arc::new(|notice: &crate::Notice| {
+        if let Some(text) = &notice.balloon {
+            show_tray_notification(text);
+        }
+    })
+}
+
+fn show_tray_notification(text: &str) {
+    let window = TRAY_WINDOW.load(Ordering::Acquire);
+    if window == 0 {
+        tracing::debug!("no tray icon; notification skipped");
+        return;
+    }
+    *PENDING_BALLOON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text.to_owned());
+    // SAFETY: posting to a window of another thread only queues a message;
+    // a window destroyed meanwhile makes the call fail harmlessly.
+    if unsafe { PostMessageW(window as HWND, WM_TRAY_BALLOON, 0, 0) } == 0 {
+        tracing::debug!("tray window is gone; notification skipped");
+    }
+}
+
+/// Copies `text` into a fixed wide buffer, NUL-terminated and cut short
+/// without splitting a surrogate pair.
+fn copy_wide(buffer: &mut [u16], text: &str) {
+    let mut units = text
+        .encode_utf16()
+        .take(buffer.len() - 1)
+        .collect::<Vec<_>>();
+    if units.len() == buffer.len() - 1
+        && units
+            .last()
+            .is_some_and(|unit| (0xD800..0xDC00).contains(unit))
+    {
+        units.pop();
+    }
+    buffer.fill(0);
+    buffer[..units.len()].copy_from_slice(&units);
+}
+
+/// The NIM_MODIFY data that shows `text` as a notification of `icon`.
+/// NIIF_NOSOUND: the pill already shows the notice where the user is
+/// looking, so a chime on every failure would only add noise; the
+/// notification stays in the notification center for later.
+fn balloon_data(icon: &NOTIFYICONDATAW, text: &str) -> NOTIFYICONDATAW {
+    let mut balloon = *icon;
+    balloon.uFlags = NIF_INFO;
+    balloon.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+    copy_wide(&mut balloon.szInfoTitle, BALLOON_TITLE);
+    copy_wide(&mut balloon.szInfo, text);
+    balloon
+}
+
+/// Shows the pending notification; runs on the tray thread.
+unsafe fn show_pending_balloon() {
+    let Some(text) = PENDING_BALLOON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    let shown = ICON.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|icon| {
+            let balloon = balloon_data(icon, &text);
+            // SAFETY: `balloon` is a copy of this thread's initialized icon.
+            unsafe { Shell_NotifyIconW(NIM_MODIFY, &balloon) != 0 }
+        })
+    });
+    if !shown {
+        tracing::debug!("tray icon is not shown; notification skipped");
+    }
+}
 /// User intent emitted by the desktop tray. Menu callbacks only enqueue these
 /// values; IPC and process work happens away from the status-notifier thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +218,10 @@ unsafe extern "system" fn window_proc(
             if add_icon_or_retry(hwnd) {
                 tracing::info!("tray icon added after retrying");
             }
+            return 0;
+        }
+        if message == WM_TRAY_BALLOON {
+            show_pending_balloon();
             return 0;
         }
         if message == WM_APP + 1 {
@@ -267,12 +361,14 @@ pub fn start_system_tray(runtime: PathBuf, settings: PathBuf) -> std::io::Result
             // A refused first add is retried; the window and its loop stay
             // alive so TaskbarCreated can still add the icon later.
             add_icon_or_retry(hwnd);
+            TRAY_WINDOW.store(hwnd as usize, Ordering::Release);
             let _ = ready.send(Ok(hwnd as usize));
             let mut message = std::mem::zeroed();
             while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
+            TRAY_WINDOW.store(0, Ordering::Release);
             Shell_NotifyIconW(NIM_DELETE, &icon);
             ICON.with(|slot| *slot.borrow_mut() = None);
             ACTIONS.with(|slot| *slot.borrow_mut() = None);
@@ -343,4 +439,56 @@ fn reject_command_error(message: ServerMessageKind) -> anyhow::Result<()> {
         anyhow::bail!(error)
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn icon() -> NOTIFYICONDATAW {
+        // SAFETY: NOTIFYICONDATAW is plain data; all-zero is a valid value.
+        let mut icon: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        icon.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        icon.uID = 1;
+        icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        icon
+    }
+
+    fn text(buffer: &[u16]) -> String {
+        let end = buffer.iter().position(|unit| *unit == 0).unwrap();
+        String::from_utf16(&buffer[..end]).unwrap()
+    }
+
+    #[test]
+    fn a_balloon_modifies_only_the_notification_of_the_same_icon() {
+        let balloon = balloon_data(&icon(), "Sign in again. It is saved in Recovery.");
+        assert_eq!(balloon.uFlags, NIF_INFO);
+        assert_eq!(balloon.uID, 1);
+        assert_eq!(balloon.dwInfoFlags, NIIF_INFO | NIIF_NOSOUND);
+        assert_eq!(text(&balloon.szInfoTitle), "AgentDictate");
+        assert_eq!(
+            text(&balloon.szInfo),
+            "Sign in again. It is saved in Recovery."
+        );
+    }
+
+    #[test]
+    fn a_long_notification_is_cut_without_splitting_a_character() {
+        let long = format!("{}\u{1F3A4}", "a".repeat(254));
+        let balloon = balloon_data(&icon(), &long);
+        assert_eq!(text(&balloon.szInfo), "a".repeat(254));
+        let fits = "b".repeat(300);
+        assert_eq!(text(&balloon_data(&icon(), &fits).szInfo), "b".repeat(255));
+    }
+
+    #[test]
+    fn without_a_tray_window_a_notification_is_dropped() {
+        assert_eq!(TRAY_WINDOW.load(Ordering::Acquire), 0);
+        let sink = tray_notice_sink();
+        sink(&crate::Notice {
+            notice: agentdictate_core::DictationNotice::LimitReached,
+            balloon: Some("limit".into()),
+        });
+        assert!(PENDING_BALLOON.lock().unwrap().is_none());
+    }
 }

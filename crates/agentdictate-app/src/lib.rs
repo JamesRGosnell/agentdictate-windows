@@ -65,6 +65,8 @@ pub use startup::{
     sync_startup_command, sync_startup_with_systemctl,
 };
 pub use system::{SystemDeliverer, SystemRecordingController};
+#[cfg(windows)]
+pub use tray::tray_notice_sink;
 pub use tray::{
     SystemTrayHandle, TrayAction, settings_executable_for_current_process, start_system_tray,
     tray_command_for_phase,

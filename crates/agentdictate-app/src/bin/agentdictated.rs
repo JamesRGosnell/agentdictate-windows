@@ -82,6 +82,10 @@ fn run_daemon(paths: AppPaths) -> anyhow::Result<()> {
             None
         }
     };
+    // Dictations that are not pasted are also announced from the tray icon;
+    // without one, the notifications are dropped.
+    #[cfg(windows)]
+    process.set_notice_sink(agentdictate_app::tray_notice_sink());
     start_hotkey_listener(&mut process, &runtime)?;
     let _maintenance_thread = match process.start_post_listener_maintenance() {
         Ok(thread) => Some(thread),
