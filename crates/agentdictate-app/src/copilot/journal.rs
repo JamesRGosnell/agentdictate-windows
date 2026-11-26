@@ -390,6 +390,16 @@ pub(crate) fn write_atomically(path: &Path, contents: &str) -> std::io::Result<(
     })
 }
 
+/// "12 s" or "1 min 5 s", for speech that was lost.
+pub(crate) fn gap_label(duration_ms: u64) -> String {
+    let seconds = duration_ms.div_ceil(1_000).max(1);
+    match (seconds / 60, seconds % 60) {
+        (0, seconds) => format!("{seconds} s"),
+        (minutes, 0) => format!("{minutes} min"),
+        (minutes, seconds) => format!("{minutes} min {seconds} s"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use agentdictate_core::Speaker;
@@ -451,5 +461,13 @@ mod tests {
                 .ends_with("(recovered).md")
         );
         assert_eq!(std::fs::read_dir(&live).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn lost_speech_is_labelled_by_how_long_it_was() {
+        assert_eq!(gap_label(11_200), "12 s");
+        assert_eq!(gap_label(0), "1 s");
+        assert_eq!(gap_label(65_000), "1 min 5 s");
+        assert_eq!(gap_label(120_000), "2 min");
     }
 }

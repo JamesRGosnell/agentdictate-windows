@@ -784,11 +784,13 @@ pub(crate) fn transcribe_wav_with_chatgpt(
         let payload = response
             .text()
             .map_err(|error| CodexSubscriptionError::Transport(error).to_string())?;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(rate_limit_message(&payload));
+        }
         if !status.is_success() {
             return Err(match status {
                 StatusCode::UNAUTHORIZED => CodexSubscriptionError::Unauthorized,
                 StatusCode::FORBIDDEN => CodexSubscriptionError::NotEntitled,
-                StatusCode::TOO_MANY_REQUESTS => CodexSubscriptionError::RateLimited,
                 StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
                     CodexSubscriptionError::RequestRejected
                 }
@@ -807,6 +809,56 @@ pub(crate) fn transcribe_wav_with_chatgpt(
             .unwrap_or_default()
             .trim()
             .to_owned());
+    }
+}
+
+/// What a rate-limited reply says, so a used-up plan ("resets in about 29
+/// days") is told apart from a brief limit worth waiting out.
+fn rate_limit_message(body: &str) -> String {
+    let value = serde_json::from_str::<Value>(body).ok();
+    let detail = value
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("detail"))
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+        })
+        .map(|detail| detail.trim().chars().take(240).collect::<String>())
+        .filter(|detail| !detail.is_empty());
+    let resets = value
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/resets_in_seconds")
+                .and_then(Value::as_u64)
+        })
+        .map(reset_label);
+    let mut message = "ChatGPT transcription limit reached.".to_owned();
+    if let Some(detail) = detail {
+        message.push(' ');
+        message.push_str(&detail);
+        if !detail.ends_with(['.', '!', '?']) {
+            message.push('.');
+        }
+    }
+    match resets {
+        Some(resets) => message.push_str(&format!(" It resets in about {resets}.")),
+        None => message.push_str(" Try again later."),
+    }
+    message
+}
+
+/// "45 min", "3 h", or "29 days" until a limit resets.
+fn reset_label(seconds: u64) -> String {
+    let minutes = seconds.div_ceil(60).max(1);
+    if minutes < 60 {
+        format!("{minutes} min")
+    } else if minutes < 48 * 60 {
+        format!("{} h", minutes.div_ceil(60))
+    } else {
+        format!("{} days", minutes.div_ceil(24 * 60))
     }
 }
 
@@ -1206,6 +1258,24 @@ mod tests {
         assert!(requests[0].contains("authorization: Bearer expired-token"));
         assert!(requests[1].contains("authorization: Bearer fresh-token"));
         assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn a_rate_limit_says_when_it_resets() {
+        assert_eq!(
+            rate_limit_message(""),
+            "ChatGPT transcription limit reached. Try again later."
+        );
+        assert_eq!(
+            rate_limit_message(
+                r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":2505600}}"#
+            ),
+            "ChatGPT transcription limit reached. The usage limit has been reached. It resets in about 29 days."
+        );
+        assert_eq!(
+            rate_limit_message(r#"{"error":{"resets_in_seconds":90}}"#),
+            "ChatGPT transcription limit reached. It resets in about 2 min."
+        );
     }
 
     #[test]

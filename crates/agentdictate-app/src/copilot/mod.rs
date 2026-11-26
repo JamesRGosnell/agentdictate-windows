@@ -104,12 +104,169 @@ fn capitalize(word: &str) -> String {
     })
 }
 
-/// Errors worth retrying: rate limits, outages, and dropped connections.
+/// Errors worth retrying: brief rate limits, outages, and dropped
+/// connections. A failure that will not clear up during a meeting is not.
 fn is_transient_failure(error: &str) -> bool {
+    if is_lasting_failure(error) {
+        return false;
+    }
     let error = error.to_lowercase();
     ["limit", "temporarily unavailable", "could not reach"]
         .iter()
         .any(|pattern| error.contains(pattern))
+}
+
+/// Failures that will not clear up during a meeting: a used-up plan or
+/// quota, and a sign-in or key the service turned down.
+fn is_lasting_failure(error: &str) -> bool {
+    let error = error.to_lowercase();
+    const LASTING: [&str; 13] = [
+        "usage limit",
+        "quota",
+        "billing",
+        "sign-in expired",
+        "sign in again",
+        "not signed in",
+        "sign in with chatgpt",
+        "rejected the sign-in",
+        "access token",
+        "account identifier",
+        "not available for this account",
+        "unavailable for this account",
+        "api key",
+    ];
+    LASTING.iter().any(|pattern| error.contains(pattern)) || resets_much_later(&error)
+}
+
+/// Whether a limit says it resets in hours or days rather than minutes.
+fn resets_much_later(error: &str) -> bool {
+    let Some((_, after)) = error.split_once("resets in") else {
+        return false;
+    };
+    let after = after.trim_start().trim_start_matches("about").trim_start();
+    let amount: u64 = after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    let unit = after.trim_start_matches(|character: char| character.is_ascii_digit());
+    let unit = unit.trim_start();
+    unit.starts_with("day")
+        || unit.starts_with("week")
+        || unit.starts_with('h')
+        || (unit.starts_with("min") && amount > 10)
+}
+
+/// Rate-limited utterances in a row after which a route stops waiting out
+/// its limit, so speech does not queue behind retries that keep failing.
+const LIMITED_IN_A_ROW: usize = 3;
+
+type RouteTranscribe = dyn Fn(&[u8], &str) -> Result<String, String> + Send + Sync;
+
+/// One way to transcribe an utterance, such as the OpenAI API or the
+/// ChatGPT sign-in.
+struct TranscriptionRoute {
+    name: &'static str,
+    transcribe: Box<RouteTranscribe>,
+    /// Failed in a way that will not clear up during the session.
+    down: std::sync::atomic::AtomicBool,
+    /// Utterances in a row that failed on a rate limit.
+    limited: std::sync::atomic::AtomicUsize,
+}
+
+impl TranscriptionRoute {
+    fn new(
+        name: &'static str,
+        transcribe: impl Fn(&[u8], &str) -> Result<String, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name,
+            transcribe: Box::new(transcribe),
+            down: std::sync::atomic::AtomicBool::new(false),
+            limited: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Transcribes, riding out brief rate limits and network blips.
+    fn attempt(
+        &self,
+        wav: &[u8],
+        language: &str,
+        pause: &dyn Fn(std::time::Duration),
+    ) -> Result<String, String> {
+        use std::sync::atomic::Ordering;
+        let retries = if self.limited.load(Ordering::Relaxed) >= LIMITED_IN_A_ROW {
+            0
+        } else {
+            2
+        };
+        let mut attempt = 0;
+        let result = loop {
+            match (self.transcribe)(wav, language) {
+                Err(error) if attempt < retries && is_transient_failure(&error) => {
+                    attempt += 1;
+                    tracing::warn!(route = self.name, %error, attempt, "retrying copilot transcription");
+                    pause(std::time::Duration::from_millis(1_500 * attempt));
+                }
+                result => break result,
+            }
+        };
+        match &result {
+            Err(error) if error.to_lowercase().contains("limit") => {
+                self.limited.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => self.limited.store(0, Ordering::Relaxed),
+        }
+        result
+    }
+}
+
+/// Transcribes on the first route that works, in order of preference. A
+/// route that fails for good is passed over for the rest of the session
+/// while another is left; with none left, all are tried again.
+fn transcribe_on_routes(
+    routes: &[TranscriptionRoute],
+    wav: &[u8],
+    language: &str,
+    pause: &dyn Fn(std::time::Duration),
+) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    let usable: Vec<&TranscriptionRoute> = routes
+        .iter()
+        .filter(|route| !route.down.load(Ordering::Relaxed))
+        .collect();
+    let candidates = if usable.is_empty() {
+        routes.iter().collect()
+    } else {
+        usable
+    };
+    let mut last = Err("No transcription is set up.".to_owned());
+    for (index, route) in candidates.iter().enumerate() {
+        match route.attempt(wav, language, pause) {
+            Ok(text) => {
+                if route.down.swap(false, Ordering::Relaxed) {
+                    tracing::info!(route = route.name, "copilot transcription works again");
+                }
+                return Ok(text);
+            }
+            Err(error) => {
+                let next = candidates.get(index + 1).map(|next| next.name);
+                if is_lasting_failure(&error) && !route.down.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        route = route.name,
+                        %error,
+                        next,
+                        "copilot transcription failed for good; passing it over for the rest of the session"
+                    );
+                } else if let Some(next) = next {
+                    tracing::warn!(route = route.name, %error, next, "copilot transcription failed; trying the next route");
+                }
+                last = Err(error);
+            }
+        }
+    }
+    last
 }
 
 /// Replays a recorded call through a headless session and reports how soon
@@ -516,38 +673,20 @@ fn session_services(
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(45))
             .build()?;
+        // An OpenAI API key is the user's chosen route for transcription;
+        // the ChatGPT sign-in is the fallback.
+        let mut routes = Vec::new();
+        if !openai_key.is_empty() {
+            let client = client.clone();
+            routes.push(TranscriptionRoute::new("OpenAI", move |wav, language| {
+                providers::transcribe_wav_with_openai(&client, &openai_key, wav.to_vec(), language)
+            }));
+        }
+        routes.push(TranscriptionRoute::new("ChatGPT", move |wav, language| {
+            transcribe_wav_with_chatgpt(&client, &chatgpt, wav, language)
+        }));
         Arc::new(move |wav: Vec<u8>, language: &str| {
-            // A meeting sends many short requests; ride out brief rate limits
-            // and network blips instead of dropping what was said.
-            let with_retries = |transcribe: &dyn Fn() -> Result<String, String>| {
-                let mut attempt = 0;
-                loop {
-                    match transcribe() {
-                        Err(error) if attempt < 2 && is_transient_failure(&error) => {
-                            attempt += 1;
-                            tracing::warn!(%error, attempt, "retrying copilot transcription");
-                            std::thread::sleep(std::time::Duration::from_millis(1_500 * attempt));
-                        }
-                        result => break result,
-                    }
-                }
-            };
-            let chatgpt_transcribe =
-                || transcribe_wav_with_chatgpt(&client, &chatgpt, &wav, language);
-            // An OpenAI API key is the user's chosen route for transcription;
-            // the ChatGPT sign-in is the fallback.
-            if openai_key.is_empty() {
-                return with_retries(&chatgpt_transcribe);
-            }
-            match with_retries(&|| {
-                providers::transcribe_wav_with_openai(&client, &openai_key, wav.clone(), language)
-            }) {
-                Ok(text) => Ok(text),
-                Err(error) => {
-                    tracing::warn!(%error, "OpenAI transcription failed; using ChatGPT");
-                    chatgpt_transcribe()
-                }
-            }
+            transcribe_on_routes(&routes, &wav, language, &std::thread::sleep)
         })
     };
     let provider_factory: ProviderFactory = {
@@ -873,6 +1012,89 @@ mod tests {
         assert!(!is_transient_failure(
             "ChatGPT sign-in expired. Open Codex and sign in again."
         ));
+    }
+
+    #[test]
+    fn a_used_up_plan_or_a_rejected_sign_in_is_not_waited_out() {
+        for lasting in [
+            "ChatGPT transcription limit reached. The usage limit has been reached. It resets in about 29 days.",
+            "ChatGPT rate limit reached. Try again shortly. It resets in about 3 h 20 min.",
+            "OpenAI transcription rate limit reached. Try again shortly. You exceeded your current quota, please check your plan and billing details.",
+            "OpenAI transcription rejected the sign-in or key. Incorrect API key provided.",
+            "ChatGPT sign-in expired. Open Codex and sign in again.",
+            "ChatGPT subscription transcription is unavailable for this account.",
+            "Codex is not signed in with ChatGPT.",
+        ] {
+            assert!(is_lasting_failure(lasting), "{lasting}");
+            assert!(!is_transient_failure(lasting), "{lasting}");
+        }
+        for brief in [
+            "ChatGPT transcription limit reached. Try again later.",
+            "ChatGPT transcription limit reached. It resets in about 2 min.",
+            "Could not reach ChatGPT transcription: timeout",
+        ] {
+            assert!(!is_lasting_failure(brief), "{brief}");
+            assert!(is_transient_failure(brief), "{brief}");
+        }
+    }
+
+    fn scripted_route(
+        name: &'static str,
+        calls: &std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        reply: impl Fn(usize) -> Result<String, String> + Send + Sync + 'static,
+    ) -> TranscriptionRoute {
+        let calls = std::sync::Arc::clone(calls);
+        TranscriptionRoute::new(name, move |_, _| {
+            let mut calls = calls.lock().unwrap();
+            calls.push(name);
+            let made = calls.iter().filter(|call| **call == name).count();
+            drop(calls);
+            reply(made)
+        })
+    }
+
+    #[test]
+    fn a_route_that_fails_for_good_is_passed_over_for_the_rest_of_the_session() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let routes = [
+            scripted_route("OpenAI", &calls, |_| {
+                Err(
+                    "OpenAI transcription rate limit reached. You exceeded your current quota."
+                        .into(),
+                )
+            }),
+            scripted_route("ChatGPT", &calls, |made| Ok(format!("line {made}"))),
+        ];
+        let no_wait = |_| {};
+        assert_eq!(
+            transcribe_on_routes(&routes, b"wav", "", &no_wait).unwrap(),
+            "line 1"
+        );
+        assert_eq!(
+            transcribe_on_routes(&routes, b"wav", "", &no_wait).unwrap(),
+            "line 2"
+        );
+        // Tried once, never retried, then skipped.
+        assert_eq!(*calls.lock().unwrap(), ["OpenAI", "ChatGPT", "ChatGPT"]);
+    }
+
+    #[test]
+    fn brief_limits_are_retried_until_they_keep_failing() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let routes = [scripted_route("ChatGPT", &calls, |_| {
+            Err("ChatGPT transcription limit reached. Try again later.".into())
+        })];
+        let waits = std::sync::Mutex::new(0);
+        let pause = |_| *waits.lock().unwrap() += 1;
+        for _ in 0..LIMITED_IN_A_ROW {
+            assert!(transcribe_on_routes(&routes, b"wav", "", &pause).is_err());
+        }
+        assert_eq!(calls.lock().unwrap().len(), 3 * LIMITED_IN_A_ROW);
+        // Past that, each utterance gets one try, so speech stops queueing
+        // behind retries.
+        assert!(transcribe_on_routes(&routes, b"wav", "", &pause).is_err());
+        assert_eq!(calls.lock().unwrap().len(), 3 * LIMITED_IN_A_ROW + 1);
+        assert_eq!(*waits.lock().unwrap(), 2 * LIMITED_IN_A_ROW);
     }
 
     #[test]

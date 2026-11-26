@@ -142,6 +142,9 @@ const MENTION_CONTEXT_MS: u64 = 30_000;
 const SELF_CHECK_GAP: Duration = Duration::from_secs(8);
 /// How long the notes-ready bar stays after the user ended the meeting.
 const NOTES_READY_WAIT: Duration = Duration::from_secs(25);
+/// A line from the other side transcribed this long after it was said is
+/// not judged or answered.
+const LATE_LINE: Duration = Duration::from_secs(20);
 const HEARING_PROBLEM: &str = "Can't hear the other side. Check that the call plays through your default speakers or headset.";
 
 /// Audio pipeline output, independent of the capture backend.
@@ -1726,6 +1729,7 @@ impl Engine {
                     self.transcription_problem = Some(error);
                     self.refresh_problem();
                 }
+                self.publish_gap(speaker, start_ms, end_ms);
                 if speaker == Speaker::Them {
                     self.forget_them_span(start_ms, end_ms);
                 }
@@ -1776,7 +1780,14 @@ impl Engine {
                 self.publish(line);
                 self.resolve_pending_mine(false);
                 self.alert_if_mentioned(&text, start_ms);
-                self.consider_turn(text, end_ms, voice);
+                // A line that took this long to arrive was asked long ago;
+                // the conversation has moved on.
+                let late_ms = self.elapsed_ms().saturating_sub(end_ms);
+                if late_ms > LATE_LINE.as_millis() as u64 {
+                    tracing::info!(late_ms, "a line arrived too late to answer");
+                } else {
+                    self.consider_turn(text, end_ms, voice);
+                }
             }
             Speaker::Me => {
                 let nearby = self.nearby_them(start_ms, end_ms);
@@ -1851,6 +1862,17 @@ impl Engine {
     }
 
     fn publish(&mut self, line: TranscriptLine) {
+        self.insert_line(&line);
+        match line.speaker {
+            Speaker::Them => self.translate(&line),
+            Speaker::Me => self.check_my_statement(&line.text),
+        }
+        (self.ui)(CopilotEvent::Transcript(line));
+    }
+
+    /// Adds a line to the transcript in time order and keeps it for the
+    /// notes.
+    fn insert_line(&mut self, line: &TranscriptLine) {
         let position = self
             .transcript
             .iter()
@@ -1858,10 +1880,31 @@ impl Engine {
             .unwrap_or(self.transcript.len());
         self.transcript.insert(position, line.clone());
         self.record(Entry::Line { line: line.clone() });
-        match line.speaker {
-            Speaker::Them => self.translate(&line),
-            Speaker::Me => self.check_my_statement(&line.text),
-        }
+    }
+
+    /// Marks where speech could not be transcribed, so the transcript and
+    /// notes show what is missing instead of closing over it.
+    fn publish_gap(&mut self, speaker: Speaker, start_ms: u64, end_ms: u64) {
+        let voice = match speaker {
+            Speaker::Them => self
+                .them_spans
+                .iter()
+                .find(|span| span.start_ms == start_ms && span.end_ms == end_ms)
+                .and_then(|span| span.voice),
+            Speaker::Me => None,
+        };
+        let line = TranscriptLine {
+            id: self.next_line,
+            speaker,
+            text: format!(
+                "[{} not transcribed]",
+                journal::gap_label(end_ms.saturating_sub(start_ms))
+            ),
+            at_ms: start_ms,
+            voice,
+        };
+        self.next_line += 1;
+        self.insert_line(&line);
         (self.ui)(CopilotEvent::Transcript(line));
     }
 
@@ -4491,6 +4534,62 @@ mod tests {
         assert_eq!(problems, vec![Some(limit.to_owned()), None]);
     }
 
+    #[test]
+    fn speech_that_could_not_be_transcribed_leaves_a_marker_in_the_notes() {
+        let (mut engine, _incoming, events, _requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.handle_transcribed(Speaker::Them, 0, 2_000, Ok("Where were we?".into()));
+        engine.handle_transcribed(
+            Speaker::Them,
+            3_000,
+            14_200,
+            Err("ChatGPT transcription limit reached.".into()),
+        );
+        let shown: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                CopilotEvent::Transcript(line) => Some(line.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, ["Where were we?", "[12 s not transcribed]"]);
+        let notes = std::fs::read_to_string(engine.write_notes(None).unwrap()).unwrap();
+        assert!(notes.contains("[12 s not transcribed]"));
+    }
+
+    #[test]
+    fn a_question_transcribed_long_after_it_was_asked_is_not_answered() {
+        let (mut engine, _incoming, _events, requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.started = Instant::now() - Duration::from_secs(60);
+        engine.handle_transcribed(
+            Speaker::Them,
+            20_000,
+            24_000,
+            Ok("What does pricing look like for us?".into()),
+        );
+        assert!(engine.pending_turn.is_none());
+        assert!(
+            engine
+                .transcript
+                .iter()
+                .any(|line| line.text.contains("pricing"))
+        );
+        // The same question heard on time is judged.
+        engine.handle_transcribed(
+            Speaker::Them,
+            56_000,
+            59_000,
+            Ok("And what about onboarding for us?".into()),
+        );
+        assert!(engine.pending_turn.is_some());
+        wait_for_requests(&requests, 1);
+    }
+
     fn drain(engine: &mut Engine, incoming: &Receiver<EngineMsg>) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -4521,7 +4620,7 @@ mod tests {
     /// Places the session clock well past the fixture utterances, as if the
     /// other side had already been silent for a while.
     fn after_a_pause(engine: &mut Engine) {
-        engine.started = Instant::now() - Duration::from_secs(30);
+        engine.started = Instant::now() - Duration::from_secs(15);
     }
 
     /// Feeds the capture thread's messages for a finished system-audio
@@ -5103,7 +5202,8 @@ mod tests {
     fn a_question_asked_again_is_answered_despite_the_judge() {
         let (mut engine, _incoming, events, _requests, _directory) =
             harness(CopilotSettings::default());
-        after_a_pause(&mut engine);
+        // Well past the question asked at 20 s.
+        engine.started = Instant::now() - Duration::from_secs(30);
         let them = |id, at_ms, text: &str| TranscriptLine {
             id,
             speaker: Speaker::Them,
