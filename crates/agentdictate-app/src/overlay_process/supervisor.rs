@@ -12,7 +12,7 @@ use std::{
 };
 
 use agentdictate_runtime::{DeliveryGate, DeliveryGateError};
-use agentdictate_ui::OverlayState;
+use agentdictate_ui::{OVERLAY_NOTICE_HOLD, OverlayState};
 use thiserror::Error;
 
 use super::{
@@ -33,7 +33,7 @@ mod startup_tests;
 mod focusless_teardown_tests {
     use super::*;
 
-    use agentdictate_core::{JobId, Workflow, WorkflowSignal};
+    use agentdictate_core::{DictationNotice, JobId, Workflow, WorkflowSignal};
 
     fn controller() -> (OverlayController, Receiver<OverlayCommand>) {
         let (commands, received) = channel();
@@ -227,6 +227,138 @@ mod focusless_teardown_tests {
         assert!(matches!(second_acknowledgment.try_recv(), Ok(Ok(()))));
         assert!(supervisor.helper.is_none() && supervisor.pending_dismissal.is_none());
     }
+
+    fn notice(notice: DictationNotice) -> OverlayUpdate {
+        OverlayUpdate {
+            workflow: Workflow::new().snapshot(),
+            active_recording: None,
+            notice: Some(notice),
+        }
+    }
+
+    fn hidden() -> OverlayUpdate {
+        OverlayUpdate {
+            workflow: Workflow::new().snapshot(),
+            active_recording: None,
+            notice: None,
+        }
+    }
+
+    /// A helper that shows its frame and exits when its input closes.
+    const GRACEFUL_HELPER: &str = "@echo off\r\n\
+        echo {\"status\":\"frame_submitted\"}\r\n\
+        more >nul\r\n\
+        exit /b 0\r\n";
+
+    fn graceful_helper(directory: &Path) -> PathBuf {
+        let executable = directory.join("overlay-helper.cmd");
+        std::fs::write(&executable, GRACEFUL_HELPER).unwrap();
+        executable
+    }
+
+    #[test]
+    fn a_notice_shows_the_pill_until_its_hold_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = graceful_helper(directory.path());
+        let (events, event_receiver) = channel();
+        let mut supervisor = OverlaySupervisor::new(
+            &executable,
+            Duration::from_secs(5),
+            events,
+            Arc::new(OverlayHealth::default()),
+        );
+
+        let shown_at = Instant::now();
+        supervisor.handle_update(notice(DictationNotice::LimitReached));
+        assert_eq!(
+            supervisor.helper.as_ref().map(OverlayChild::generation),
+            Some(1),
+            "a notice must launch the pill"
+        );
+        let until = supervisor.notice_until.expect("the notice has a hold");
+        assert!(until >= shown_at + OVERLAY_NOTICE_HOLD);
+        // The update that settled the dictation's bookkeeping, or a hotkey
+        // readiness change, must not cut the notice short.
+        supervisor.handle_update(hidden());
+        assert_eq!(
+            supervisor.helper.as_ref().map(OverlayChild::generation),
+            Some(1)
+        );
+        assert_eq!(supervisor.notice_until, Some(until));
+
+        supervisor.notice_deadline_passed(until - Duration::from_millis(1));
+        assert!(supervisor.helper.is_some(), "the notice ended early");
+        supervisor.notice_deadline_passed(until);
+        assert!(supervisor.helper.is_none() && supervisor.notice_until.is_none());
+        let (generation, result) = exit_of(&mut supervisor, &event_receiver);
+        assert_eq!(generation, 1);
+        assert!(result.unwrap().success(), "the pill must exit on its own");
+        supervisor.handle_helper_exit(generation, Ok(ExitStatus::default()));
+        assert!(
+            supervisor.helper.is_none(),
+            "an ended notice was relaunched"
+        );
+
+        supervisor.handle_update(hidden());
+        assert!(supervisor.helper.is_none());
+    }
+
+    #[test]
+    fn a_new_dictation_takes_over_the_pill_showing_a_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = graceful_helper(directory.path());
+        let (events, event_receiver) = channel();
+        let mut supervisor = OverlaySupervisor::new(
+            &executable,
+            Duration::from_secs(5),
+            events,
+            Arc::new(OverlayHealth::default()),
+        );
+
+        supervisor.handle_update(notice(DictationNotice::TranscriptionFailed));
+        supervisor.handle_update(recording());
+        assert_eq!(
+            supervisor.helper.as_ref().map(OverlayChild::generation),
+            Some(1),
+            "the recording must reuse the pill at once"
+        );
+        assert!(supervisor.notice_until.is_none());
+        // The recording ends normally: the pill closes without waiting.
+        supervisor.handle_update(hidden());
+        assert!(supervisor.helper.is_none());
+        let (generation, _) = exit_of(&mut supervisor, &event_receiver);
+        assert_eq!(generation, 1);
+    }
+
+    #[test]
+    fn a_notice_after_a_paste_dismissal_opens_a_fresh_pill() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = graceful_helper(directory.path());
+        let (events, event_receiver) = channel();
+        let mut supervisor = OverlaySupervisor::new(
+            &executable,
+            Duration::from_secs(5),
+            events,
+            Arc::new(OverlayHealth::default()),
+        );
+        supervisor.handle_update(recording());
+        let (reply, acknowledgment) = sync_channel(1);
+        supervisor.handle_command(OverlayCommand::Dismiss { reply });
+
+        supervisor.handle_update(notice(DictationNotice::CopiedNotPasted));
+
+        assert_eq!(
+            supervisor.helper.as_ref().map(OverlayChild::generation),
+            Some(2)
+        );
+        let (generation, result) = exit_of(&mut supervisor, &event_receiver);
+        assert_eq!(generation, 1);
+        supervisor.handle_helper_exit(generation, result);
+        assert!(matches!(acknowledgment.try_recv(), Ok(Ok(()))));
+        supervisor.shutdown();
+        let (generation, _) = exit_of(&mut supervisor, &event_receiver);
+        assert_eq!(generation, 2);
+    }
 }
 // Upper bound the daemon waits for the helper to exit after dismissal. The
 /// dismissal ack now includes the helper's fade-out, so this must comfortably
@@ -416,7 +548,7 @@ pub struct OverlayProcessState {
 
 impl OverlayProcessState {
     pub fn transition(&mut self, update: &OverlayUpdate) -> OverlayProcessAction {
-        let visible = OverlayState::from(update.workflow).is_visible();
+        let visible = update.state().is_visible();
         match (self.running, visible) {
             (false, false) => OverlayProcessAction::StayHeadless,
             (false, true) => {
@@ -489,7 +621,23 @@ fn overlay_presenter_loop(
     };
 
     let mut supervisor = OverlaySupervisor::new(executable, ready_timeout, events.clone(), health);
-    while let Ok(event) = event_receiver.recv() {
+    loop {
+        let event = match supervisor.notice_until {
+            None => event_receiver
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected),
+            Some(until) => {
+                event_receiver.recv_timeout(until.saturating_duration_since(Instant::now()))
+            }
+        };
+        let event = match event {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => {
+                supervisor.notice_deadline_passed(Instant::now());
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match event {
             PresenterEvent::Command(command) => supervisor.handle_command(command),
             PresenterEvent::HelperStatus { generation, status } => {
@@ -531,6 +679,9 @@ struct OverlaySupervisor<'a> {
     remaining_restarts: u8,
     next_generation: u64,
     pending_dismissal: Option<PendingDismissal>,
+    /// When the notice on screen fades. Until then a hidden update leaves
+    /// it up; a new dictation replaces it at once.
+    notice_until: Option<Instant>,
 }
 
 /// A dismissed helper that is fading out. It leaves `helper` at dismissal, so
@@ -559,6 +710,7 @@ impl<'a> OverlaySupervisor<'a> {
             remaining_restarts: 0,
             next_generation: 0,
             pending_dismissal: None,
+            notice_until: None,
         }
     }
 
@@ -571,6 +723,7 @@ impl<'a> OverlaySupervisor<'a> {
     }
 
     fn dismiss_and_wait(&mut self, reply: SyncSender<Result<(), OverlayTeardownError>>) {
+        self.notice_until = None;
         self.last_visible_update = None;
         self.remaining_restarts = 0;
         self.lifecycle.mark_stopped();
@@ -601,8 +754,28 @@ impl<'a> OverlaySupervisor<'a> {
             .is_some_and(|pending| pending.child.generation() == generation)
     }
 
+    /// Lets an expired notice's helper fade out and exit.
+    fn notice_deadline_passed(&mut self, now: Instant) {
+        if self.notice_until.is_none_or(|until| until > now) {
+            return;
+        }
+        self.notice_until = None;
+        self.last_visible_update = None;
+        self.remaining_restarts = 0;
+        self.lifecycle.mark_stopped();
+        if let Some(mut child) = self.helper.take() {
+            child.finish();
+        }
+    }
+
     fn handle_update(&mut self, update: OverlayUpdate) {
-        if OverlayState::from(update.workflow).is_visible() {
+        let state = update.state();
+        if !state.is_visible() && self.notice_until.is_some() {
+            return;
+        }
+        self.notice_until =
+            matches!(state, OverlayState::Notice(_)).then(|| Instant::now() + OVERLAY_NOTICE_HOLD);
+        if state.is_visible() {
             self.last_visible_update = Some(update.clone());
             self.remaining_restarts = AUTOMATIC_RESTART_LIMIT_PER_UPDATE;
         } else {
@@ -749,6 +922,7 @@ impl<'a> OverlaySupervisor<'a> {
     }
 
     fn shutdown(&mut self) {
+        self.notice_until = None;
         self.last_visible_update = None;
         self.remaining_restarts = 0;
         self.lifecycle.mark_stopped();

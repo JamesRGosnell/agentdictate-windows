@@ -542,3 +542,34 @@ while IFS= read -r line; do :; done
     drop(overlay);
     presenter.join().unwrap();
 }
+
+#[test]
+fn a_notice_opens_the_overlay_process_like_a_dictation() {
+    let mut state = OverlayProcessState::default();
+    let notice = OverlayUpdate {
+        notice: Some(agentdictate_core::DictationNotice::NotPasted),
+        ..update(&Workflow::new())
+    };
+    assert_eq!(state.transition(&notice), OverlayProcessAction::Launch);
+    assert_eq!(state.transition(&notice), OverlayProcessAction::Update);
+    assert_eq!(
+        state.transition(&update(&Workflow::new())),
+        OverlayProcessAction::Stop
+    );
+
+    let encoded = serde_json::to_string(&notice).unwrap();
+    assert!(
+        encoded.contains(r#""notice":{"notice":"not_pasted"}"#),
+        "{encoded}"
+    );
+    assert_eq!(
+        serde_json::from_str::<OverlayUpdate>(&encoded).unwrap(),
+        notice
+    );
+    // An update without a notice keeps the earlier wire form.
+    assert!(
+        !serde_json::to_string(&update(&Workflow::new()))
+            .unwrap()
+            .contains("notice")
+    );
+}
