@@ -457,16 +457,29 @@ pub fn run_copilot_echo_test(speech: &std::path::Path) -> anyhow::Result<usize> 
 pub fn copilot_launch_reason(config_file: &std::path::Path) -> Option<String> {
     let settings_path = store::settings_path(config_file);
     let settings = store::load(&settings_path);
-    if !settings.launch_from_dictation_hotkey || win::instance::is_running() {
+    let listening = win::instance::is_running();
+    if !settings.launch_from_dictation_hotkey || listening {
         return None;
     }
-    // Pressed in a meeting, the shortcut always opens the copilot, even one
-    // the user ended earlier in that meeting: pressing it asks for it.
     let signal = meeting::classify(
         &win::signals::active_microphone_apps(),
         &win::signals::window_titles(),
     );
-    signal.in_meeting.then_some(signal.reason)
+    dictation_opens_copilot(
+        settings.launch_from_dictation_hotkey,
+        listening,
+        signal.in_meeting,
+    )
+    .then_some(signal.reason)
+}
+
+/// Whether the dictation shortcut opens the copilot rather than dictating.
+/// Pressed in a meeting, it always does, even for a copilot the user ended
+/// earlier in that meeting: pressing it asks for it. Only a copilot that is
+/// listening keeps it dictating; one still writing the notes of a meeting
+/// that ended does not.
+fn dictation_opens_copilot(enabled: bool, listening: bool, in_meeting: bool) -> bool {
+    enabled && !listening && in_meeting
 }
 
 /// How often the background app looks for a meeting to open the copilot for.
@@ -851,7 +864,7 @@ pub fn run_copilot() -> anyhow::Result<()> {
 
     use engine::{Engine, EngineMsg, UiSink};
 
-    let Some(instance) = win::instance::acquire() else {
+    let Some(mut instance) = win::instance::acquire() else {
         tracing::info!("meeting copilot is already running; asked it to show");
         return Ok(());
     };
@@ -873,12 +886,27 @@ pub fn run_copilot() -> anyhow::Result<()> {
         settings_path,
         Arc::new(win::WindowsPlatform),
     )?;
-    let engine = Engine::new(
+    let mut engine = Engine::new(
         services,
         settings.clone(),
         Arc::clone(&ui),
         engine_sender.clone(),
     );
+    // What only the listening copilot holds: the single-copilot guard and
+    // the global shortcuts. Both are let go once the meeting ends, so the
+    // dictation shortcut can open a new copilot while this one writes its
+    // notes.
+    let listening: Arc<std::sync::Mutex<ListeningHold>> = Arc::default();
+    {
+        let listening = Arc::clone(&listening);
+        engine.when_listening_stops(move || {
+            if let Ok(mut hold) = listening.lock() {
+                hold.stopped = true;
+                hold.held.take();
+            }
+            tracing::info!("meeting copilot stopped listening; a new one may start");
+        });
+    }
     let engine_thread = std::thread::Builder::new()
         .name("copilot-engine".into())
         .spawn(move || engine.run(engine_messages))?;
@@ -895,6 +923,11 @@ pub fn run_copilot() -> anyhow::Result<()> {
         instance.watch_show_requests(move || {
             let _ = sender.send(EngineMsg::ShowRequested);
         });
+    }
+    match listening.lock() {
+        Ok(mut hold) if !hold.stopped => hold.held = Some((instance, hotkeys)),
+        // The meeting already ended.
+        _ => drop((instance, hotkeys)),
     }
     // A listening session always shows in the notification area, even with
     // its window hidden.
@@ -953,9 +986,18 @@ pub fn run_copilot() -> anyhow::Result<()> {
         let _ = std::fs::write(&marker, b"");
     }
     drop(tray);
-    drop(hotkeys);
-    drop(instance);
+    if let Ok(mut hold) = listening.lock() {
+        hold.held.take();
+    }
     Ok(())
+}
+
+/// What a copilot holds only while it listens, and whether it has stopped.
+#[cfg(all(windows, feature = "desktop"))]
+#[derive(Default)]
+struct ListeningHold {
+    stopped: bool,
+    held: Option<(win::instance::InstanceGuard, win::hotkeys::CopilotHotkeys)>,
 }
 
 #[cfg(test)]
@@ -972,6 +1014,15 @@ mod tests {
         assert_eq!(launch_decision(false, ended, now), (false, true));
         let long_ago = Some(now - DISMISSED_FOR - std::time::Duration::from_secs(1));
         assert_eq!(launch_decision(true, long_ago, now), (true, true));
+    }
+
+    #[test]
+    fn the_shortcut_opens_a_new_copilot_while_the_last_one_writes_its_notes() {
+        // A copilot past its meeting no longer counts as listening.
+        assert!(dictation_opens_copilot(true, false, true));
+        assert!(!dictation_opens_copilot(true, true, true));
+        assert!(!dictation_opens_copilot(true, false, false));
+        assert!(!dictation_opens_copilot(false, false, true));
     }
 
     #[test]

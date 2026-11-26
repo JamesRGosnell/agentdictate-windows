@@ -653,6 +653,8 @@ pub(crate) struct Engine {
     ending: bool,
     /// The transcription error shown on the bar, until one succeeds.
     transcription_problem: Option<String>,
+    /// Run once the session stops listening, before its notes are written.
+    on_stop_listening: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Engine {
@@ -739,7 +741,14 @@ impl Engine {
             chatgpt_models: Vec::new(),
             ending: false,
             transcription_problem: None,
+            on_stop_listening: None,
         }
+    }
+
+    /// Calls `release` as soon as the session stops listening, so what only
+    /// a listening copilot may hold is let go while the notes are written.
+    pub(crate) fn when_listening_stops(&mut self, release: impl FnOnce() + Send + 'static) {
+        self.on_stop_listening = Some(Box::new(release));
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -3803,6 +3812,11 @@ impl Engine {
             settings.meeting_goal.clear();
             self.update_settings(settings);
         }
+        // A new session may start from here on, while this one finishes;
+        // the settings are saved first so it reads them as left.
+        if let Some(release) = self.on_stop_listening.take() {
+            release();
+        }
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut close_requested = false;
         loop {
@@ -6555,6 +6569,50 @@ mod tests {
             assert!(notes.contains(expected), "{expected} is in the notes");
         }
         assert!(!record.exists(), "the record is gone once recovered");
+    }
+
+    #[test]
+    fn listening_is_let_go_before_the_notes_are_written() {
+        let (mut engine, incoming, _events, _requests, directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.publish(said(1, Speaker::Them, "Can we start with a pilot?"));
+        engine.notes_ready_wait = Duration::ZERO;
+        let meetings = directory.path().join("meetings");
+        let notes_count = {
+            let meetings = meetings.clone();
+            move || {
+                std::fs::read_dir(&meetings)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|entry| {
+                                entry
+                                    .path()
+                                    .extension()
+                                    .is_some_and(|extension| extension == "md")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0)
+            }
+        };
+        let at_release = Arc::new(Mutex::new(None));
+        {
+            let at_release = Arc::clone(&at_release);
+            let notes_count = notes_count.clone();
+            engine.when_listening_stops(move || {
+                *at_release.lock().unwrap() = Some(notes_count());
+            });
+        }
+        engine.finish(&incoming, true);
+        assert_eq!(
+            *at_release.lock().unwrap(),
+            Some(0),
+            "let go before the notes"
+        );
+        assert_eq!(notes_count(), 1);
     }
 
     /// Answers at once, except the meeting summary, which waits to be let go.
