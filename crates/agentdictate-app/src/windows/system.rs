@@ -18,7 +18,7 @@ use windows_sys::Win32::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
         TOKEN_QUERY, TokenIntegrityLevel,
     },
-    System::{DataExchange::*, Memory::*, Threading::*},
+    System::Threading::*,
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
@@ -27,8 +27,11 @@ enum AudioCommand {
     Start(JobId, PathBuf, Reply<()>),
     Finish(JobId, Reply<CapturedRecording>),
 }
+#[path = "clipboard.rs"]
+mod clipboard;
 #[path = "ducking.rs"]
 mod ducking;
+use clipboard::Clipboard as _;
 pub struct SystemRecordingController {
     commands: mpsc::Sender<AudioCommand>,
     settings: Settings,
@@ -359,52 +362,6 @@ fn wait_for_recovery_focus(
         "Focus the destination application, or use Copy and paste manually.",
     ))
 }
-struct ClipboardGuard(HWND);
-impl Drop for ClipboardGuard {
-    fn drop(&mut self) {
-        unsafe {
-            CloseClipboard();
-            DestroyWindow(self.0);
-        }
-    }
-}
-fn open_clipboard() -> Result<ClipboardGuard, ExternalError> {
-    let class: Vec<u16> = "STATIC".encode_utf16().chain(Some(0)).collect();
-    let owner = unsafe {
-        CreateWindowExW(
-            0,
-            class.as_ptr(),
-            std::ptr::null(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if owner.is_null() {
-        return Err(ExternalError::new(
-            "Could not create clipboard owner window",
-        ));
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if unsafe { OpenClipboard(owner) } != 0 {
-            return Ok(ClipboardGuard(owner));
-        }
-        if Instant::now() >= deadline {
-            unsafe {
-                DestroyWindow(owner);
-            }
-            return Err(ExternalError::new("Windows clipboard is busy"));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
 impl SystemDeliverer {
     pub fn for_environment(shortcut: &str) -> Self {
         Self {
@@ -414,48 +371,9 @@ impl SystemDeliverer {
     pub fn update_shortcut(&mut self, shortcut: &str) {
         self.shortcut = shortcut.into();
     }
+    /// Leaves `text` on the clipboard for the user to paste.
     pub fn copy_text(&mut self, text: &str) -> Result<(), ExternalError> {
-        let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-        let _guard = open_clipboard()?;
-        // SAFETY: Windows receives ownership only after successful SetClipboardData.
-        unsafe {
-            let allocation = GlobalAlloc(GMEM_MOVEABLE, text.len() * 2);
-            if allocation.is_null() {
-                return Err(ExternalError::new("could not allocate clipboard memory"));
-            }
-            let destination = GlobalLock(allocation);
-            if destination.is_null() {
-                GlobalFree(allocation);
-                return Err(ExternalError::new("could not lock clipboard memory"));
-            }
-            std::ptr::copy_nonoverlapping(text.as_ptr(), destination.cast(), text.len());
-            GlobalUnlock(allocation);
-            if EmptyClipboard() == 0 || SetClipboardData(13, allocation).is_null() {
-                GlobalFree(allocation);
-                return Err(ExternalError::new(format!(
-                    "clipboard publication failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            let handle = GetClipboardData(13);
-            if handle.is_null() {
-                return Err(ExternalError::new("clipboard readback failed"));
-            }
-            let contents = GlobalLock(handle);
-            if contents.is_null() {
-                return Err(ExternalError::new("clipboard readback lock failed"));
-            }
-            let matches = GlobalSize(handle) >= text.len() * 2
-                && std::slice::from_raw_parts(contents.cast::<u16>(), text.len())
-                    == text.as_slice();
-            GlobalUnlock(handle);
-            if !matches {
-                return Err(ExternalError::new(
-                    "clipboard readback differs from transcript",
-                ));
-            }
-        }
-        Ok(())
+        clipboard::Win32Clipboard.write_text(text, false)
     }
 }
 fn paste_keys(shortcut: &str, class: &str) -> Vec<u16> {
@@ -689,69 +607,90 @@ impl Deliverer for SystemDeliverer {
         }
         let elevated_target =
             paste_blocked_by_integrity(process_integrity(Some(pid)), process_integrity(None));
-        if let Err(error) = self.copy_text(&job.final_text) {
-            return Ok(not_sent(
-                false,
-                format!("Could not copy the text, so nothing was pasted: {error}"),
-            ));
-        }
         if elevated_target {
+            if let Err(error) = self.copy_text(&job.final_text) {
+                return Ok(not_sent(
+                    false,
+                    format!("Could not copy the text, so nothing was pasted: {error}"),
+                ));
+            }
             tracing::info!(pid, "focused window is elevated; copied without pasting");
             return Ok(not_sent(true, ELEVATED_PASTE_REASON));
         }
-        if unsafe { GetForegroundWindow() } != target
-            || [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
-                .iter()
-                .any(|vk| unsafe { GetAsyncKeyState(*vk as i32) } < 0)
-        {
-            return Ok(not_sent(
-                true,
-                "Focus or held keys changed before pasting; the text is on the clipboard",
-            ));
-        }
-        let mut class = [0u16; 256];
-        let size = unsafe { GetClassNameW(target, class.as_mut_ptr(), class.len() as i32) };
-        let class = String::from_utf16_lossy(&class[..size.max(0) as usize]);
-        let keys = paste_keys(&self.shortcut, &class);
-        let inputs: Vec<INPUT> = keys
-            .iter()
-            .map(|vk| key(*vk, false))
-            .chain(keys.iter().rev().map(|vk| key(*vk, true)))
-            .collect();
-        let count = unsafe {
-            SendInput(
-                inputs.len() as u32,
-                inputs.as_ptr(),
-                std::mem::size_of::<INPUT>() as i32,
-            )
-        };
-        if count == 0 {
-            return Ok(not_sent(
-                true,
-                format!(
-                    "Windows refused the paste keys; the text is on the clipboard: {}",
-                    std::io::Error::last_os_error()
-                ),
-            ));
-        }
-        if count != inputs.len() as u32 {
-            // Balance our own partial injection, without retrying the paste itself.
-            let release: Vec<INPUT> = keys.iter().rev().map(|vk| key(*vk, true)).collect();
-            unsafe {
-                SendInput(
-                    release.len() as u32,
-                    release.as_ptr(),
-                    std::mem::size_of::<INPUT>() as i32,
-                );
-            }
-            return Ok(DeliveryDisposition::Ambiguous {
-                copied_to_clipboard: true,
+        let shortcut = self.shortcut.clone();
+        let staged =
+            clipboard::paste_staged(&mut clipboard::Win32Clipboard, &job.final_text, || {
+                send_paste_keys(target, &shortcut)
             });
+        match staged {
+            Ok((disposition, restore)) => {
+                if let Some(staged) = restore {
+                    clipboard::restore_later(staged);
+                }
+                Ok(disposition)
+            }
+            Err(error) => Ok(not_sent(
+                false,
+                format!("Could not copy the text, so nothing was pasted: {error}"),
+            )),
         }
-        Ok(DeliveryDisposition::Submitted {
+    }
+}
+/// Sends the paste shortcut to `target`, whose transcript is already on the
+/// clipboard, unless the focus or held keys changed since it was chosen.
+fn send_paste_keys(target: HWND, shortcut: &str) -> DeliveryDisposition {
+    if unsafe { GetForegroundWindow() } != target
+        || [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+            .iter()
+            .any(|vk| unsafe { GetAsyncKeyState(*vk as i32) } < 0)
+    {
+        return not_sent(
+            true,
+            "Focus or held keys changed before pasting; the text is on the clipboard",
+        );
+    }
+    let mut class = [0u16; 256];
+    let size = unsafe { GetClassNameW(target, class.as_mut_ptr(), class.len() as i32) };
+    let class = String::from_utf16_lossy(&class[..size.max(0) as usize]);
+    let keys = paste_keys(shortcut, &class);
+    let inputs: Vec<INPUT> = keys
+        .iter()
+        .map(|vk| key(*vk, false))
+        .chain(keys.iter().rev().map(|vk| key(*vk, true)))
+        .collect();
+    let count = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
+    if count == 0 {
+        return not_sent(
+            true,
+            format!(
+                "Windows refused the paste keys; the text is on the clipboard: {}",
+                std::io::Error::last_os_error()
+            ),
+        );
+    }
+    if count != inputs.len() as u32 {
+        // Balance our own partial injection, without retrying the paste itself.
+        let release: Vec<INPUT> = keys.iter().rev().map(|vk| key(*vk, true)).collect();
+        unsafe {
+            SendInput(
+                release.len() as u32,
+                release.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+        }
+        return DeliveryDisposition::Ambiguous {
             copied_to_clipboard: true,
-            paste_triggered: true,
-        })
+        };
+    }
+    DeliveryDisposition::Submitted {
+        copied_to_clipboard: true,
+        paste_triggered: true,
     }
 }
 
