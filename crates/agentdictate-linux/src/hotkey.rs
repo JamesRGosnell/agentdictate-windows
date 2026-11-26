@@ -408,6 +408,28 @@ impl HotkeyTracker {
         self.transition(matches)
     }
 
+    /// Applies `input` after dropping tracked keys that are physically up.
+    ///
+    /// A listener can miss key releases: on Windows, a low-level hook sees no
+    /// input while the secure desktop (Ctrl+Alt+Del, lock, UAC) or an elevated
+    /// window has focus, so a modifier released there would stay "held" and
+    /// a later bare Space would match Ctrl+Space. On every key press, each
+    /// other tracked key is checked with `is_down`; `Some(false)` drops it,
+    /// while `None` (state unknown) keeps it.
+    pub fn input_reconciled(
+        &mut self,
+        device: DeviceId,
+        input: KeyInput,
+        mut is_down: impl FnMut(KeyCode) -> Option<bool>,
+    ) -> Option<HotkeySignal> {
+        if input.state != KeyState::Released {
+            for pressed in self.pressed_by_device.values_mut() {
+                pressed.retain(|&code| code == input.code || is_down(code) != Some(false));
+            }
+        }
+        self.input(device, input)
+    }
+
     pub fn remove_device(&mut self, device: DeviceId) -> Option<HotkeySignal> {
         self.pressed_by_device.remove(&device);
         let matches = self

@@ -37,6 +37,45 @@ fn one_physical_chord_emits_one_press_and_one_release() {
 }
 
 #[test]
+fn a_modifier_released_out_of_sight_does_not_make_bare_space_match() {
+    let spec: HotkeySpec = "Ctrl+Space".parse().expect("supported hotkey");
+    let mut tracker = HotkeyTracker::new(spec);
+    // Ctrl goes down; its release happens on the secure desktop and is never seen.
+    assert_eq!(
+        tracker.input_reconciled(1, KeyInput::new(KEY_LEFT_CTRL, KeyState::Pressed), |_| {
+            Some(true)
+        }),
+        None
+    );
+
+    let ctrl_is_up = |code| (code == KEY_LEFT_CTRL).then_some(false);
+    assert_eq!(
+        tracker.input_reconciled(1, KeyInput::new(KEY_SPACE, KeyState::Pressed), ctrl_is_up),
+        None
+    );
+}
+
+#[test]
+fn reconciled_input_keeps_keys_that_are_still_down_or_unknown() {
+    let spec: HotkeySpec = "Ctrl+Space".parse().expect("supported hotkey");
+    let mut held = HotkeyTracker::new(spec.clone());
+    held.input_reconciled(1, KeyInput::new(KEY_LEFT_CTRL, KeyState::Pressed), |_| None);
+    assert_eq!(
+        held.input_reconciled(1, KeyInput::new(KEY_SPACE, KeyState::Pressed), |_| Some(
+            true
+        )),
+        Some(HotkeySignal::Pressed)
+    );
+
+    let mut unknown = HotkeyTracker::new(spec);
+    unknown.input_reconciled(1, KeyInput::new(KEY_LEFT_CTRL, KeyState::Pressed), |_| None);
+    assert_eq!(
+        unknown.input_reconciled(1, KeyInput::new(KEY_SPACE, KeyState::Pressed), |_| None),
+        Some(HotkeySignal::Pressed)
+    );
+}
+
+#[test]
 fn escape_cancels_without_turning_release_into_a_second_action() {
     let spec: HotkeySpec = "Ctrl+Space".parse().expect("supported hotkey");
     let mut tracker = HotkeyTracker::new(spec);

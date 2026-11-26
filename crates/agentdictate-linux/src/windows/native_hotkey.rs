@@ -4,6 +4,7 @@ use crate::hotkey::*;
 pub use events::*;
 use std::{
     cell::RefCell,
+    collections::HashMap,
     io,
     sync::{
         Arc,
@@ -14,11 +15,23 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     System::{LibraryLoader::*, Threading::*},
-    UI::WindowsAndMessaging::*,
+    UI::{Input::KeyboardAndMouse::GetAsyncKeyState, WindowsAndMessaging::*},
 };
 struct HookState {
     tracker: HotkeyTracker,
+    /// The virtual key each tracked key last went down as, so its physical
+    /// state can be checked with `GetAsyncKeyState`. Low-level hooks report
+    /// left/right-specific modifier keys (VK_LCONTROL, VK_RCONTROL, ...).
+    virtual_keys: HashMap<KeyCode, u32>,
     sender: mpsc::Sender<NativeHotkeyEvent>,
+}
+/// Whether `virtual_key` is physically down right now. Called only for keys
+/// other than the one the hook is handling, whose async state the system
+/// updates after the hook returns.
+fn virtual_key_is_down(virtual_key: u32) -> bool {
+    // SAFETY: GetAsyncKeyState has no preconditions; any key code is valid.
+    let state = unsafe { GetAsyncKeyState(virtual_key as i32) };
+    state as u16 & 0x8000 != 0
 }
 thread_local! {static STATE:RefCell<Option<HookState>>=const{RefCell::new(None)};}
 pub const SELF_INJECTION: usize = 0x41474449;
@@ -61,9 +74,24 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                 state,
             );
             STATE.with(|slot| {
-                if let Some(state) = slot.borrow_mut().as_mut()
-                    && let Some(signal) = state.tracker.input(1, input)
-                {
+                let mut slot = slot.borrow_mut();
+                let Some(state) = slot.as_mut() else {
+                    return;
+                };
+                match input.state {
+                    KeyState::Released => {
+                        state.virtual_keys.remove(&input.code);
+                    }
+                    KeyState::Pressed | KeyState::Repeated => {
+                        state.virtual_keys.insert(input.code, event.vkCode);
+                    }
+                }
+                let virtual_keys = &state.virtual_keys;
+                // Missed releases (secure desktop, elevated focus) must not
+                // leave a modifier "held": check each other tracked key.
+                if let Some(signal) = state.tracker.input_reconciled(1, input, |code| {
+                    virtual_keys.get(&code).map(|&key| virtual_key_is_down(key))
+                }) {
                     let _ = state
                         .sender
                         .send(NativeHotkeyEvent::Signal(NativeHotkeySignal {
@@ -100,6 +128,7 @@ impl NativeHotkeyListener {
                 STATE.with(|slot| {
                     *slot.borrow_mut() = Some(HookState {
                         tracker: HotkeyTracker::new(spec),
+                        virtual_keys: HashMap::new(),
                         sender: sender.clone(),
                     })
                 });
