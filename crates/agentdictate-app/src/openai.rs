@@ -1,5 +1,7 @@
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use agentdictate_core::{JobId, ReasoningEffort, Settings, TranscriptionProvider};
@@ -31,36 +33,137 @@ fn upload_file_name(audio_path: &Path, extension: &str) -> String {
     format!("{stem}.{extension}")
 }
 
-fn encode_ogg_opus(audio_path: &Path) -> Result<Vec<u8>, ExternalError> {
+/// Builds the command that compresses one captured WAV to Opus/OGG on stdout.
+/// Injectable so tests can stand in a hung or missing encoder.
+type EncoderCommand = Arc<dyn Fn(&Path) -> Command + Send + Sync>;
+
+fn ffmpeg_command(audio_path: &Path) -> Command {
     let mut command = Command::new("ffmpeg");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let output = command
+    command
         .args(["-loglevel", "error", "-i"])
         .arg(audio_path)
         .args(["-ac", "1", "-ar", "16000", "-c:a", "libopus"])
-        .args(["-b:a", UPLOAD_OPUS_BITRATE, "-f", "ogg", "pipe:1"])
-        .output()
-        .map_err(|error| ExternalError::new(format!("could not run ffmpeg: {error}")))?;
-    if !output.status.success() {
-        return Err(ExternalError::new(format!(
-            "ffmpeg exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    if output.stdout.is_empty() {
-        return Err(ExternalError::new("ffmpeg produced no audio"));
-    }
-    Ok(output.stdout)
+        .args(["-b:a", UPLOAD_OPUS_BITRATE, "-f", "ogg", "pipe:1"]);
+    command
 }
 
-fn prepare_upload_audio(audio_path: &Path) -> Result<UploadAudio, ExternalError> {
+/// Bounds a hung encoder. The daemon holds its global lock while a dictation
+/// is transcribed, so an encoder that never returns would freeze the hotkey,
+/// tray and Settings. ffmpeg normally needs a few milliseconds per second of
+/// audio, so this only fires when it is stuck; the WAV is uploaded instead.
+fn encode_deadline(audio_seconds: f64) -> Instant {
+    let scaled = Duration::try_from_secs_f64(audio_seconds.max(0.0) / 2.0).unwrap_or_default();
+    Instant::now() + Duration::from_secs(10) + scaled
+}
+
+/// Reads `pipe` to its end on a detached thread. A missing pipe yields a
+/// disconnected receiver.
+fn drain_pipe(
+    pipe: Option<impl Read + Send + 'static>,
+) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    if let Some(mut pipe) = pipe {
+        // A failed spawn drops the sender, which the caller sees as a
+        // disconnected pipe.
+        let _ = std::thread::Builder::new()
+            .name("agentdictate-encoder-pipe".into())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = sender.send(pipe.read_to_end(&mut bytes).map(|_| bytes));
+            });
+    }
+    receiver
+}
+
+/// Runs `command` to completion and returns its stdout, killing it at
+/// `deadline`. Both pipes are drained on their own threads so a chatty child
+/// cannot block on a full pipe. After a kill the reader threads are left to
+/// finish on their own: a grandchild may still hold a pipe open, and joining
+/// them could block past the deadline.
+fn run_with_deadline(mut command: Command, deadline: Instant) -> Result<Vec<u8>, ExternalError> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| ExternalError::new(format!("could not run {program}: {error}")))?;
+    let stdout = drain_pipe(child.stdout.take());
+    let stderr = drain_pipe(child.stderr.take());
+    let stop = |child: &mut std::process::Child, detail: String| {
+        let _ = child.kill();
+        let _ = child.wait();
+        ExternalError::new(detail)
+    };
+    let timed_out = || format!("{program} did not finish before its deadline; stopped it");
+    // The child closes stdout when it is done, so wait on that event first.
+    let output = match stdout.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            return Err(stop(
+                &mut child,
+                format!("could not read {program} output: {error}"),
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => return Err(stop(&mut child, timed_out())),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(stop(&mut child, format!("could not read {program} output")));
+        }
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) => return Err(stop(&mut child, timed_out())),
+            Err(error) => {
+                return Err(stop(
+                    &mut child,
+                    format!("could not wait for {program}: {error}"),
+                ));
+            }
+        }
+    };
+    if !status.success() {
+        let detail = stderr
+            .recv_timeout(Duration::from_millis(100))
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        return Err(ExternalError::new(format!(
+            "{program} exited with {status}: {}",
+            String::from_utf8_lossy(&detail).trim()
+        )));
+    }
+    Ok(output)
+}
+
+fn encode_ogg_opus(
+    encoder: &EncoderCommand,
+    audio_path: &Path,
+    deadline: Instant,
+) -> Result<Vec<u8>, ExternalError> {
+    let encoded = run_with_deadline(encoder(audio_path), deadline)?;
+    if encoded.is_empty() {
+        return Err(ExternalError::new("ffmpeg produced no audio"));
+    }
+    Ok(encoded)
+}
+
+fn prepare_upload_audio(
+    encoder: &EncoderCommand,
+    audio_path: &Path,
+    deadline: Instant,
+) -> Result<UploadAudio, ExternalError> {
     let encode_started = Instant::now();
-    match encode_ogg_opus(audio_path) {
+    match encode_ogg_opus(encoder, audio_path, deadline) {
         Ok(bytes) => Ok(UploadAudio {
             bytes,
             file_name: upload_file_name(audio_path, "ogg"),
@@ -321,6 +424,7 @@ pub struct ReqwestOpenAiTransport {
     api_base: String,
     live: Option<crate::live_transcription::LiveTranscription>,
     actual_model: Option<String>,
+    encoder: EncoderCommand,
 }
 
 impl ReqwestOpenAiTransport {
@@ -343,7 +447,21 @@ impl ReqwestOpenAiTransport {
             api_base: api_base.into().trim_end_matches('/').to_owned(),
             actual_model: None,
             live: None,
+            encoder: Arc::new(ffmpeg_command),
         }
+    }
+
+    /// Replaces the `ffmpeg` command that compresses uploads, so tests can
+    /// exercise the encoder boundary with a fake. `encoder` receives the
+    /// captured WAV and must build a command that writes the encoding to
+    /// stdout.
+    #[must_use]
+    pub fn with_audio_encoder(
+        mut self,
+        encoder: impl Fn(&Path) -> Command + Send + Sync + 'static,
+    ) -> Self {
+        self.encoder = Arc::new(encoder);
+        self
     }
 
     /// The key requests are sent with.
@@ -476,7 +594,11 @@ impl SpeechTransport for ReqwestOpenAiTransport {
                 "This model accepts one language hint; choose one language or automatic detection",
             ));
         }
-        let upload = prepare_upload_audio(request.audio_path)?;
+        let upload = prepare_upload_audio(
+            &self.encoder,
+            request.audio_path,
+            encode_deadline(request.duration_seconds),
+        )?;
         let upload_bytes = upload.bytes.len();
         let file = reqwest::blocking::multipart::Part::bytes(upload.bytes)
             .file_name(upload.file_name)
@@ -654,7 +776,38 @@ impl CleanupTransport for ReqwestOpenAiTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_reasoning_effort, encode_ogg_opus, upload_file_name};
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        EncoderCommand, cleanup_reasoning_effort, encode_ogg_opus, ffmpeg_command,
+        prepare_upload_audio, upload_file_name,
+    };
+
+    fn ffmpeg() -> EncoderCommand {
+        Arc::new(ffmpeg_command)
+    }
+
+    fn ample_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    /// An encoder that never finishes on its own and ignores the recording.
+    fn hung_encoder() -> EncoderCommand {
+        Arc::new(|_: &Path| {
+            let mut command;
+            if cfg!(windows) {
+                command = Command::new("ping");
+                command.args(["-n", "30", "127.0.0.1"]);
+            } else {
+                command = Command::new("sleep");
+                command.arg("30");
+            }
+            command
+        })
+    }
 
     #[test]
     fn encoding_an_unreadable_recording_reports_an_error_instead_of_panicking() {
@@ -662,7 +815,46 @@ mod tests {
         let audio_path = directory.path().join("recording.wav");
         std::fs::write(&audio_path, b"not a wav file").unwrap();
 
-        assert!(encode_ogg_opus(&audio_path).is_err());
+        assert!(encode_ogg_opus(&ffmpeg(), &audio_path, ample_deadline()).is_err());
+    }
+
+    #[test]
+    fn a_hung_encoder_is_stopped_at_its_deadline_and_the_wav_is_uploaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio_path = directory.path().join("recording.wav");
+        std::fs::write(&audio_path, tiny_wav()).unwrap();
+        let started = Instant::now();
+
+        let upload = prepare_upload_audio(
+            &hung_encoder(),
+            &audio_path,
+            started + Duration::from_millis(300),
+        )
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the encoder deadline was not enforced: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(upload.mime, "audio/wav");
+        assert_eq!(upload.file_name, "recording.wav");
+        assert_eq!(upload.bytes, tiny_wav());
+        assert_eq!(upload.encode_ms, None);
+    }
+
+    #[test]
+    fn a_missing_encoder_still_uploads_the_wav() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio_path = directory.path().join("recording.wav");
+        std::fs::write(&audio_path, tiny_wav()).unwrap();
+        let missing: EncoderCommand =
+            Arc::new(|_: &Path| Command::new("agentdictate-missing-encoder-for-test"));
+
+        let upload = prepare_upload_audio(&missing, &audio_path, ample_deadline()).unwrap();
+
+        assert_eq!(upload.mime, "audio/wav");
+        assert_eq!(upload.bytes, tiny_wav());
     }
 
     #[test]
@@ -679,7 +871,7 @@ mod tests {
         let audio_path = directory.path().join("recording.wav");
         std::fs::write(&audio_path, tiny_wav()).unwrap();
 
-        let encoded = encode_ogg_opus(&audio_path).unwrap();
+        let encoded = encode_ogg_opus(&ffmpeg(), &audio_path, ample_deadline()).unwrap();
 
         assert!(encoded.starts_with(b"OggS"));
         assert_eq!(upload_file_name(&audio_path, "ogg"), "recording.ogg");
