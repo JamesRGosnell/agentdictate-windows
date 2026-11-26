@@ -25,11 +25,25 @@ fn main() -> anyhow::Result<()> {
     if is_copilot_argument(argument.as_deref()) {
         let _log_guard = init_file_logging(&paths.logs, "copilot.log")?;
         #[cfg(windows)]
-        return agentdictate_app::run_copilot();
+        return logged("copilot", agentdictate_app::run_copilot());
         #[cfg(not(windows))]
         anyhow::bail!("the meeting copilot is available on Windows");
     }
     let _log_guard = init_file_logging(&paths.logs, "agentdictated.log")?;
+    // The guard outlives this call, so the failure reaches the log file.
+    logged("daemon", run(argument, paths))
+}
+
+/// Logs a failure before `main` returns it. The windows-subsystem binary has
+/// no visible stderr, so the log file is the only place it can be read.
+fn logged(name: &str, result: anyhow::Result<()>) -> anyhow::Result<()> {
+    if let Err(error) = &result {
+        tracing::error!("{name} failed: {error:#}");
+    }
+    result
+}
+
+fn run(argument: Option<String>, paths: AppPaths) -> anyhow::Result<()> {
     if is_overlay_helper_argument(argument.as_deref()) {
         tracing::info!("transient recording overlay starting");
         return run_overlay_helper();
