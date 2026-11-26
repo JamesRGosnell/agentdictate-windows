@@ -11,6 +11,7 @@ use agentdictate_runtime::{
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
+use crate::ProcessingTranscriber;
 use crate::model_catalog::{TranscriptionProfile, transcription_profile};
 
 /// 32 kbps Opus reduces the 256 kbps PCM payload by roughly 8x before container
@@ -385,6 +386,16 @@ pub trait CleanupTransport {
     fn cleanup_text(&mut self, request: CleanupRequest<'_>) -> Result<String, ExternalError>;
 }
 
+/// A transport that can hand what it prepared for one recording to a copy
+/// of itself, so that dictation is transcribed on the processing worker
+/// while this transport serves the next recording.
+pub trait JobTransport: Sized {
+    /// A copy for `job` that takes over anything prepared while it
+    /// recorded, such as a live stream or a sign-in check. It runs under
+    /// the daemon lock, so it must not block.
+    fn for_job(&mut self, job: &RecordingJob) -> Self;
+}
+
 pub struct SpeechRouter<A, C> {
     openai: A,
     chatgpt: C,
@@ -398,6 +409,15 @@ impl<A, C> SpeechRouter<A, C> {
 
     pub const fn openai_mut(&mut self) -> &mut A {
         &mut self.openai
+    }
+}
+
+impl<A: JobTransport, C: JobTransport> JobTransport for SpeechRouter<A, C> {
+    fn for_job(&mut self, job: &RecordingJob) -> Self {
+        Self {
+            openai: self.openai.for_job(job),
+            chatgpt: self.chatgpt.for_job(job),
+        }
     }
 }
 
@@ -439,7 +459,8 @@ pub struct TranscriptionPipeline<S, C> {
     cleanup: C,
     /// Called with the job id right before the cleanup model runs, so the UI
     /// can show the cleaning phase while `transcribe` is still blocking.
-    cleanup_started_observer: Option<Box<dyn Fn(JobId) + Send>>,
+    /// Every dictation's own pipeline shares it.
+    cleanup_started_observer: Option<Arc<dyn Fn(JobId) + Send + Sync>>,
 }
 
 impl<S, C> TranscriptionPipeline<S, C> {
@@ -453,8 +474,11 @@ impl<S, C> TranscriptionPipeline<S, C> {
         }
     }
 
-    pub fn set_cleanup_started_observer(&mut self, observer: impl Fn(JobId) + Send + 'static) {
-        self.cleanup_started_observer = Some(Box::new(observer));
+    pub fn set_cleanup_started_observer(
+        &mut self,
+        observer: impl Fn(JobId) + Send + Sync + 'static,
+    ) {
+        self.cleanup_started_observer = Some(Arc::new(observer));
     }
 
     pub fn update_settings(&mut self, settings: Settings) {
@@ -467,6 +491,23 @@ impl<S, C> TranscriptionPipeline<S, C> {
 
     pub const fn cleanup_mut(&mut self) -> &mut C {
         &mut self.cleanup
+    }
+}
+
+impl<S, C> ProcessingTranscriber for TranscriptionPipeline<S, C>
+where
+    S: SpeechTransport + JobTransport + Send + 'static,
+    C: CleanupTransport + JobTransport + Send + 'static,
+{
+    type Job = Self;
+
+    fn for_job(&mut self, job: &RecordingJob) -> Self {
+        Self {
+            settings: self.settings.clone(),
+            speech: self.speech.for_job(job),
+            cleanup: self.cleanup.for_job(job),
+            cleanup_started_observer: self.cleanup_started_observer.clone(),
+        }
     }
 }
 
@@ -740,6 +781,20 @@ impl ReqwestOpenAiTransport {
         } else {
             message
         })
+    }
+}
+
+impl JobTransport for ReqwestOpenAiTransport {
+    fn for_job(&mut self, job: &RecordingJob) -> Self {
+        Self {
+            // Clones share the connection pool.
+            client: self.client.clone(),
+            api_key: self.api_key.clone(),
+            api_base: self.api_base.clone(),
+            live: self.live.take_if(|live| live.job_id == job.id),
+            actual_model: None,
+            encoder: Arc::clone(&self.encoder),
+        }
     }
 }
 

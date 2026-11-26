@@ -18,6 +18,7 @@ mod notice;
 mod openai;
 mod overlay_process;
 mod process;
+mod processing;
 #[cfg_attr(windows, path = "windows/startup.rs")]
 mod startup;
 #[cfg_attr(windows, path = "windows/system.rs")]
@@ -48,8 +49,8 @@ pub use hotkey_dispatch::{
 };
 pub use notice::{DictationEnd, Notice, classify_message, dictation_notice};
 pub use openai::{
-    CleanupRequest, CleanupTransport, ReqwestOpenAiTransport, SpeechRouter, SpeechTransport,
-    TranscriptionPipeline, TranscriptionRequest,
+    CleanupRequest, CleanupTransport, JobTransport, ReqwestOpenAiTransport, SpeechRouter,
+    SpeechTransport, TranscriptionPipeline, TranscriptionRequest,
 };
 #[cfg(feature = "desktop")]
 pub use overlay_process::run_overlay_helper;
@@ -60,6 +61,7 @@ pub use overlay_process::{
     start_overlay_presenter_with_timeout,
 };
 pub use process::{AgentProcess, HotkeyReconfigurer, ProductionDaemon, command_for_hotkey};
+pub use processing::ProcessingTranscriber;
 pub use startup::{
     DAEMON_SERVICE_NAME, SERVICE_ARGUMENT, START_SERVICE_ARGUMENT, bootstrap_daemon_service,
     sync_startup_command, sync_startup_with_systemctl,

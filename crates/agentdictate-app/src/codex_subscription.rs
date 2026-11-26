@@ -473,6 +473,20 @@ impl Default for CodexSubscriptionTransport {
     }
 }
 
+impl crate::openai::JobTransport for CodexSubscriptionTransport {
+    fn for_job(&mut self, job: &RecordingJob) -> Self {
+        Self {
+            client: self.client.clone(),
+            endpoint: self.endpoint.clone(),
+            auth_provider: Arc::clone(&self.auth_provider),
+            // The sign-in check started for this recording goes with it.
+            prepared_auth: self
+                .prepared_auth
+                .take_if(|pending| pending.job_id == Some(job.id)),
+        }
+    }
+}
+
 impl SpeechTransport for CodexSubscriptionTransport {
     fn begin_recording(&mut self, job: &RecordingJob, options: &DictationOptions) {
         if !options.language.contains(',') {
@@ -1114,6 +1128,55 @@ mod tests {
                 .access_token
                 .expose(),
             "fresh"
+        );
+    }
+
+    #[test]
+    fn a_stopped_dictation_takes_its_prepared_sign_in_to_the_processing_worker() {
+        use crate::openai::JobTransport;
+
+        let mut calls = 0;
+        let provider = CallbackAuth(move |_| {
+            calls += 1;
+            Ok(auth(if calls == 1 { "prepared" } else { "fresh" }))
+        });
+        let mut transport =
+            CodexSubscriptionTransport::with_endpoint_and_auth("http://unused", provider);
+        let path = PathBuf::from("recording.wav");
+        let stopped = JobId::new();
+        transport.prepare_auth(stopped, path.clone());
+        let job = |id| RecordingJob {
+            options: None,
+            id,
+            legacy_id: 0,
+            started_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            stage: agentdictate_core::JobStage::Captured,
+            audio_path: path.clone(),
+            duration_seconds: 1.0,
+            transcription_provider: agentdictate_core::TranscriptionProvider::ChatGptSubscription,
+            transcription_model: String::new(),
+            raw_transcript: String::new(),
+            final_text: String::new(),
+            copied_to_clipboard: false,
+            paste_triggered: false,
+            delivery_status: agentdictate_runtime::DeliveryStatus::NotAttempted,
+            error_message: None,
+            cleanup_error: None,
+        };
+
+        let unrelated = transport.for_job(&job(JobId::new()));
+        assert!(unrelated.prepared_auth.is_none());
+        let mut processing = transport.for_job(&job(stopped));
+
+        assert!(transport.prepared_auth.is_none());
+        assert_eq!(
+            processing
+                .recording_auth(&path)
+                .unwrap()
+                .access_token
+                .expose(),
+            "prepared"
         );
     }
 
