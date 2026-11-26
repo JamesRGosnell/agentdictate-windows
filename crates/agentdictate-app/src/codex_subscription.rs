@@ -628,6 +628,39 @@ pub(crate) struct ChatGptCredentials {
     provider: Mutex<Box<dyn ChatGptAuthProvider>>,
     codex_binary: OsString,
     cached: Mutex<Option<CachedChatGptAuth>>,
+    /// The one load through Codex under way, which every lane waits on
+    /// rather than starting its own.
+    flight: Mutex<Flight>,
+    landed: std::sync::Condvar,
+}
+
+/// Loads through Codex take seconds (up to about 20 s when it is slow to
+/// start), so lanes that need credentials at once share a single load.
+#[derive(Default)]
+struct Flight {
+    loading: bool,
+    /// The load under way refreshes the token.
+    refreshing: bool,
+    /// Loads finished so far, so a waiter knows when the one it waited
+    /// for has landed.
+    finished: u64,
+    /// The last load's failure, given to callers for a while instead of
+    /// starting Codex again for each of them.
+    failure: Option<(Instant, String)>,
+}
+
+/// How long a failed sign-in check is reported again without retrying.
+const FAILURE_REMEMBERED: Duration = Duration::from_secs(30);
+
+/// What a caller needs from [`ChatGptCredentials::obtain`].
+#[derive(Clone, Copy)]
+enum Wanted<'a> {
+    /// Any token that has not expired.
+    Current,
+    /// A token other than this one, which the service turned down.
+    Replacing(&'a str),
+    /// A freshly refreshed token.
+    Refreshed,
 }
 
 struct CachedChatGptAuth {
@@ -646,10 +679,16 @@ pub(crate) struct ChatGptBearer {
 impl ChatGptCredentials {
     pub(crate) fn discover() -> Self {
         let provider = CodexAppServerAuthProvider::discover();
+        Self::with_provider(provider.codex_binary.clone(), Box::new(provider))
+    }
+
+    fn with_provider(codex_binary: OsString, provider: Box<dyn ChatGptAuthProvider>) -> Self {
         Self {
-            codex_binary: provider.codex_binary.clone(),
-            provider: Mutex::new(Box::new(provider)),
+            codex_binary,
+            provider: Mutex::new(provider),
             cached: Mutex::new(None),
+            flight: Mutex::new(Flight::default()),
+            landed: std::sync::Condvar::new(),
         }
     }
 
@@ -667,13 +706,77 @@ impl ChatGptCredentials {
 
     /// Returns cached credentials, loading or refreshing them through Codex.
     pub(crate) fn bearer(&self, force_refresh: bool) -> Result<ChatGptBearer, String> {
+        self.obtain(if force_refresh {
+            Wanted::Refreshed
+        } else {
+            Wanted::Current
+        })
+    }
+
+    /// Credentials to retry with after the service turned down `rejected`.
+    /// When another lane has already replaced that token, its replacement
+    /// is used without refreshing again.
+    pub(crate) fn bearer_after_rejection(&self, rejected: &str) -> Result<ChatGptBearer, String> {
+        self.obtain(Wanted::Replacing(rejected))
+    }
+
+    fn obtain(&self, wanted: Wanted<'_>) -> Result<ChatGptBearer, String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !force_refresh && let Some(bearer) = self.cached_bearer(now) {
+        let suitable = |joined_refresh: bool| {
+            let cached = self.cached_bearer(now)?;
+            match wanted {
+                Wanted::Current => Some(cached),
+                Wanted::Replacing(rejected) => (cached.token != rejected).then_some(cached),
+                Wanted::Refreshed => joined_refresh.then_some(cached),
+            }
+        };
+        if let Some(bearer) = suitable(false) {
             return Ok(bearer);
         }
+        let unavailable = || "ChatGPT sign-in state is unavailable".to_owned();
+        let mut flight = self.flight.lock().map_err(|_| unavailable())?;
+        let mut joined_refresh = false;
+        loop {
+            if let Some(bearer) = suitable(joined_refresh) {
+                return Ok(bearer);
+            }
+            if let Some((at, error)) = &flight.failure
+                && at.elapsed() < FAILURE_REMEMBERED
+            {
+                return Err(error.clone());
+            }
+            if !flight.loading {
+                break;
+            }
+            // Another lane is loading: wait for it and use what it gets.
+            let seen = flight.finished;
+            joined_refresh = flight.refreshing;
+            while flight.loading && flight.finished == seen {
+                flight = self.landed.wait(flight).map_err(|_| unavailable())?;
+            }
+        }
+        let refresh = !matches!(wanted, Wanted::Current);
+        flight.loading = true;
+        flight.refreshing = refresh;
+        drop(flight);
+        let result = self.load(refresh, now);
+        let mut flight = self.flight.lock().map_err(|_| unavailable())?;
+        flight.loading = false;
+        flight.finished += 1;
+        flight.failure = result
+            .as_ref()
+            .err()
+            .map(|error| (Instant::now(), error.clone()));
+        drop(flight);
+        self.landed.notify_all();
+        result
+    }
+
+    /// Loads credentials through Codex and caches them.
+    fn load(&self, force_refresh: bool, now: u64) -> Result<ChatGptBearer, String> {
         let expiry = |auth: &ChatGptAuth| {
             parse_jwt_claims(auth.access_token.expose())
                 .ok()
@@ -683,11 +786,6 @@ impl ChatGptCredentials {
             .provider
             .lock()
             .map_err(|_| "ChatGPT sign-in state is unavailable".to_owned())?;
-        // Several transcription and answer lanes can miss the cache together.
-        // The lane ahead of us may have filled it while we waited for Codex.
-        if !force_refresh && let Some(bearer) = self.cached_bearer(now) {
-            return Ok(bearer);
-        }
         let mut auth = provider
             .load(force_refresh)
             .map_err(|error| error.to_string())?;
@@ -757,9 +855,13 @@ pub(crate) fn transcribe_wav_with_chatgpt(
     language: &str,
 ) -> Result<String, String> {
     let boundary = format!("----codex-transcribe-{}", Uuid::new_v4());
-    let mut refreshed = false;
+    let mut rejected: Option<String> = None;
     loop {
-        let bearer = credentials.bearer(refreshed)?;
+        let refreshed = rejected.is_some();
+        let bearer = match &rejected {
+            Some(rejected) => credentials.bearer_after_rejection(rejected)?,
+            None => credentials.bearer(false)?,
+        };
         let response = client
             .post(CHATGPT_TRANSCRIPTION_ENDPOINT)
             .header(
@@ -778,7 +880,7 @@ pub(crate) fn transcribe_wav_with_chatgpt(
             .map_err(|error| CodexSubscriptionError::Transport(error).to_string())?;
         let status = response.status();
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) && !refreshed {
-            refreshed = true;
+            rejected = Some(bearer.token);
             continue;
         }
         let payload = response
@@ -1052,11 +1154,84 @@ mod tests {
     }
 
     fn credentials(provider: impl ChatGptAuthProvider + 'static) -> ChatGptCredentials {
-        ChatGptCredentials {
-            provider: Mutex::new(Box::new(provider)),
-            codex_binary: "unused-codex".into(),
-            cached: Mutex::new(None),
+        ChatGptCredentials::with_provider("unused-codex".into(), Box::new(provider))
+    }
+
+    #[test]
+    fn lanes_waiting_on_a_failing_sign_in_check_share_one_failure() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let credentials = Arc::new(credentials(CallbackAuth(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(300));
+            Err(CodexSubscriptionError::AppServerTimeout)
+        })));
+        let barrier = Arc::new(Barrier::new(5));
+        let started = Instant::now();
+        let lanes: Vec<_> = (0..5)
+            .map(|_| {
+                let credentials = Arc::clone(&credentials);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    credentials.bearer(false).map(|bearer| bearer.token)
+                })
+            })
+            .collect();
+        for lane in lanes {
+            assert!(lane.join().unwrap().is_err());
         }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // Five lanes in turn would have taken 1.5 s.
+        assert!(started.elapsed() < Duration::from_millis(900));
+        // The failure is remembered for a while rather than retried at once.
+        assert!(credentials.bearer(false).is_err());
+        assert!(credentials.bearer_after_rejection("any").is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn lanes_turned_down_with_the_same_token_refresh_it_once() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&refreshes);
+        let credentials = Arc::new(credentials(CallbackAuth(move |refresh: bool| {
+            if !refresh {
+                return Ok(auth("stale"));
+            }
+            counted.fetch_add(1, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(200));
+            Ok(auth("fresh"))
+        })));
+        assert_eq!(credentials.bearer(false).unwrap().token, "stale");
+        let barrier = Arc::new(Barrier::new(2));
+        let lanes: Vec<_> = (0..2)
+            .map(|_| {
+                let credentials = Arc::clone(&credentials);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    credentials.bearer_after_rejection("stale").unwrap().token
+                })
+            })
+            .collect();
+        for lane in lanes {
+            assert_eq!(lane.join().unwrap(), "fresh");
+        }
+        // A lane whose request was turned down before the refresh landed
+        // takes the new token as it is.
+        assert_eq!(
+            credentials.bearer_after_rejection("stale").unwrap().token,
+            "fresh"
+        );
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
     }
 
     #[test]

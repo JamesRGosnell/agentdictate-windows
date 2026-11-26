@@ -663,6 +663,9 @@ impl AnswerProvider for ResponsesProvider {
         };
         let deadlines = self.deadlines.unwrap_or_else(|| deadlines_for(request));
         let mut refreshed = false;
+        // The ChatGPT token last sent, and the one the service turned down.
+        let mut sent_token: Option<String> = None;
+        let mut rejected_token: Option<String> = None;
         let mut index = 0;
         let mut rejected_here: Vec<String> = Vec::new();
         while index < models.len() {
@@ -677,7 +680,11 @@ impl AnswerProvider for ResponsesProvider {
                 .json(&responses_body(request, model));
             builder = match &self.auth {
                 ResponsesAuth::ChatGpt(credentials) => {
-                    let bearer = credentials.bearer(refreshed)?;
+                    let bearer = match &rejected_token {
+                        Some(rejected) => credentials.bearer_after_rejection(rejected)?,
+                        None => credentials.bearer(false)?,
+                    };
+                    sent_token = Some(bearer.token.clone());
                     builder
                         .bearer_auth(bearer.token)
                         .header("chatgpt-account-id", bearer.account_id)
@@ -711,6 +718,7 @@ impl AnswerProvider for ResponsesProvider {
                 && !refreshed
             {
                 refreshed = true;
+                rejected_token = sent_token.take();
                 continue;
             }
             // Some models cannot skip reasoning; ask them again for a little.
