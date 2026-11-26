@@ -43,6 +43,22 @@ fn place(window: usize, metrics: [u32; 3]) -> io::Result<()> {
             // under Discord for a whole dictation.
             tracing::warn!("recording overlay lost topmost; restoring it");
         }
+        if !topmost {
+            // Seen live: Windows can treat the pill as already topmost while
+            // its WS_EX_TOPMOST bit is clear, and then ignores HWND_TOPMOST
+            // (it reports success, four times a second, for a whole
+            // dictation). Leaving the topmost band first makes the next
+            // HWND_TOPMOST a real change.
+            SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+        }
         if !(placed && topmost)
             && SetWindowPos(
                 hwnd,
