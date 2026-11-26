@@ -1037,3 +1037,132 @@ fn reject_capture_checkpoint(connection: &rusqlite::Connection) {
         )
         .unwrap();
 }
+
+mod notices {
+    use std::sync::{Arc, Mutex, mpsc::Receiver};
+
+    use agentdictate_app::{
+        AppPaths, Daemon, Notice, OverlayUpdate, RecordingController, overlay_update_recorder,
+    };
+    use agentdictate_core::{DictationNotice, Settings};
+    use agentdictate_runtime::{
+        Deliverer, ExternalError, ExternalFailureKind, RecordingJob, Runtime, Transcriber,
+        Transcript,
+    };
+    use tempfile::{TempDir, tempdir};
+
+    use super::{FixedTranscriber, PreservingRecorder, SubmittedDelivery, app_paths};
+
+    struct LimitedTranscriber;
+    impl Transcriber for LimitedTranscriber {
+        fn transcribe(&mut self, _: &RecordingJob) -> Result<Transcript, ExternalError> {
+            Err(ExternalError::with_kind(
+                ExternalFailureKind::LimitReached,
+                "ChatGPT transcription limit reached. Try again later.",
+            ))
+        }
+    }
+
+    struct Observed<R, T, D> {
+        daemon: Daemon<R, T, D>,
+        updates: Receiver<OverlayUpdate>,
+        sent: Arc<Mutex<Vec<Notice>>>,
+        _directory: TempDir,
+    }
+
+    impl<R: RecordingController, T: Transcriber, D: Deliverer> Observed<R, T, D> {
+        fn new(recorder: R, transcriber: T, deliverer: D) -> Self {
+            let directory = tempdir().unwrap();
+            let paths: AppPaths = app_paths(directory.path());
+            std::fs::create_dir_all(paths.database_file.parent().unwrap()).unwrap();
+            let runtime = Runtime::open(&paths.database_file).unwrap();
+            let mut daemon = Daemon::new(
+                runtime,
+                Settings::default(),
+                paths,
+                recorder,
+                transcriber,
+                deliverer,
+            );
+            let (controller, updates) = overlay_update_recorder();
+            daemon.set_overlay_controller(controller);
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&sent);
+            daemon.set_notice_sink(Arc::new(move |notice: &Notice| {
+                sink.lock().unwrap().push(notice.clone());
+            }));
+            Self {
+                daemon,
+                updates,
+                sent,
+                _directory: directory,
+            }
+        }
+
+        /// The notices published to the pill since the last call: every
+        /// update forwarded until the recorder has been quiet for a while.
+        fn pill_notices(&self) -> Vec<DictationNotice> {
+            let quiet = std::time::Duration::from_millis(200);
+            std::iter::from_fn(|| self.updates.recv_timeout(quiet).ok())
+                .filter_map(|update| update.notice)
+                .collect()
+        }
+
+        fn sent(&self) -> Vec<Notice> {
+            std::mem::take(&mut *self.sent.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn a_failed_dictation_publishes_its_notice_and_a_paste_publishes_none() {
+        let mut failing = Observed::new(
+            PreservingRecorder::default(),
+            LimitedTranscriber,
+            SubmittedDelivery::default(),
+        );
+        failing.daemon.start_recording().unwrap();
+        failing.daemon.stop_recording().unwrap_err();
+        assert_eq!(failing.pill_notices(), vec![DictationNotice::LimitReached]);
+        let sent = failing.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].notice, DictationNotice::LimitReached);
+        assert!(
+            sent[0]
+                .balloon
+                .as_deref()
+                .is_some_and(|text| text.contains("limit reached")),
+            "{sent:?}"
+        );
+
+        let mut pasting = Observed::new(
+            PreservingRecorder::default(),
+            FixedTranscriber,
+            SubmittedDelivery::default(),
+        );
+        pasting.daemon.start_recording().unwrap();
+        pasting.daemon.stop_recording().unwrap();
+        assert!(pasting.pill_notices().is_empty());
+        assert!(pasting.sent().is_empty());
+    }
+
+    #[test]
+    fn retries_from_settings_and_escape_stay_quiet() {
+        let mut observed = Observed::new(
+            PreservingRecorder::default(),
+            LimitedTranscriber,
+            SubmittedDelivery::default(),
+        );
+        let failed = observed.daemon.start_recording().unwrap();
+        observed.daemon.stop_recording().unwrap_err();
+        assert_eq!(observed.pill_notices().len(), 1);
+        observed.sent();
+
+        observed.daemon.retry_transcription(failed.id).unwrap_err();
+        observed.daemon.start_recording().unwrap();
+        observed.daemon.discard_recording().unwrap();
+        observed.daemon.shutdown().unwrap();
+
+        assert!(observed.pill_notices().is_empty());
+        assert!(observed.sent().is_empty());
+    }
+}

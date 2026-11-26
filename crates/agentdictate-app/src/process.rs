@@ -162,6 +162,12 @@ impl AgentProcess {
         self.daemon.set_overlay_controller(controller);
     }
 
+    /// Sends the notice about each dictation that was not pasted normally
+    /// to `sink`, for the tray notification.
+    pub fn set_notice_sink(&mut self, sink: crate::NoticeSink) {
+        self.daemon.set_notice_sink(sink);
+    }
+
     pub fn set_hotkey_reconfigurer(&mut self, control: Arc<dyn HotkeyReconfigurer>) {
         self.hotkey_control = Some(control);
     }

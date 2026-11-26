@@ -568,6 +568,29 @@ impl OverlayProcessState {
     }
 }
 
+/// A controller without a helper process: its updates arrive on the
+/// receiver and its dismissals are acknowledged at once. For tests.
+#[doc(hidden)]
+pub fn overlay_update_recorder() -> (OverlayController, Receiver<OverlayUpdate>) {
+    let (commands, received) = channel();
+    let (updates, recorded) = channel();
+    let health = Arc::new(OverlayHealth::default());
+    std::thread::spawn(move || {
+        while let Ok(command) = received.recv() {
+            match command {
+                OverlayCommand::Update(update) => {
+                    let _ = updates.send(update);
+                }
+                OverlayCommand::Dismiss { reply } => {
+                    let _ = reply.send(Ok(()));
+                }
+                OverlayCommand::ForceDismiss => {}
+            }
+        }
+    });
+    (OverlayController { commands, health }, recorded)
+}
+
 pub fn start_overlay_presenter(
     executable: PathBuf,
 ) -> io::Result<(OverlayController, JoinHandle<()>)> {

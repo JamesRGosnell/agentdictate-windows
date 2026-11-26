@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 
 use agentdictate_core::{
     AppSnapshot, HistoryPageCursor, HistoryPageRequest, HistoryPageSnapshot, HistorySnapshot,
@@ -15,7 +16,14 @@ use agentdictate_runtime::{
 use chrono::Utc;
 use thiserror::Error;
 
-use crate::{ActiveRecordingUpdate, AppPaths, OverlayController, OverlayUpdate};
+use crate::{
+    ActiveRecordingUpdate, AppPaths, DictationEnd, Notice, OverlayController, OverlayUpdate,
+    dictation_notice,
+};
+
+/// Receives the notice about each dictation that was not pasted normally,
+/// for the tray notification. It must not block.
+pub type NoticeSink = Arc<dyn Fn(&Notice) + Send + Sync>;
 
 pub(crate) const OVERVIEW_RECENT_HISTORY_LIMIT: usize = 30;
 
@@ -119,6 +127,7 @@ pub struct Daemon<R, T, D> {
     last_transcript: Option<String>,
     hotkey: HotkeyReadiness,
     overlay: OverlayDeliveryGate,
+    notice_sink: Option<NoticeSink>,
 }
 
 impl<R, T, D> Daemon<R, T, D>
@@ -152,6 +161,7 @@ where
             last_transcript: None,
             hotkey: HotkeyReadiness::Starting,
             overlay: OverlayDeliveryGate::Headless(HeadlessDeliveryGate),
+            notice_sink: None,
         }
     }
 
@@ -210,12 +220,14 @@ where
                 if let WorkflowPhase::Starting { job_id } = self.workflow.snapshot().phase {
                     // Dismisses the waiting indicator even if the database can
                     // no longer be queried after a failed checkpoint.
-                    self.settle(
+                    let message = external_message(&error);
+                    self.settle_announcing(
                         job_id,
                         WorkflowSignal::Interrupted {
                             job_id,
                             at: JobStage::Interrupted,
                         },
+                        dictation_notice(DictationEnd::RecorderDidNotStart { message: &message }),
                     );
                 }
                 return Err(error.into());
@@ -263,12 +275,13 @@ where
                     JobStage::Recording,
                     format!("recording could not be finalized: {error}"),
                 );
-                self.settle(
+                self.settle_announcing(
                     id,
                     WorkflowSignal::Interrupted {
                         job_id: id,
                         at: JobStage::Interrupted,
                     },
+                    dictation_notice(DictationEnd::RecordingInterrupted),
                 );
                 persisted?;
                 return Err(error.into());
@@ -289,7 +302,11 @@ where
                 %error,
                 "recording finalized but its capture checkpoint failed"
             );
-            self.recover_after_capture_checkpoint_failure(id, &error);
+            self.recover_after_capture_checkpoint_failure(
+                id,
+                &error,
+                dictation_notice(DictationEnd::RecordingInterrupted),
+            );
             return Err(error.into());
         }
         self.workflow
@@ -311,25 +328,30 @@ where
                 tracing::error!(job_id = %id, %error, "dictation processing failed");
                 // A failed re-read must still end the session, or every
                 // later Start is refused as AlreadyRecording.
-                let persisted_stage = self
-                    .runtime
-                    .job(id)
-                    .ok()
-                    .flatten()
-                    .map_or(JobStage::Failed, |job| job.stage);
-                self.settle(
+                let persisted = self.runtime.job(id).ok().flatten();
+                let persisted_stage = persisted.as_ref().map_or(JobStage::Failed, |job| job.stage);
+                let notice = dictation_notice(DictationEnd::Failed {
+                    error: &error,
+                    job: persisted.as_ref(),
+                });
+                self.settle_announcing(
                     id,
                     WorkflowSignal::Interrupted {
                         job_id: id,
                         at: persisted_stage,
                     },
+                    notice,
                 );
                 return Err(error.into());
             }
         };
         if result.stage == JobStage::NoSpeech {
             self.cleanup_completed_audio(&result);
-            self.settle(id, WorkflowSignal::NoSpeechDetected { job_id: id });
+            self.settle_announcing(
+                id,
+                WorkflowSignal::NoSpeechDetected { job_id: id },
+                dictation_notice(DictationEnd::Finished(&result)),
+            );
             tracing::info!(job_id = %id, "empty dictation finished quietly");
             return Ok(result);
         }
@@ -356,7 +378,7 @@ where
             }
         };
         self.last_transcript = Some(result.final_text.clone());
-        self.settle(id, end);
+        self.settle_announcing(id, end, dictation_notice(DictationEnd::Finished(&result)));
         tracing::info!(
             job_id = %id,
             stage = ?result.stage,
@@ -401,7 +423,7 @@ where
                 %error,
                 "discarded recording finalized but its capture checkpoint failed"
             );
-            self.recover_after_capture_checkpoint_failure(id, &error);
+            self.recover_after_capture_checkpoint_failure(id, &error, None);
             return Err(error.into());
         }
         let discarded = match self
@@ -441,6 +463,7 @@ where
         tracing::warn!(job_id = %id, "recorder exited without an explicit stop");
         self.preserve_active_recording(
             "recorder exited unexpectedly before the dictation completed; audio was preserved",
+            dictation_notice(DictationEnd::RecordingInterrupted),
         )
         .map(Some)
     }
@@ -450,8 +473,10 @@ where
     pub fn shutdown(&mut self) -> Result<(), DaemonError> {
         if let Some(id) = self.active_job {
             self.transcriber.cancel_recording(id);
+            // A shutdown is announced by the app closing, not by a notice.
             self.preserve_active_recording(
                 "AgentDictate shut down before this dictation completed; audio was preserved",
+                None,
             )?;
         }
         Ok(())
@@ -704,13 +729,39 @@ where
         &mut self.deliverer
     }
 
+    /// Shows how dictations that are not pasted normally end as tray
+    /// notifications.
+    pub fn set_notice_sink(&mut self, sink: NoticeSink) {
+        self.notice_sink = Some(sink);
+    }
+
     fn publish_overlay_update(&self) {
+        self.publish(None);
+    }
+
+    /// Publishes the workflow and, when a dictation just ended without a
+    /// normal paste, the notice about it: on the pill and to the sink.
+    fn publish(&self, notice: Option<&Notice>) {
         if let OverlayDeliveryGate::Live(overlay) = &self.overlay {
-            overlay.update(self.overlay_update());
+            overlay.update(OverlayUpdate {
+                notice: notice.map(|notice| notice.notice),
+                ..self.overlay_update()
+            });
+        }
+        if let Some(notice) = notice {
+            tracing::info!(notice = %notice.notice.pill_text(), "dictation ended without a paste");
+            if let Some(sink) = &self.notice_sink {
+                sink(notice);
+            }
         }
     }
 
-    fn recover_after_capture_checkpoint_failure(&mut self, id: JobId, primary: &RuntimeError) {
+    fn recover_after_capture_checkpoint_failure(
+        &mut self,
+        id: JobId,
+        primary: &RuntimeError,
+        notice: Option<Notice>,
+    ) {
         self.transcriber.cancel_recording(id);
         if let Err(recovery_error) = self.runtime.interrupt_job(
             id,
@@ -724,12 +775,13 @@ where
             );
         }
 
-        self.settle(
+        self.settle_announcing(
             id,
             WorkflowSignal::Interrupted {
                 job_id: id,
                 at: JobStage::Interrupted,
             },
+            notice,
         );
     }
 
@@ -737,6 +789,13 @@ where
     /// fail, an out-of-order workflow is rebuilt, and the Recovery recount is
     /// best-effort, so no bookkeeping error can leave a stale active job.
     fn settle(&mut self, id: JobId, end: WorkflowSignal) {
+        self.settle_announcing(id, end, None);
+    }
+
+    /// `settle`, then announces `notice` about the dictation that ended.
+    /// Only dictations the user just made pass one: Recovery retries,
+    /// Escape and shutdown stay quiet.
+    fn settle_announcing(&mut self, id: JobId, end: WorkflowSignal, notice: Option<Notice>) {
         self.active_job = None;
         self.active_recording = None;
         let needs_attention = matches!(end, WorkflowSignal::Interrupted { .. });
@@ -752,7 +811,7 @@ where
         }
         self.recount_recovery(id, needs_attention);
         self.sequence += 1;
-        self.publish_overlay_update();
+        self.publish(notice.as_ref());
     }
 
     fn recount_recovery(&mut self, id: JobId, needs_attention: bool) {
@@ -774,6 +833,7 @@ where
     fn preserve_active_recording(
         &mut self,
         reason: &'static str,
+        notice: Option<Notice>,
     ) -> Result<RecordingJob, DaemonError> {
         let id = self.active_job.ok_or(DaemonError::NotRecording)?;
         self.transcriber.cancel_recording(id);
@@ -786,12 +846,13 @@ where
                     JobStage::Recording,
                     format!("{reason}; recording could not be finalized: {error}"),
                 );
-                self.settle(
+                self.settle_announcing(
                     id,
                     WorkflowSignal::Interrupted {
                         job_id: id,
                         at: JobStage::Interrupted,
                     },
+                    notice,
                 );
                 return Ok(interrupted?);
             }
@@ -802,18 +863,19 @@ where
                 %error,
                 "preserved recording finalized but its capture checkpoint failed"
             );
-            self.recover_after_capture_checkpoint_failure(id, &error);
+            self.recover_after_capture_checkpoint_failure(id, &error, notice);
             return Err(error.into());
         }
         let interrupted = self
             .runtime
             .interrupt_job(id, JobStage::Captured, reason.to_owned());
-        self.settle(
+        self.settle_announcing(
             id,
             WorkflowSignal::Interrupted {
                 job_id: id,
                 at: JobStage::Interrupted,
             },
+            notice,
         );
         Ok(interrupted?)
     }
@@ -887,6 +949,14 @@ where
             activity,
             weekly_activity,
         })
+    }
+}
+
+/// The external failure's own message, without the runtime's prefix.
+fn external_message(error: &RuntimeError) -> String {
+    match error {
+        RuntimeError::External(error) => error.to_string(),
+        error => error.to_string(),
     }
 }
 

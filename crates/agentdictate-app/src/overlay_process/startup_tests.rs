@@ -124,7 +124,13 @@ fn waiting_indicator_precedes_audio_and_only_becomes_ready_after_its_checkpoint(
                 update.workflow.phase,
                 WorkflowPhase::NeedsAttention { .. }
             ));
-            assert!(!update.presentation().state().is_visible());
+            // The waiting indicator turns into the failure's notice.
+            assert_eq!(
+                update.state(),
+                agentdictate_ui::OverlayState::Notice(
+                    agentdictate_core::DictationNotice::MicrophoneFailed
+                )
+            );
             assert!(update.active_recording.is_none());
             assert_eq!(daemon.snapshot().recoverable_count, 1);
             daemon.recorder_mut().fail = false;

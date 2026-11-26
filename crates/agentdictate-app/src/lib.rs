@@ -41,7 +41,7 @@ pub use copilot::{
 };
 #[cfg(all(windows, feature = "desktop"))]
 pub use copilot::{install_copilot_settings_store, run_copilot};
-pub use daemon::{CapturedRecording, Daemon, DaemonError, RecordingController};
+pub use daemon::{CapturedRecording, Daemon, DaemonError, NoticeSink, RecordingController};
 pub use diagnostics::init_file_logging;
 pub use hotkey_dispatch::{
     HotkeyActionOutcome, HotkeyDispatchGate, HotkeyIgnoreReason, start_hotkey_listener,
@@ -56,7 +56,8 @@ pub use overlay_process::run_overlay_helper;
 pub use overlay_process::{
     ActiveRecordingUpdate, OVERLAY_HEALTH_FILE, OVERLAY_TEARDOWN_TIMEOUT, OverlayController,
     OverlayProcessAction, OverlayProcessState, OverlayTeardownError, OverlayUpdate,
-    is_overlay_helper_argument, start_overlay_presenter, start_overlay_presenter_with_timeout,
+    is_overlay_helper_argument, overlay_update_recorder, start_overlay_presenter,
+    start_overlay_presenter_with_timeout,
 };
 pub use process::{AgentProcess, HotkeyReconfigurer, ProductionDaemon, command_for_hotkey};
 pub use startup::{

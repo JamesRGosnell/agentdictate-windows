@@ -10,6 +10,6 @@ pub use helper::run_overlay_helper;
 pub use protocol::{ActiveRecordingUpdate, OverlayUpdate};
 pub use supervisor::{
     OVERLAY_HEALTH_FILE, OVERLAY_TEARDOWN_TIMEOUT, OverlayController, OverlayProcessAction,
-    OverlayProcessState, OverlayTeardownError, start_overlay_presenter,
+    OverlayProcessState, OverlayTeardownError, overlay_update_recorder, start_overlay_presenter,
     start_overlay_presenter_with_timeout,
 };
