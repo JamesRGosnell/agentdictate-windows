@@ -28,12 +28,49 @@ const OVERLAY_READY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 #[path = "startup_tests.rs"]
 mod startup_tests;
+
+#[cfg(all(test, windows))]
+mod focusless_teardown_tests {
+    use super::*;
+
+    #[test]
+    fn an_unconfirmed_helper_exit_does_not_block_the_windows_paste() {
+        let (commands, received) = channel();
+        let controller = OverlayController {
+            commands,
+            health: Arc::new(OverlayHealth::default()),
+        };
+        // A presenter that accepts commands but never observes the exit.
+        let started = Instant::now();
+        let result = controller.dismiss_and_wait();
+        assert!(result.is_ok(), "paste must proceed: {result:?}");
+        assert!(
+            started.elapsed() < OVERLAY_TEARDOWN_TIMEOUT + Duration::from_secs(1),
+            "a lingering helper must not add a second full teardown wait"
+        );
+        let sent = received.try_iter().collect::<Vec<_>>();
+        assert!(matches!(sent[0], OverlayCommand::Dismiss { .. }));
+        assert!(matches!(sent[1], OverlayCommand::ForceDismiss));
+    }
+}
 /// Upper bound the daemon waits for the helper to exit after dismissal. The
 /// dismissal ack now includes the helper's fade-out, so this must comfortably
 /// exceed the UI crate's `OVERLAY_FADE_HOLD` plus process teardown; the
 /// relation is asserted by the overlay lifecycle tests.
 #[doc(hidden)]
 pub const OVERLAY_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The Windows overlay window is created `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`,
+/// so it cannot become the paste target even while its process lingers.
+const OVERLAY_CANNOT_TAKE_FOCUS: bool = cfg!(windows);
+
+/// How long paste waits for a terminated helper to be observed gone. Where the
+/// overlay cannot take focus, a short grace suffices before pasting anyway.
+const FORCED_EXIT_CONFIRMATION_TIMEOUT: Duration = if OVERLAY_CANNOT_TAKE_FOCUS {
+    Duration::from_millis(250)
+} else {
+    OVERLAY_TEARDOWN_TIMEOUT
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayProcessAction {
@@ -116,10 +153,19 @@ impl OverlayController {
                 self.commands
                     .send(OverlayCommand::ForceDismiss)
                     .map_err(|_| OverlayTeardownError::PresenterUnavailable)?;
-                // Killing the presentation-only helper is safe, but paste still
-                // requires its observed process exit, not merely a kill request.
-                match acknowledgment.recv_timeout(OVERLAY_TEARDOWN_TIMEOUT) {
+                // Killing the presentation-only helper is safe. On X11 paste
+                // still requires its observed process exit, not merely a kill
+                // request. The Windows overlay is no-activate and click-through,
+                // so it can never take the paste: a helper slow to die under
+                // load must not cost the user their dictation.
+                match acknowledgment.recv_timeout(FORCED_EXIT_CONFIRMATION_TIMEOUT) {
                     Ok(result) => result,
+                    Err(RecvTimeoutError::Timeout) if OVERLAY_CANNOT_TAKE_FOCUS => {
+                        tracing::warn!(
+                            "overlay helper exit unconfirmed after termination; pasting anyway"
+                        );
+                        Ok(())
+                    }
                     Err(RecvTimeoutError::Timeout) => Err(OverlayTeardownError::TimedOut),
                     Err(RecvTimeoutError::Disconnected) => {
                         Err(OverlayTeardownError::PresenterUnavailable)

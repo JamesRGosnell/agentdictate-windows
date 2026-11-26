@@ -33,10 +33,17 @@ fn place(window: usize, metrics: [u32; 3]) -> io::Result<()> {
         let y = info.rcWork.bottom - height - gap;
         let mut current = std::mem::zeroed();
         GetWindowRect(hwnd, &mut current);
-        if (current.left != x
-            || current.top != y
-            || current.right - current.left != width
-            || current.bottom - current.top != height)
+        let topmost = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST as isize != 0;
+        let placed = current.left == x
+            && current.top == y
+            && current.right - current.left == width
+            && current.bottom - current.top == height;
+        if placed && !topmost {
+            // Seen live: a correctly placed pill that was not topmost stayed
+            // under Discord for a whole dictation.
+            tracing::warn!("recording overlay lost topmost; restoring it");
+        }
+        if !(placed && topmost)
             && SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
