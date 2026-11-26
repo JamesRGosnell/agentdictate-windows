@@ -80,6 +80,21 @@ pub(crate) fn is_accidental_tap(path: &Path) -> bool {
     inspect().unwrap_or(false)
 }
 
+/// Window over which loudness is measured: 30 ms of 16 kHz audio, short enough
+/// to resolve one syllable and long enough to average out single samples.
+const ENERGY_WINDOW_SAMPLES: usize = 480;
+/// RMS level, about -45 dBFS, above which a window holds more than room tone.
+/// Recorded speech measures -27 to -35 dBFS; the near-silent clips that were
+/// misreported as failed dictations measure -57 to -63 dBFS.
+const AUDIBLE_WINDOW_RMS: f64 = 184.0;
+/// Consecutive audible windows (90 ms) that make a clip audible. A spoken
+/// syllable sustains energy this long, even a quiet "Hello?", while a key or
+/// mouse click lasts a few milliseconds and lifts at most two windows.
+const AUDIBLE_RUN_WINDOWS: usize = 3;
+
+/// Near-silent means no 90 ms stretch rises above -45 dBFS. Clicks and other
+/// brief transients do not count as sound; anything sustained, including a
+/// steady hum, does, so the clip stays recoverable.
 fn inspect_quiet_pcm(path: &Path) -> anyhow::Result<bool> {
     let mut file = File::open(path)?;
     let start = data_start(&mut file)?;
@@ -91,23 +106,50 @@ fn inspect_quiet_pcm(path: &Path) -> anyhow::Result<bool> {
         remaining > 0 && remaining % 2 == 0 && start + remaining <= file.metadata()?.len(),
         "invalid PCM length"
     );
-    let samples = remaining / 2;
-    let mut energy = 0f64;
+    let mut loudness = WindowedLoudness::default();
     let mut buffer = [0; 8192];
     while remaining > 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
         file.read_exact(&mut buffer[..count])?;
         for pair in buffer[..count].chunks_exact(2) {
-            let sample = i32::from(i16::from_le_bytes([pair[0], pair[1]]));
-            // Peak below roughly -48 dBFS and RMS below roughly -60 dBFS.
-            if sample.abs() > 128 {
+            if loudness.push(i16::from_le_bytes([pair[0], pair[1]])) {
                 return Ok(false);
             }
-            energy += f64::from(sample * sample);
         }
         remaining -= count as u64;
     }
-    Ok(energy / samples as f64 <= 32.0 * 32.0)
+    Ok(!loudness.finish())
+}
+
+/// Tracks runs of consecutive audible energy windows.
+#[derive(Default)]
+struct WindowedLoudness {
+    energy: f64,
+    samples: usize,
+    audible_run: usize,
+}
+
+impl WindowedLoudness {
+    /// Adds one sample; true once a sustained audible run has been seen.
+    fn push(&mut self, sample: i16) -> bool {
+        let sample = f64::from(sample);
+        self.energy += sample * sample;
+        self.samples += 1;
+        self.samples == ENERGY_WINDOW_SAMPLES && self.close_window()
+    }
+
+    /// Closes a trailing partial window; true if the clip is audible.
+    fn finish(&mut self) -> bool {
+        self.samples > 0 && self.close_window()
+    }
+
+    fn close_window(&mut self) -> bool {
+        let audible = self.energy / self.samples as f64 > AUDIBLE_WINDOW_RMS * AUDIBLE_WINDOW_RMS;
+        self.energy = 0.0;
+        self.samples = 0;
+        self.audible_run = if audible { self.audible_run + 1 } else { 0 };
+        self.audible_run >= AUDIBLE_RUN_WINDOWS
+    }
 }
 
 #[cfg(test)]
@@ -157,5 +199,59 @@ mod tests {
         std::fs::write(&path, b"broken recording").unwrap();
         assert!(!is_near_silent(&path));
         assert!(!is_near_silent(&dir.path().join("missing.wav")));
+    }
+
+    /// A canonical 16 kHz mono PCM16 WAV holding `samples`.
+    fn wav(samples: &[i16]) -> Vec<u8> {
+        let data_len = (samples.len() * 2) as u32;
+        let mut wav =
+            b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data"
+                .to_vec();
+        wav[4..8].copy_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    /// Two seconds of deterministic room tone within +/-20 (about -67 dBFS RMS).
+    fn room_tone() -> Vec<i16> {
+        let mut state = 0x2545_f491_u32;
+        (0..32_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 16) as i16 % 21
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_click_in_room_tone_is_near_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.wav");
+        let mut samples = room_tone();
+        // One 3 ms keyboard click at about -12 dBFS.
+        for (index, sample) in samples[16_000..16_048].iter_mut().enumerate() {
+            *sample = if index % 2 == 0 { 8000 } else { -8000 };
+        }
+        std::fs::write(&path, wav(&samples)).unwrap();
+
+        assert!(is_near_silent(&path));
+    }
+
+    #[test]
+    fn a_brief_word_at_speech_level_is_audible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.wav");
+        let mut samples = room_tone();
+        // 300 ms of a 200 Hz tone at -30 dBFS RMS (peak 1465).
+        for (index, sample) in samples[8_000..12_800].iter_mut().enumerate() {
+            let phase = index as f64 * 200.0 * std::f64::consts::TAU / 16_000.0;
+            *sample = (1465.0 * phase.sin()) as i16;
+        }
+        std::fs::write(&path, wav(&samples)).unwrap();
+
+        assert!(!is_near_silent(&path));
     }
 }
