@@ -1,7 +1,7 @@
 use agentdictate_core::{ClientCommand, ServerMessageKind, WorkflowPhase};
 use agentdictate_runtime::IpcClient;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -62,7 +62,52 @@ pub const fn tray_command_for_phase(
     }
 }
 
-thread_local! {static ACTIONS:RefCell<Option<mpsc::Sender<TrayAction>>>=const{RefCell::new(None)}; static ICON:RefCell<Option<NOTIFYICONDATAW>>=const{RefCell::new(None)};}
+thread_local! {static ACTIONS:RefCell<Option<mpsc::Sender<TrayAction>>>=const{RefCell::new(None)}; static ICON:RefCell<Option<NOTIFYICONDATAW>>=const{RefCell::new(None)}; static ADD_ATTEMPTS:Cell<u32>=const{Cell::new(0)};}
+/// The shell can refuse NIM_ADD while Explorer is still starting (sign-in,
+/// autostart) or restarting; the icon is retried on this timer instead of
+/// being lost for the session.
+const ICON_RETRY_TIMER: usize = 1;
+const ICON_RETRY_INTERVAL_MS: u32 = 5_000;
+/// Five-second retries for three minutes; after that only TaskbarCreated,
+/// sent when Explorer (re)starts, adds the icon.
+const ICON_RETRY_LIMIT: u32 = 36;
+/// Shows the icon, returning whether the shell has it. NIM_MODIFY first: a
+/// NIM_ADD that timed out may still have added it, and adding twice fails.
+unsafe fn show_icon(icon: &NOTIFYICONDATAW) -> bool {
+    // SAFETY: `icon` is a fully initialized NOTIFYICONDATAW for this window.
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, icon) != 0 || Shell_NotifyIconW(NIM_ADD, icon) != 0 }
+}
+/// Shows the icon now or schedules retries; runs on the tray thread.
+unsafe fn add_icon_or_retry(hwnd: HWND) -> bool {
+    let shown = ICON.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            // SAFETY: the stored icon belongs to this thread's tray window.
+            .is_some_and(|icon| unsafe { show_icon(icon) })
+    });
+    // SAFETY: the timer belongs to `hwnd`, a live window of this thread.
+    unsafe {
+        if shown {
+            KillTimer(hwnd, ICON_RETRY_TIMER);
+            ADD_ATTEMPTS.set(0);
+            return true;
+        }
+        let attempts = ADD_ATTEMPTS.get() + 1;
+        ADD_ATTEMPTS.set(attempts);
+        if attempts == 1 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "could not add the tray icon; retrying"
+            );
+            SetTimer(hwnd, ICON_RETRY_TIMER, ICON_RETRY_INTERVAL_MS, None);
+        } else if attempts > ICON_RETRY_LIMIT {
+            KillTimer(hwnd, ICON_RETRY_TIMER);
+            ADD_ATTEMPTS.set(0);
+            tracing::warn!("tray icon is still unavailable; it will appear when Explorer restarts");
+        }
+    }
+    false
+}
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -74,11 +119,15 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     unsafe {
         if message == RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) {
-            ICON.with(|slot| {
-                if let Some(icon) = slot.borrow().as_ref() {
-                    Shell_NotifyIconW(NIM_ADD, icon);
-                }
-            });
+            KillTimer(hwnd, ICON_RETRY_TIMER);
+            ADD_ATTEMPTS.set(0);
+            add_icon_or_retry(hwnd);
+            return 0;
+        }
+        if message == WM_TIMER && wparam == ICON_RETRY_TIMER {
+            if add_icon_or_retry(hwnd) {
+                tracing::info!("tray icon added after retrying");
+            }
             return 0;
         }
         if message == WM_APP + 1 {
@@ -214,12 +263,10 @@ pub fn start_system_tray(runtime: PathBuf, settings: PathBuf) -> std::io::Result
             }
             let tip = wide("AgentDictate");
             icon.szTip[..tip.len()].copy_from_slice(&tip);
-            if Shell_NotifyIconW(NIM_ADD, &icon) == 0 {
-                let _ = ready.send(Err(std::io::Error::last_os_error()));
-                DestroyWindow(hwnd);
-                return;
-            }
             ICON.with(|slot| *slot.borrow_mut() = Some(icon));
+            // A refused first add is retried; the window and its loop stay
+            // alive so TaskbarCreated can still add the icon later.
+            add_icon_or_retry(hwnd);
             let _ = ready.send(Ok(hwnd as usize));
             let mut message = std::mem::zeroed();
             while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
