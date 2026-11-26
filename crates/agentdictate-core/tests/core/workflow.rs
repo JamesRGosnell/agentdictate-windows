@@ -224,3 +224,37 @@ fn a_recoverable_failure_does_not_block_the_next_recording() {
 
     assert_eq!(next.phase, WorkflowPhase::Starting { job_id: next_job });
 }
+
+#[test]
+fn the_next_recording_can_start_while_a_dictation_is_processed() {
+    let mut workflow = Workflow::new();
+    let processing = JobId::new();
+    workflow
+        .apply(WorkflowSignal::StartRequested { job_id: processing })
+        .unwrap();
+    workflow
+        .apply(WorkflowSignal::FirstAudioFrameWritten { job_id: processing })
+        .unwrap();
+    workflow.apply(WorkflowSignal::StopRequested).unwrap();
+    workflow
+        .apply(WorkflowSignal::CaptureFinalized { job_id: processing })
+        .unwrap();
+    let next = JobId::new();
+
+    let starting = workflow
+        .apply(WorkflowSignal::StartRequested { job_id: next })
+        .unwrap();
+
+    assert_eq!(starting.phase, WorkflowPhase::Starting { job_id: next });
+    assert_eq!(starting.phase.job_id(), Some(next));
+    // The earlier dictation's own signals no longer move the workflow.
+    assert_eq!(
+        workflow
+            .apply(WorkflowSignal::TranscriptStored { job_id: processing })
+            .unwrap_err(),
+        agentdictate_core::WorkflowError::JobMismatch {
+            expected: next,
+            received: processing,
+        }
+    );
+}

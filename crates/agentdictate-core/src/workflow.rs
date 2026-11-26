@@ -89,7 +89,9 @@ pub enum WorkflowPhase {
 }
 
 impl WorkflowPhase {
-    const fn job_id(self) -> Option<JobId> {
+    /// The job this phase is about; `None` when ready.
+    #[must_use]
+    pub const fn job_id(self) -> Option<JobId> {
         match self {
             Self::Ready => None,
             Self::Starting { job_id }
@@ -198,17 +200,21 @@ impl Workflow {
         self.snapshot
     }
 
+    /// Applies `signal`. A new recording may start while an earlier
+    /// dictation still needs attention or is still being processed: the
+    /// workflow then follows the new recording, and the earlier dictation
+    /// finishes without changing it.
     pub fn apply(&mut self, signal: WorkflowSignal) -> Result<WorkflowSnapshot, WorkflowError> {
-        let starts_after_recovery = matches!(
+        let starts_another_job = matches!(
             (self.snapshot.phase, signal),
             (
-                WorkflowPhase::NeedsAttention { .. },
+                WorkflowPhase::NeedsAttention { .. } | WorkflowPhase::Processing { .. },
                 WorkflowSignal::StartRequested { .. }
             )
         );
         if let (Some(expected), Some(received)) = (self.snapshot.phase.job_id(), signal.job_id())
             && expected != received
-            && !starts_after_recovery
+            && !starts_another_job
         {
             return Err(WorkflowError::JobMismatch { expected, received });
         }
@@ -224,9 +230,10 @@ impl Workflow {
             (WorkflowPhase::Ready, WorkflowSignal::StartRequested { job_id }) => {
                 WorkflowPhase::Starting { job_id }
             }
-            (WorkflowPhase::NeedsAttention { .. }, WorkflowSignal::StartRequested { job_id }) => {
-                WorkflowPhase::Starting { job_id }
-            }
+            (
+                WorkflowPhase::NeedsAttention { .. } | WorkflowPhase::Processing { .. },
+                WorkflowSignal::StartRequested { job_id },
+            ) => WorkflowPhase::Starting { job_id },
             (
                 WorkflowPhase::Starting { job_id: expected },
                 WorkflowSignal::FirstAudioFrameWritten { job_id },
