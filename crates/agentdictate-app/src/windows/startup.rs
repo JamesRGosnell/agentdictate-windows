@@ -103,6 +103,23 @@ fn quote_argument(arg: &str) -> String {
     result.push('"');
     result
 }
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+/// Starts the daemon outside the launcher's job object. A terminal or IDE
+/// often runs its children in a kill-on-close job, so a daemon left inside
+/// it dies when that session ends. A job that forbids breakaway rejects the
+/// flag with ERROR_ACCESS_DENIED; the daemon then starts inside the job.
+fn spawn_outside_job<T>(mut spawn: impl FnMut(u32) -> io::Result<T>) -> io::Result<T> {
+    match spawn(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB) {
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            tracing::warn!(
+                "cannot start the daemon outside this job; it will end with its session"
+            );
+            spawn(CREATE_NO_WINDOW)
+        }
+        result => result,
+    }
+}
 pub fn bootstrap_daemon_service(
     runtime: &Path,
     _service: &Path,
@@ -111,13 +128,15 @@ pub fn bootstrap_daemon_service(
     if IpcClient::connect(runtime).is_ok() {
         return Ok(());
     }
-    let mut child = Command::new(executable)
-        .arg(SERVICE_ARGUMENT)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(0x08000000)
-        .spawn()?;
+    let mut child = spawn_outside_job(|flags| {
+        Command::new(executable)
+            .arg(SERVICE_ARGUMENT)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    })?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if IpcClient::connect(runtime).is_ok() {
@@ -142,5 +161,48 @@ mod tests {
             r#""C:\My Apps\agentdictated.exe""#
         );
         assert_eq!(quote_argument("a\"b"), "\"a\\\"b\"");
+    }
+    #[test]
+    fn the_daemon_breaks_away_from_the_launcher_job_when_allowed() {
+        let mut attempts = Vec::new();
+        let flags = spawn_outside_job(|flags| {
+            attempts.push(flags);
+            Ok(flags)
+        })
+        .unwrap();
+        assert_eq!(flags, CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+        assert_eq!(attempts.len(), 1);
+    }
+    #[test]
+    fn a_job_that_forbids_breakaway_still_starts_the_daemon() {
+        let mut attempts = Vec::new();
+        let flags = spawn_outside_job(|flags| {
+            attempts.push(flags);
+            if flags & CREATE_BREAKAWAY_FROM_JOB != 0 {
+                Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32))
+            } else {
+                Ok(flags)
+            }
+        })
+        .unwrap();
+        assert_eq!(flags, CREATE_NO_WINDOW);
+        assert_eq!(
+            attempts,
+            [
+                CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+                CREATE_NO_WINDOW
+            ]
+        );
+    }
+    #[test]
+    fn other_spawn_failures_are_not_retried() {
+        let mut attempts = 0;
+        let error = spawn_outside_job::<()>(|_| {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_FILE_NOT_FOUND as i32));
+        assert_eq!(attempts, 1);
     }
 }
