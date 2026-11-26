@@ -552,6 +552,59 @@ fn delivery_gate_failure_is_safe_to_retry_and_never_calls_the_deliverer() {
 }
 
 #[test]
+fn delivery_that_fails_before_any_paste_stays_ready_and_can_be_retried() {
+    struct NotSentDeliverer;
+    impl Deliverer for NotSentDeliverer {
+        fn deliver(&mut self, _: &RecordingJob) -> Result<DeliveryDisposition, ExternalError> {
+            Ok(DeliveryDisposition::NotSent {
+                copied_to_clipboard: false,
+                reason: "No focused destination window".to_owned(),
+            })
+        }
+    }
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("agentdictate.db");
+    let mut runtime = Runtime::open(&database_path).unwrap();
+    let job = runtime
+        .start_recording(
+            request(
+                &directory.path().join("recordings/not-sent.wav"),
+                TRANSCRIPTION_MODEL,
+            ),
+            &mut crate::support::ReadyRecorder,
+        )
+        .unwrap();
+    runtime.capture_recording(job.id, 2.0).unwrap();
+
+    let not_sent = runtime
+        .process_captured(
+            job.id,
+            &mut FixedTranscriber,
+            &mut HeadlessDeliveryGate,
+            &mut NotSentDeliverer,
+        )
+        .unwrap();
+
+    assert_eq!(not_sent.stage, JobStage::ReadyToDeliver);
+    assert_eq!(not_sent.delivery_status, DeliveryStatus::NotAttempted);
+    assert_eq!(
+        not_sent.error_message.as_deref(),
+        Some("No focused destination window")
+    );
+    drop(runtime);
+    let mut runtime = Runtime::open(&database_path).unwrap();
+    let reopened = runtime.job(job.id).unwrap().unwrap();
+    assert_eq!(reopened.stage, JobStage::ReadyToDeliver);
+    assert_eq!(reopened.delivery_status, DeliveryStatus::NotAttempted);
+    let mut submitted = CountingSubmittedDeliverer { attempts: 0 };
+    let delivered = runtime
+        .retry_delivery(job.id, &mut HeadlessDeliveryGate, &mut submitted)
+        .unwrap();
+    assert_eq!(delivered.stage, JobStage::Delivered);
+    assert_eq!(submitted.attempts, 1);
+}
+
+#[test]
 fn legacy_committed_delivery_is_read_as_submitted_and_not_recovered() {
     let directory = TempDir::new().unwrap();
     let database_path = directory.path().join("agentdictate.db");

@@ -159,14 +159,20 @@ pub trait Transcriber {
     fn transcribe(&mut self, job: &RecordingJob) -> Result<Transcript, ExternalError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeliveryDisposition {
     Submitted {
         copied_to_clipboard: bool,
         paste_triggered: bool,
     },
-    Ambiguous {
+    /// A paste shortcut was at least partly injected but its outcome is
+    /// unknown, so the text may already be in the focused application.
+    Ambiguous { copied_to_clipboard: bool },
+    /// Delivery stopped before any key was injected, so nothing reached the
+    /// focused application and pasting again is safe.
+    NotSent {
         copied_to_clipboard: bool,
+        reason: String,
     },
 }
 

@@ -483,7 +483,15 @@ fn key(vk: u16, up: bool) -> INPUT {
         },
     }
 }
+fn not_sent(copied_to_clipboard: bool, reason: impl Into<String>) -> DeliveryDisposition {
+    DeliveryDisposition::NotSent {
+        copied_to_clipboard,
+        reason: reason.into(),
+    }
+}
 impl Deliverer for SystemDeliverer {
+    /// Pastes with one injected shortcut. Every failure before any key is
+    /// injected is `NotSent`, so the text can be pasted again safely.
     fn deliver(&mut self, job: &RecordingJob) -> Result<DeliveryDisposition, ExternalError> {
         let deadline = Instant::now() + Duration::from_secs(5);
         // Wait for physical modifiers to be released; never release the user's held keys.
@@ -492,7 +500,8 @@ impl Deliverer for SystemDeliverer {
             .any(|vk| unsafe { GetAsyncKeyState(*vk as i32) } < 0)
         {
             if Instant::now() >= deadline {
-                return Err(ExternalError::new(
+                return Ok(not_sent(
+                    false,
                     "Release shortcut modifiers before pasting; the transcript remains in Recovery",
                 ));
             }
@@ -500,7 +509,7 @@ impl Deliverer for SystemDeliverer {
         }
         let target = unsafe { GetForegroundWindow() };
         if target.is_null() {
-            return Err(ExternalError::new("No focused destination window"));
+            return Ok(not_sent(false, "No focused destination window"));
         }
         let mut pid = 0;
         unsafe {
@@ -523,19 +532,26 @@ impl Deliverer for SystemDeliverer {
             }
         }
         if destination_is_ours {
-            return Err(ExternalError::new(
+            return Ok(not_sent(
+                false,
                 "Focus the destination application before stopping dictation",
             ));
         }
-        self.copy_text(&job.final_text)?;
+        if let Err(error) = self.copy_text(&job.final_text) {
+            return Ok(not_sent(
+                false,
+                format!("Could not copy the text, so nothing was pasted: {error}"),
+            ));
+        }
         if unsafe { GetForegroundWindow() } != target
             || [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
                 .iter()
                 .any(|vk| unsafe { GetAsyncKeyState(*vk as i32) } < 0)
         {
-            return Ok(DeliveryDisposition::Ambiguous {
-                copied_to_clipboard: true,
-            });
+            return Ok(not_sent(
+                true,
+                "Focus or held keys changed before pasting; the text is on the clipboard",
+            ));
         }
         let mut class = [0u16; 256];
         let size = unsafe { GetClassNameW(target, class.as_mut_ptr(), class.len() as i32) };
@@ -553,17 +569,24 @@ impl Deliverer for SystemDeliverer {
                 std::mem::size_of::<INPUT>() as i32,
             )
         };
+        if count == 0 {
+            return Ok(not_sent(
+                true,
+                format!(
+                    "Windows refused the paste keys; the text is on the clipboard: {}",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
         if count != inputs.len() as u32 {
             // Balance our own partial injection, without retrying the paste itself.
-            if count > 0 {
-                let release: Vec<INPUT> = keys.iter().rev().map(|vk| key(*vk, true)).collect();
-                unsafe {
-                    SendInput(
-                        release.len() as u32,
-                        release.as_ptr(),
-                        std::mem::size_of::<INPUT>() as i32,
-                    );
-                }
+            let release: Vec<INPUT> = keys.iter().rev().map(|vk| key(*vk, true)).collect();
+            unsafe {
+                SendInput(
+                    release.len() as u32,
+                    release.as_ptr(),
+                    std::mem::size_of::<INPUT>() as i32,
+                );
             }
             return Ok(DeliveryDisposition::Ambiguous {
                 copied_to_clipboard: true,
