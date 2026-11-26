@@ -288,16 +288,20 @@ where
             Ok(result) => result,
             Err(error) => {
                 tracing::error!(job_id = %id, %error, "dictation processing failed");
+                // The session ends first, so even a failed re-read below can
+                // never leave every later Start refused as AlreadyRecording.
+                self.active_job = None;
+                self.active_recording = None;
                 let persisted_stage = self
                     .runtime
-                    .job(id)?
+                    .job(id)
+                    .ok()
+                    .flatten()
                     .map_or(JobStage::Failed, |job| job.stage);
                 self.workflow.apply(WorkflowSignal::Interrupted {
                     job_id: id,
                     at: persisted_stage,
                 })?;
-                self.active_job = None;
-                self.active_recording = None;
                 self.recoverable_count = self.attention_recovery_count()?;
                 self.sequence += 1;
                 self.publish_overlay_update();

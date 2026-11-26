@@ -231,6 +231,19 @@ impl Runtime {
             });
         }
         self.update_stage(id, JobStage::Transcribing, None)?;
+        self.transcribe_and_deliver(id, transcriber, delivery_gate, deliverer)
+            .map_err(|error| self.fail_job(id, error))
+    }
+
+    /// Everything after the `Transcribing` checkpoint. Callers route its
+    /// errors through `fail_job` so no failure can strand the job in flight.
+    fn transcribe_and_deliver(
+        &mut self,
+        id: JobId,
+        transcriber: &mut impl Transcriber,
+        delivery_gate: &mut impl DeliveryGate,
+        deliverer: &mut impl Deliverer,
+    ) -> Result<RecordingJob, RuntimeError> {
         let transcribing = self.job(id)?.ok_or(RuntimeError::JobNotFound(id))?;
         let transcript =
             match transcriber.transcribe_checkpointed(&transcribing, &mut |raw, model| {
@@ -260,7 +273,8 @@ impl Runtime {
                     return Ok(finished);
                 }
                 Err(error) => {
-                    self.update_stage(id, JobStage::Failed, Some(error.to_string()))?;
+                    // If this write fails too, `fail_job` records the failure.
+                    let _ = self.update_stage(id, JobStage::Failed, Some(error.to_string()));
                     return Err(error.into());
                 }
             };
@@ -490,6 +504,7 @@ impl Runtime {
         let ready = self.job(id)?.expect("updated job must be readable");
         self.publish(RuntimeEvent::JobUpdated(ready.clone()));
         self.deliver_ready(ready, delivery_gate, deliverer)
+            .map_err(|error| self.fail_job(id, error))
     }
 
     /// Deletes explicit recovery data, text and audio, without exposing a
@@ -670,6 +685,36 @@ impl Runtime {
         let result = self.job(ready.id)?.expect("updated job must be readable");
         self.publish(RuntimeEvent::JobUpdated(result.clone()));
         Ok(result)
+    }
+
+    /// Records `error` on a job that a failed step left in flight, applying
+    /// the daemon-start rules to this one job: transcribing or cleaning
+    /// becomes failed and keeps its raw transcript, and a started paste
+    /// attempt becomes ambiguous so it is never replayed. A job at a safe
+    /// checkpoint, such as a gate-blocked ready one, is left as it is. If even
+    /// this write fails, the returned error says so and the next daemon start
+    /// reconciles the job instead.
+    fn fail_job(&self, id: JobId, error: RuntimeError) -> RuntimeError {
+        let recorded = self.connection.execute(
+            r#"
+            UPDATE dictation_jobs
+            SET state = 'failed', stage = 'failed', updated_at = ?1, error_message = ?2,
+                delivery_status = CASE delivery_status
+                    WHEN 'attempting' THEN 'ambiguous'
+                    ELSE delivery_status
+                END
+            WHERE runtime_id = ?3
+              AND (stage IN ('transcribing', 'cleaning') OR delivery_status = 'attempting')
+            "#,
+            params![timestamp(Utc::now()), error.to_string(), id.to_string()],
+        );
+        match recorded {
+            Ok(_) => error,
+            Err(record_error) => RuntimeError::FailureNotRecorded {
+                error: Box::new(error),
+                record_error,
+            },
+        }
     }
 
     fn mark_delivery_ambiguous(

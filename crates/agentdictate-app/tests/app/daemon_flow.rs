@@ -364,6 +364,65 @@ fn stop_capture_checkpoint_failure_clears_the_session_and_preserves_audio() {
 }
 
 #[test]
+fn failure_after_transcription_leaves_a_failed_recovery_and_allows_the_next_start() {
+    let directory = tempdir().unwrap();
+    let paths = app_paths(directory.path());
+    std::fs::create_dir_all(paths.database_file.parent().unwrap()).unwrap();
+    let runtime = Runtime::open(&paths.database_file).unwrap();
+    let mut daemon = Daemon::new(
+        runtime,
+        Settings::default(),
+        paths.clone(),
+        PreservingRecorder::default(),
+        FixedTranscriber,
+        SubmittedDelivery::default(),
+    );
+    let started = daemon.start_recording().unwrap();
+    let connection = rusqlite::Connection::open(&paths.database_file).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            CREATE TRIGGER reject_ready_checkpoint
+            BEFORE UPDATE OF stage ON dictation_jobs
+            WHEN NEW.stage = 'ready_to_deliver'
+            BEGIN
+                SELECT RAISE(FAIL, 'ready checkpoint unavailable');
+            END;
+            "#,
+        )
+        .unwrap();
+
+    let error = daemon.stop_recording().unwrap_err();
+
+    assert!(error.to_string().contains("ready checkpoint unavailable"));
+    assert_eq!(daemon.deliverer().attempts, 0);
+    assert!(matches!(
+        daemon.snapshot().workflow.phase,
+        WorkflowPhase::NeedsAttention {
+            job_id,
+            at: JobStage::Failed,
+        } if job_id == started.id
+    ));
+    assert_eq!(daemon.snapshot().recoverable_count, 1);
+    let failed = Runtime::open_observer(&paths.database_file)
+        .unwrap()
+        .job(started.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.stage, JobStage::Failed);
+    assert_eq!(failed.raw_transcript, "raw transcript");
+
+    let next = daemon.start_recording().unwrap();
+    assert_ne!(next.id, started.id);
+    daemon.discard_recording().unwrap();
+    connection
+        .execute_batch("DROP TRIGGER reject_ready_checkpoint")
+        .unwrap();
+    let delivered = daemon.retry_transcription(started.id).unwrap();
+    assert_eq!(delivered.stage, JobStage::Delivered);
+}
+
+#[test]
 fn escape_discards_audio_and_returns_ready_even_when_audio_retention_is_enabled() {
     let directory = tempdir().unwrap();
     let paths = app_paths(directory.path());

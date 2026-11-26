@@ -605,6 +605,102 @@ fn delivery_that_fails_before_any_paste_stays_ready_and_can_be_retried() {
 }
 
 #[test]
+fn failure_after_the_transcribing_checkpoint_marks_the_job_failed_and_retryable() {
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("agentdictate.db");
+    let mut runtime = Runtime::open(&database_path).unwrap();
+    let audio_path = directory.path().join("recordings/ready-write-fails.wav");
+    std::fs::create_dir_all(audio_path.parent().unwrap()).unwrap();
+    std::fs::write(&audio_path, b"audio").unwrap();
+    let job = runtime
+        .start_recording(
+            request(&audio_path, TRANSCRIPTION_MODEL),
+            &mut crate::support::ReadyRecorder,
+        )
+        .unwrap();
+    runtime.capture_recording(job.id, 2.0).unwrap();
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            CREATE TRIGGER reject_ready_checkpoint
+            BEFORE UPDATE OF stage ON dictation_jobs
+            WHEN NEW.stage = 'ready_to_deliver'
+            BEGIN
+                SELECT RAISE(FAIL, 'ready checkpoint unavailable');
+            END;
+            "#,
+        )
+        .unwrap();
+    let mut deliverer = CountingSubmittedDeliverer { attempts: 0 };
+
+    let error = runtime
+        .process_captured(
+            job.id,
+            &mut FixedTranscriber,
+            &mut HeadlessDeliveryGate,
+            &mut deliverer,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("ready checkpoint unavailable"));
+    assert_eq!(deliverer.attempts, 0);
+    let failed = runtime.job(job.id).unwrap().unwrap();
+    assert_eq!(failed.stage, JobStage::Failed);
+    assert_eq!(failed.delivery_status, DeliveryStatus::NotAttempted);
+    assert_eq!(failed.raw_transcript, "durable raw words");
+    assert!(
+        runtime
+            .recovery_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.job_id == job.id)
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER reject_ready_checkpoint")
+        .unwrap();
+    let delivered = runtime
+        .retry_transcription(
+            job.id,
+            &mut FixedTranscriber,
+            &mut HeadlessDeliveryGate,
+            &mut deliverer,
+        )
+        .unwrap();
+    assert_eq!(delivered.stage, JobStage::Delivered);
+    assert_eq!(deliverer.attempts, 1);
+}
+
+#[test]
+fn a_gate_blocked_ready_job_is_not_marked_failed() {
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("agentdictate.db");
+    let mut runtime = Runtime::open(&database_path).unwrap();
+    let job = runtime
+        .start_recording(
+            request(
+                &directory.path().join("recordings/gate-blocked.wav"),
+                TRANSCRIPTION_MODEL,
+            ),
+            &mut crate::support::ReadyRecorder,
+        )
+        .unwrap();
+    runtime.capture_recording(job.id, 2.0).unwrap();
+    runtime
+        .process_captured(
+            job.id,
+            &mut FixedTranscriber,
+            &mut FailingDeliveryGate,
+            &mut CountingSubmittedDeliverer { attempts: 0 },
+        )
+        .unwrap_err();
+    let blocked = runtime.job(job.id).unwrap().unwrap();
+    assert_eq!(blocked.stage, JobStage::ReadyToDeliver);
+    assert_eq!(blocked.delivery_status, DeliveryStatus::NotAttempted);
+}
+
+#[test]
 fn legacy_committed_delivery_is_read_as_submitted_and_not_recovered() {
     let directory = TempDir::new().unwrap();
     let database_path = directory.path().join("agentdictate.db");
