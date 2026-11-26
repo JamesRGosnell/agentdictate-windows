@@ -11,6 +11,7 @@ use std::{
 use thiserror::Error;
 use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*, System::Pipes::*};
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const ACCEPT_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 #[derive(Debug, Error)]
 pub enum IpcError {
     #[error("IPC I/O failed: {0}")]
@@ -102,6 +103,20 @@ impl IpcServer {
         if unsafe { ConnectNamedPipe(pending.as_raw_handle(), std::ptr::null_mut()) } == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+                // A client that opened and closed the pipe before this call
+                // (ERROR_NO_DATA) leaves the instance closing, and every later
+                // ConnectNamedPipe fails the same way. Disconnecting returns it
+                // to listening. Any other failure gets a fresh instance and a
+                // short pause, so a persistent error cannot spin the caller.
+                // SAFETY: pending still owns the live server handle.
+                unsafe { DisconnectNamedPipe(pending.as_raw_handle()) };
+                if error.raw_os_error() != Some(ERROR_NO_DATA as i32) {
+                    if let Ok(next) = create_pipe(&self.name, false) {
+                        *pending = next;
+                    }
+                    drop(pending);
+                    std::thread::sleep(ACCEPT_FAILURE_BACKOFF);
+                }
                 return Err(error);
             }
         }
@@ -257,5 +272,74 @@ fn check_version(received: u16) -> Result<(), IpcError> {
             received,
             expected: PROTOCOL_VERSION,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    struct RejectingHandler;
+
+    impl IpcHandler for RejectingHandler {
+        fn snapshot(&self, request_id: u64) -> ServerMessage {
+            ServerMessage::command_rejected(request_id, "test server")
+        }
+
+        fn handle(&mut self, _command: ClientCommand) -> ServerMessage {
+            ServerMessage::command_rejected(0, "test server")
+        }
+    }
+
+    #[test]
+    fn a_client_that_closes_before_accept_does_not_wedge_the_server() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let runtime = directory.path().join("runtime");
+        let server = IpcServer::bind(&runtime).unwrap();
+
+        // Open and close the pipe before the server reaches ConnectNamedPipe.
+        let name = pipe_name(&runtime);
+        // SAFETY: terminated name and no inherited handle; the File below
+        // takes sole ownership and closes it at once.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            handle,
+            INVALID_HANDLE_VALUE,
+            "{}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: the handle was just opened and nothing else owns it.
+        drop(unsafe { File::from_raw_handle(handle) });
+
+        let (served, outcome) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut handler = RejectingHandler;
+            for _ in 0..5 {
+                if server.serve_next(&mut handler).is_ok() {
+                    let _ = served.send(true);
+                    return;
+                }
+            }
+            let _ = served.send(false);
+        });
+
+        let (client, initial) = IpcClient::connect(&runtime).unwrap();
+        assert!(matches!(
+            initial.kind,
+            agentdictate_core::ServerMessageKind::CommandRejected { .. }
+        ));
+        drop(client);
+        assert_eq!(outcome.recv_timeout(Duration::from_secs(10)), Ok(true));
     }
 }

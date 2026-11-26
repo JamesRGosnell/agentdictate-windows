@@ -11,7 +11,8 @@ use agentdictate_app::{
 use agentdictate_core::{ClientCommand, ServerMessageKind};
 #[cfg(unix)]
 use agentdictate_runtime::IpcClient;
-use agentdictate_runtime::IpcServer;
+use agentdictate_runtime::{IpcHandler, IpcServer};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,18 +84,24 @@ fn run_daemon(paths: AppPaths) -> anyhow::Result<()> {
         }
     };
     let show_tray_icon = process.show_tray_icon();
-    let process = Arc::new(Mutex::new(process));
+    let quitting = Arc::new(AtomicBool::new(false));
+    let process = Arc::new(Mutex::new(QuitSignallingHandler {
+        process,
+        quitting: Arc::clone(&quitting),
+        runtime: runtime.clone(),
+    }));
     let ipc_thread = std::thread::Builder::new()
         .name("agentdictate-ipc".into())
         .spawn(move || {
             loop {
-                match process.lock() {
-                    Ok(process) if process.should_quit() => break,
-                    Ok(_) => {}
-                    Err(_) => {
-                        tracing::error!("daemon process lock is poisoned");
-                        break;
-                    }
+                // Never lock the process here: a long command (a
+                // transcription) holds it, and no client could connect.
+                if quitting.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                if process.is_poisoned() {
+                    tracing::error!("daemon process lock is poisoned");
+                    break;
                 }
                 if let Err(error) = server.serve_next_concurrent(Arc::clone(&process)) {
                     tracing::warn!(%error, "could not accept IPC session");
@@ -133,6 +140,33 @@ fn run_daemon(paths: AppPaths) -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("overlay presenter thread panicked"))?;
     }
     Ok(())
+}
+
+/// Serves daemon IPC and raises `quitting` once a command made the process
+/// quit, so the accept loop checks for quit without the process lock.
+struct QuitSignallingHandler {
+    process: AgentProcess,
+    quitting: Arc<AtomicBool>,
+    runtime: std::path::PathBuf,
+}
+
+impl IpcHandler for QuitSignallingHandler {
+    fn snapshot(&self, request_id: u64) -> agentdictate_core::ServerMessage {
+        self.process.snapshot(request_id)
+    }
+
+    fn handle(
+        &mut self,
+        command: agentdictate_core::ClientCommand,
+    ) -> agentdictate_core::ServerMessage {
+        let response = self.process.handle(command);
+        if self.process.should_quit() && !self.quitting.swap(true, AtomicOrdering::AcqRel) {
+            // The process already woke the accept loop, possibly before this
+            // flag was raised; wake it again so it is sure to see the flag.
+            let _ = agentdictate_runtime::IpcClient::wake(&self.runtime);
+        }
+        response
+    }
 }
 
 #[cfg(unix)]
