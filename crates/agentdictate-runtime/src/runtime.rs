@@ -1,14 +1,15 @@
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use agentdictate_core::apply_replacements;
 use chrono::Utc;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::history::serialize_replacements;
 use crate::history_search;
@@ -53,6 +54,36 @@ impl Runtime {
             subscribers: Vec::new(),
             history_search_cache: RefCell::new(history_search::SearchCache::default()),
         })
+    }
+
+    /// Opens the daemon's database like `open`. A file SQLite reports as
+    /// corrupt or not a database is moved aside to `<file>.corrupt-<unix
+    /// secs>`, with its `-wal` and `-shm` files, and a fresh database takes
+    /// its place, so dictation keeps working. Returns where the file went.
+    pub fn open_or_set_aside(
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, Option<PathBuf>), RuntimeError> {
+        let path = path.as_ref();
+        match Self::open(path) {
+            Ok(runtime) => Ok((runtime, None)),
+            Err(RuntimeError::Database(rusqlite::Error::SqliteFailure(failure, _)))
+                if matches!(
+                    failure.code,
+                    ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
+                ) =>
+            {
+                let set_aside = suffixed(path, &format!(".corrupt-{}", Utc::now().timestamp()));
+                for companion in ["", "-wal", "-shm"] {
+                    match fs::rename(suffixed(path, companion), suffixed(&set_aside, companion)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Ok((Self::open(path)?, Some(set_aside)))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Opens a read-only view without running startup reconciliation.
@@ -823,6 +854,13 @@ impl Runtime {
     }
 }
 
+/// `path` with `suffix` appended to its file name.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// Configures every connection that writes. WAL lets readers proceed while
 /// another connection writes. FULL keeps delivery checkpoints durable across
 /// power loss, so a submitted paste never becomes safely retryable again.
@@ -1048,6 +1086,30 @@ fn reconcile_interrupted_jobs(connection: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn garbage_database_is_set_aside_and_a_fresh_one_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("agentdictate.sqlite");
+        let garbage = b"not a database, only garbage bytes, long enough to read";
+        fs::write(&database, garbage).unwrap();
+
+        let (runtime, set_aside) = Runtime::open_or_set_aside(&database).unwrap();
+
+        let set_aside = set_aside.expect("the unreadable file is set aside");
+        assert!(
+            set_aside
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("agentdictate.sqlite.corrupt-")
+        );
+        assert_eq!(fs::read(&set_aside).unwrap(), garbage);
+        assert!(runtime.recovery_entries().unwrap().is_empty());
+        drop(runtime);
+        let (_, again) = Runtime::open_or_set_aside(&database).unwrap();
+        assert!(again.is_none());
+    }
 
     #[test]
     fn writers_reserve_the_write_lock_while_observers_keep_reading() {

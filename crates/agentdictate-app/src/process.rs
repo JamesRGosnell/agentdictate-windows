@@ -71,7 +71,13 @@ impl AgentProcess {
         let mut settings = load_settings(&paths.config_file)?;
         let own_api_key = settings.openai_api_key.trim().to_owned();
         settings.openai_api_key = effective_api_key(&own_api_key, &paths.config_file);
-        let runtime = Runtime::open(&paths.database_file)?;
+        let (runtime, set_aside) = Runtime::open_or_set_aside(&paths.database_file)?;
+        if let Some(set_aside) = set_aside {
+            tracing::error!(
+                set_aside = %set_aside.display(),
+                "the history database could not be read; it was set aside and a new one started"
+            );
+        }
         runtime.reconcile_recovery_deletions(&paths.recordings)?;
         let model_catalog = ModelCatalog::open(&paths.cache, &settings.openai_api_key);
         let speech = SpeechRouter::new(
