@@ -60,16 +60,48 @@ pub enum RuntimeError {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ExternalError {
     #[error("{message}")]
-    Failure { message: String },
+    Failure {
+        message: String,
+        kind: ExternalFailureKind,
+    },
     #[error("No speech detected.")]
     NoSpeech,
+}
+
+/// What the user can do about a failed external operation, when its source
+/// knows. Only the dictation notice reads it; the message stays the record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExternalFailureKind {
+    #[default]
+    Other,
+    /// The service needs a sign-in or a valid API key.
+    SignInRequired,
+    /// The service's usage or rate limit was reached.
+    LimitReached,
+    /// The audio was not silent, but no speech was recognized in it.
+    NothingRecognized,
 }
 
 impl ExternalError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(ExternalFailureKind::Other, message)
+    }
+
+    #[must_use]
+    pub fn with_kind(kind: ExternalFailureKind, message: impl Into<String>) -> Self {
         Self::Failure {
             message: message.into(),
+            kind,
+        }
+    }
+
+    /// The failure's kind; `None` for `NoSpeech`.
+    #[must_use]
+    pub const fn failure_kind(&self) -> Option<ExternalFailureKind> {
+        match self {
+            Self::Failure { kind, .. } => Some(*kind),
+            Self::NoSpeech => None,
         }
     }
 }

@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agentdictate_core::{DictationOptions, JobId};
-use agentdictate_runtime::{ExternalError, RecordingJob};
+use agentdictate_runtime::{ExternalError, ExternalFailureKind, RecordingJob};
 use base64::Engine as _;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -114,6 +114,29 @@ enum CodexSubscriptionError {
     InvalidResponse,
     #[error("No speech detected.")]
     EmptyTranscript,
+}
+
+impl CodexSubscriptionError {
+    /// What the user can do about this failure, for the dictation notice.
+    const fn failure_kind(&self) -> ExternalFailureKind {
+        match self {
+            Self::ChatGptSignInRequired
+            | Self::ChatGptTokenUnavailable
+            | Self::MissingAccountId
+            | Self::Unauthorized => ExternalFailureKind::SignInRequired,
+            Self::RateLimited => ExternalFailureKind::LimitReached,
+            Self::EmptyTranscript => ExternalFailureKind::NothingRecognized,
+            Self::AppServerUnavailable
+            | Self::AppServerTimeout
+            | Self::InvalidAuthResponse
+            | Self::AudioRead(_)
+            | Self::Transport(_)
+            | Self::NotEntitled
+            | Self::ServiceUnavailable
+            | Self::RequestRejected
+            | Self::InvalidResponse => ExternalFailureKind::Other,
+        }
+    }
 }
 
 fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
@@ -477,7 +500,7 @@ impl SpeechTransport for CodexSubscriptionTransport {
         }
         self.transcribe(&request).map_err(|error| match error {
             CodexSubscriptionError::EmptyTranscript => ExternalError::NoSpeech,
-            error => ExternalError::new(error.to_string()),
+            error => ExternalError::with_kind(error.failure_kind(), error.to_string()),
         })
     }
 }

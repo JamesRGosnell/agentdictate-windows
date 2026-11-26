@@ -5,7 +5,9 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use agentdictate_core::{JobId, ReasoningEffort, Settings, TranscriptionProvider};
-use agentdictate_runtime::{ExternalError, RecordingJob, Transcriber, Transcript};
+use agentdictate_runtime::{
+    ExternalError, ExternalFailureKind, RecordingJob, Transcriber, Transcript,
+};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -511,7 +513,8 @@ impl<S: SpeechTransport, C: CleanupTransport> Transcriber for TranscriptionPipel
                 Err(ExternalError::NoSpeech)
                     if !crate::captured_audio::is_near_silent(&job.audio_path) =>
                 {
-                    return Err(ExternalError::new(
+                    return Err(ExternalError::with_kind(
+                        ExternalFailureKind::NothingRecognized,
                         "No speech was recognized. Audio is saved for another attempt.",
                     ));
                 }
@@ -522,7 +525,10 @@ impl<S: SpeechTransport, C: CleanupTransport> Transcriber for TranscriptionPipel
             return Err(if crate::captured_audio::is_near_silent(&job.audio_path) {
                 ExternalError::NoSpeech
             } else {
-                ExternalError::new("Transcription returned an empty result; audio is saved")
+                ExternalError::with_kind(
+                    ExternalFailureKind::NothingRecognized,
+                    "Transcription returned an empty result; audio is saved",
+                )
             });
         }
         checkpoint(
@@ -626,7 +632,8 @@ impl ReqwestOpenAiTransport {
 
     fn authorization(&self) -> Result<String, ExternalError> {
         if self.api_key.is_empty() {
-            return Err(ExternalError::new(
+            return Err(ExternalError::with_kind(
+                ExternalFailureKind::SignInRequired,
                 "OpenAI API key missing. Paste your API key in AgentDictate settings.",
             ));
         }
@@ -691,7 +698,10 @@ impl ReqwestOpenAiTransport {
 
     fn response_error(status: StatusCode, body: &str) -> ExternalError {
         if status == StatusCode::UNAUTHORIZED {
-            return ExternalError::new("OpenAI authentication failed. Check your API key.");
+            return ExternalError::with_kind(
+                ExternalFailureKind::SignInRequired,
+                "OpenAI authentication failed. Check your API key.",
+            );
         }
         let message = serde_json::from_str::<Value>(body)
             .ok()
@@ -714,9 +724,16 @@ impl ReqwestOpenAiTransport {
                 | StatusCode::SERVICE_UNAVAILABLE
                 | StatusCode::GATEWAY_TIMEOUT
         ) {
-            return ExternalError::new(format!(
-                "Could not reach OpenAI or the request was not accepted: {message}"
-            ));
+            // 429 is both the rate limit and an exhausted quota.
+            let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                ExternalFailureKind::LimitReached
+            } else {
+                ExternalFailureKind::Other
+            };
+            return ExternalError::with_kind(
+                kind,
+                format!("Could not reach OpenAI or the request was not accepted: {message}"),
+            );
         }
         ExternalError::new(if message.is_empty() {
             format!("OpenAI request failed with status {status}")

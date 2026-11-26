@@ -14,6 +14,7 @@ mod hotkey_dispatch;
 mod live_transcription;
 mod meetings;
 mod model_catalog;
+mod notice;
 mod openai;
 mod overlay_process;
 mod process;
@@ -45,6 +46,7 @@ pub use diagnostics::init_file_logging;
 pub use hotkey_dispatch::{
     HotkeyActionOutcome, HotkeyDispatchGate, HotkeyIgnoreReason, start_hotkey_listener,
 };
+pub use notice::{DictationEnd, Notice, classify_message, dictation_notice};
 pub use openai::{
     CleanupRequest, CleanupTransport, ReqwestOpenAiTransport, SpeechRouter, SpeechTransport,
     TranscriptionPipeline, TranscriptionRequest,

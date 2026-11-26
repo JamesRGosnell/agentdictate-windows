@@ -3,6 +3,7 @@
 mod copilot;
 mod costs;
 mod dictation;
+mod notice;
 mod protocol;
 mod replacements;
 mod settings;
@@ -14,6 +15,7 @@ mod workflow;
 pub use copilot::*;
 pub use costs::*;
 pub use dictation::*;
+pub use notice::*;
 pub use protocol::*;
 pub use replacements::*;
 pub use settings::*;
