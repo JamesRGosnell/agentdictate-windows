@@ -63,6 +63,13 @@ impl Transcriber for Unused {
         panic!("startup must not transcribe");
     }
 }
+impl crate::ProcessingTranscriber for Unused {
+    type Job = Self;
+
+    fn for_job(&mut self, _: &RecordingJob) -> Self {
+        Self
+    }
+}
 impl Deliverer for Unused {
     fn deliver(&mut self, _: &RecordingJob) -> Result<DeliveryDisposition, ExternalError> {
         panic!("startup must not paste");

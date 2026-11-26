@@ -6,7 +6,9 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 
-use agentdictate_app::{AppPaths, CapturedRecording, Daemon, RecordingController};
+use agentdictate_app::{
+    AppPaths, CapturedRecording, Daemon, ProcessingTranscriber, RecordingController,
+};
 use agentdictate_core::{HistoryPageRequest, HotkeyReadiness, JobStage, Settings, WorkflowPhase};
 use agentdictate_runtime::{
     Deliverer, DeliveryDisposition, ExternalError, FocusedWindow, HistoryQuery, Recorder,
@@ -87,6 +89,11 @@ fn empty_dictation_finishes_without_delivery_history_or_recovery_and_allows_the_
             panic!("an accidental tap must not be uploaded")
         }
     }
+    impl agentdictate_app::JobTransport for Empty {
+        fn for_job(&mut self, _: &RecordingJob) -> Self {
+            Self
+        }
+    }
     impl agentdictate_app::CleanupTransport for Empty {
         fn cleanup_text(
             &mut self,
@@ -126,7 +133,7 @@ fn empty_dictation_finishes_without_delivery_history_or_recovery_and_allows_the_
         SubmittedDelivery::default(),
     );
     daemon.start_recording().unwrap();
-    let finished = daemon.stop_recording().unwrap();
+    let finished = daemon.stop_recording_and_wait().unwrap();
     assert_eq!(finished.stage, JobStage::NoSpeech);
     assert_eq!(daemon.snapshot().workflow.phase, WorkflowPhase::Ready);
     assert_eq!(daemon.snapshot().recoverable_count, 0);
@@ -183,7 +190,18 @@ const BROWSER: FocusedWindow = FocusedWindow {
 
 /// The desktop's focused window, shared by the fakes so transcription can
 /// move it the way a user switching windows would.
-type SharedFocus = std::rc::Rc<std::cell::Cell<Option<FocusedWindow>>>;
+#[derive(Clone, Default)]
+struct SharedFocus(std::sync::Arc<std::sync::Mutex<Option<FocusedWindow>>>);
+
+impl SharedFocus {
+    fn set(&self, window: Option<FocusedWindow>) {
+        *self.0.lock().unwrap() = window;
+    }
+
+    fn get(&self) -> Option<FocusedWindow> {
+        *self.0.lock().unwrap()
+    }
+}
 
 /// Moves the focus to the browser while the transcript is produced.
 struct FocusMovingTranscriber(SharedFocus);
@@ -192,6 +210,14 @@ impl Transcriber for FocusMovingTranscriber {
     fn transcribe(&mut self, job: &RecordingJob) -> Result<Transcript, ExternalError> {
         self.0.set(Some(BROWSER));
         FixedTranscriber.transcribe(job)
+    }
+}
+
+impl ProcessingTranscriber for FocusMovingTranscriber {
+    type Job = Self;
+
+    fn for_job(&mut self, _: &RecordingJob) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -252,7 +278,7 @@ fn delivery_receives_the_window_focused_at_stop_and_a_retry_receives_none() {
 
     daemon.start_recording().unwrap();
     focus.set(Some(EDITOR));
-    let stopped = daemon.stop_recording().unwrap();
+    let stopped = daemon.stop_recording_and_wait().unwrap();
     // The focus moved to the browser during transcription; delivery still
     // gets the editor the user stopped in.
     assert_eq!(focus.get(), Some(BROWSER));
@@ -293,7 +319,7 @@ fn daemon_checkpoints_audio_before_capture_and_transcript_before_delivery() {
     assert_eq!(daemon.snapshot().recoverable_count, 0);
     assert!(daemon.workspace_snapshot().unwrap().recoveries.is_empty());
 
-    let delivered = daemon.stop_recording().unwrap();
+    let delivered = daemon.stop_recording_and_wait().unwrap();
 
     assert_eq!(delivered.stage, JobStage::Delivered);
     assert_eq!(delivered.raw_transcript, "raw transcript");
@@ -356,7 +382,7 @@ fn daemon_waits_for_overlay_exit_before_delivery() {
     daemon.set_overlay_controller(overlay);
 
     let started = daemon.start_recording().unwrap();
-    let delivered = daemon.stop_recording().unwrap();
+    let delivered = daemon.stop_recording_and_wait().unwrap();
 
     assert_eq!(delivered.stage, JobStage::Delivered);
     assert!(daemon.deliverer().delivered_after_exit);
@@ -503,7 +529,7 @@ fn failure_after_transcription_leaves_a_failed_recovery_and_allows_the_next_star
         )
         .unwrap();
 
-    let error = daemon.stop_recording().unwrap_err();
+    let error = daemon.stop_recording_and_wait().unwrap_err();
 
     assert!(error.to_string().contains("ready checkpoint unavailable"));
     assert_eq!(daemon.deliverer().attempts, 0);
@@ -572,7 +598,7 @@ fn deleting_another_recovery_item_keeps_a_live_recording_stoppable() {
         WorkflowPhase::Recording { job_id } if job_id == live.id
     ));
     assert_eq!(daemon.snapshot().recoverable_count, 0);
-    let delivered = daemon.stop_recording().unwrap();
+    let delivered = daemon.stop_recording_and_wait().unwrap();
     assert_eq!(delivered.stage, JobStage::Delivered);
     assert_eq!(daemon.recorder().finish_attempts, 1);
     assert_eq!(daemon.snapshot().workflow.phase, WorkflowPhase::Ready);
@@ -1042,7 +1068,8 @@ mod notices {
     use std::sync::{Arc, Mutex, mpsc::Receiver};
 
     use agentdictate_app::{
-        AppPaths, Daemon, Notice, OverlayUpdate, RecordingController, overlay_update_recorder,
+        AppPaths, Daemon, Notice, OverlayUpdate, ProcessingTranscriber, RecordingController,
+        overlay_update_recorder,
     };
     use agentdictate_core::{DictationNotice, Settings};
     use agentdictate_runtime::{
@@ -1062,6 +1089,13 @@ mod notices {
             ))
         }
     }
+    impl ProcessingTranscriber for LimitedTranscriber {
+        type Job = Self;
+
+        fn for_job(&mut self, _: &RecordingJob) -> Self {
+            Self
+        }
+    }
 
     struct Observed<R, T, D> {
         daemon: Daemon<R, T, D>,
@@ -1070,7 +1104,12 @@ mod notices {
         _directory: TempDir,
     }
 
-    impl<R: RecordingController, T: Transcriber, D: Deliverer> Observed<R, T, D> {
+    impl<R, T, D> Observed<R, T, D>
+    where
+        R: RecordingController,
+        T: ProcessingTranscriber,
+        D: Deliverer + Send + 'static,
+    {
         fn new(recorder: R, transcriber: T, deliverer: D) -> Self {
             let directory = tempdir().unwrap();
             let paths: AppPaths = app_paths(directory.path());
@@ -1121,7 +1160,7 @@ mod notices {
             SubmittedDelivery::default(),
         );
         failing.daemon.start_recording().unwrap();
-        failing.daemon.stop_recording().unwrap_err();
+        failing.daemon.stop_recording_and_wait().unwrap_err();
         assert_eq!(failing.pill_notices(), vec![DictationNotice::LimitReached]);
         let sent = failing.sent();
         assert_eq!(sent.len(), 1);
@@ -1140,7 +1179,7 @@ mod notices {
             SubmittedDelivery::default(),
         );
         pasting.daemon.start_recording().unwrap();
-        pasting.daemon.stop_recording().unwrap();
+        pasting.daemon.stop_recording_and_wait().unwrap();
         assert!(pasting.pill_notices().is_empty());
         assert!(pasting.sent().is_empty());
     }
@@ -1153,7 +1192,7 @@ mod notices {
             SubmittedDelivery::default(),
         );
         let failed = observed.daemon.start_recording().unwrap();
-        observed.daemon.stop_recording().unwrap_err();
+        observed.daemon.stop_recording_and_wait().unwrap_err();
         assert_eq!(observed.pill_notices().len(), 1);
         observed.sent();
 

@@ -86,6 +86,16 @@ the desktop app watches the SQLite database and the model-catalog cache file
 with inotify and refreshes its workspace when they change, so writes made by
 the daemon appear without polling or debounce delays.
 
+The daemon serves every command under one lock, and a command holds it only
+for bounded work. Stopping a recording returns once the captured audio is
+checkpointed; the dictation is then transcribed, cleaned and pasted on one
+processing worker with its own database connection, in the order dictations
+were stopped. The next recording can start while an earlier dictation is
+processed: the overlay and snapshots follow the newest dictation, and an
+earlier one still pastes into the window it was stopped in, or announces why
+it did not. Quitting gives stopped dictations three seconds to paste; what is
+left waits in Recovery.
+
 ## Text Delivery Pipeline
 
 After transcription, the daemon delivers text to the focused application:

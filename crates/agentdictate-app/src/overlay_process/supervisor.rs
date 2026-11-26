@@ -369,7 +369,7 @@ pub const OVERLAY_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The Windows overlay window is created `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`,
 /// so it cannot become the paste target even while its process lingers.
-const OVERLAY_CANNOT_TAKE_FOCUS: bool = cfg!(windows);
+pub(crate) const OVERLAY_CANNOT_TAKE_FOCUS: bool = cfg!(windows);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayProcessAction {

@@ -8,6 +8,7 @@ pub use helper::is_overlay_helper_argument;
 #[cfg(feature = "desktop")]
 pub use helper::run_overlay_helper;
 pub use protocol::{ActiveRecordingUpdate, OverlayUpdate};
+pub(crate) use supervisor::OVERLAY_CANNOT_TAKE_FOCUS;
 pub use supervisor::{
     OVERLAY_HEALTH_FILE, OVERLAY_TEARDOWN_TIMEOUT, OverlayController, OverlayProcessAction,
     OverlayProcessState, OverlayTeardownError, overlay_update_recorder, start_overlay_presenter,

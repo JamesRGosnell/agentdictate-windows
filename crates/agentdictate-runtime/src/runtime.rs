@@ -778,6 +778,13 @@ impl Runtime {
         }
     }
 
+    /// `fail_job` for a caller whose own step failed outside the runtime,
+    /// such as a processing thread that panicked: the job never stays in
+    /// flight, and a started paste attempt is never replayed.
+    pub fn fail_in_flight_job(&self, id: JobId, error: RuntimeError) -> RuntimeError {
+        self.fail_job(id, error)
+    }
+
     fn mark_delivery_ambiguous(
         &self,
         id: JobId,

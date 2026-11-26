@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agentdictate_app::{CapturedRecording, RecordingController};
+use agentdictate_app::{CapturedRecording, ProcessingTranscriber, RecordingController};
 use agentdictate_core::JobStage;
 use agentdictate_runtime::{
     ExternalError, Recorder, RecordingJob, Runtime, Transcriber, Transcript,
@@ -41,6 +41,14 @@ impl Transcriber for FixedTranscriber {
             cleaned_text: Some("Final transcript.".into()),
             cleanup_error: None,
         })
+    }
+}
+
+impl ProcessingTranscriber for FixedTranscriber {
+    type Job = Self;
+
+    fn for_job(&mut self, _: &RecordingJob) -> Self {
+        Self
     }
 }
 

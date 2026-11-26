@@ -2,6 +2,8 @@
 mod codex_subscription_live;
 #[path = "app/daemon_flow.rs"]
 mod daemon_flow;
+#[path = "app/daemon_processing.rs"]
+mod daemon_processing;
 #[path = "app/diagnostics.rs"]
 mod diagnostics;
 #[path = "app/hotkey_dispatch.rs"]

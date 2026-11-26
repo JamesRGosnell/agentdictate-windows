@@ -2,8 +2,8 @@ use std::sync::{Arc, RwLock};
 use std::{io, path::PathBuf};
 
 use agentdictate_core::{
-    ClientCommand, ClientCommandKind, ClientCommandTag, HotkeyReadiness, ProcessingStage,
-    ServerMessage, Settings, WorkflowPhase, WorkflowSnapshot,
+    ClientCommand, ClientCommandKind, ClientCommandTag, HotkeyReadiness, ServerMessage, Settings,
+    WorkflowPhase,
 };
 use agentdictate_linux::hotkey::{HotkeySignal, HotkeySpec};
 use agentdictate_runtime::{
@@ -13,10 +13,9 @@ use agentdictate_runtime::{
 
 use crate::model_catalog::ModelCatalog;
 use crate::{
-    AppPaths, CodexSubscriptionTransport, Daemon, OverlayController, OverlayUpdate,
-    ReqwestOpenAiTransport, SpeechRouter, SystemDeliverer, SystemRecordingController,
-    TranscriptionPipeline, chatgpt_dictation_import::start_chatgpt_dictation_importer,
-    sync_startup_with_systemctl,
+    AppPaths, CodexSubscriptionTransport, Daemon, OverlayController, ReqwestOpenAiTransport,
+    SpeechRouter, SystemDeliverer, SystemRecordingController, TranscriptionPipeline,
+    chatgpt_dictation_import::start_chatgpt_dictation_importer, sync_startup_with_systemctl,
 };
 
 pub type ProductionTranscriber = TranscriptionPipeline<
@@ -89,15 +88,23 @@ impl AgentProcess {
         let recorder = SystemRecordingController::for_system(&settings, &paths.runtime);
         let deliverer = SystemDeliverer::for_environment(&settings.paste_shortcut);
         let history_index_maintenance = HistoryIndexMaintenance::new();
+        let mut daemon = Daemon::new(
+            runtime,
+            settings,
+            paths.clone(),
+            recorder,
+            transcriber,
+            deliverer,
+        );
+        // Shows the cleaning stage, which the pipeline reaches while it
+        // transcribes on the processing worker.
+        let cleanup_started = daemon.cleanup_started_observer();
+        daemon
+            .transcriber_mut()
+            .set_cleanup_started_observer(cleanup_started);
+        daemon.set_history_maintenance(history_index_maintenance.clone());
         Ok(Self {
-            daemon: Daemon::new(
-                runtime,
-                settings,
-                paths.clone(),
-                recorder,
-                transcriber,
-                deliverer,
-            ),
+            daemon,
             config_file: paths.config_file,
             autostart_file: paths.autostart_file,
             daemon_service_file: paths.daemon_service_file,
@@ -140,25 +147,6 @@ impl AgentProcess {
     }
 
     pub fn set_overlay_controller(&mut self, controller: OverlayController) {
-        // The transcription pipeline blocks the daemon while it transcribes
-        // and cleans, so the workflow cannot signal the cleaning stage from
-        // there. Push the overlay presentation for it directly instead; the
-        // daemon's next publish after the pipeline returns supersedes it.
-        let overlay = controller.clone();
-        self.daemon
-            .transcriber_mut()
-            .set_cleanup_started_observer(move |job_id| {
-                overlay.update(OverlayUpdate {
-                    workflow: WorkflowSnapshot {
-                        phase: WorkflowPhase::Processing {
-                            job_id,
-                            stage: ProcessingStage::Cleaning,
-                        },
-                    },
-                    active_recording: None,
-                    notice: None,
-                });
-            });
         self.daemon.set_overlay_controller(controller);
     }
 

@@ -112,8 +112,10 @@ fn run_daemon(paths: AppPaths) -> anyhow::Result<()> {
         .name("agentdictate-ipc".into())
         .spawn(move || {
             loop {
-                // Never lock the process here: a long command (a
-                // transcription) holds it, and no client could connect.
+                // Never lock the process here: a slow command (a Recovery
+                // retry) can hold it, and no client could connect.
+                // Transcription runs on the daemon's processing worker,
+                // without the lock.
                 if quitting.load(AtomicOrdering::Acquire) {
                     break;
                 }

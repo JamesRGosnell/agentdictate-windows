@@ -62,10 +62,10 @@ fn ffmpeg_command(audio_path: &Path) -> Command {
     command
 }
 
-/// Bounds a hung encoder. The daemon holds its global lock while a dictation
-/// is transcribed, so an encoder that never returns would freeze the hotkey,
-/// tray and Settings. ffmpeg normally needs a few milliseconds per second of
-/// audio, so this only fires when it is stuck; the WAV is uploaded instead.
+/// Bounds a hung encoder. Dictations paste in the order they were stopped,
+/// so an encoder that never returns would hold up every later dictation.
+/// ffmpeg normally needs a few milliseconds per second of audio, so this
+/// only fires when it is stuck; the WAV is uploaded instead.
 fn encode_deadline(audio_seconds: f64) -> Instant {
     let scaled = Duration::try_from_secs_f64(audio_seconds.max(0.0) / 2.0).unwrap_or_default();
     Instant::now() + Duration::from_secs(10) + scaled
@@ -308,8 +308,8 @@ fn http_client() -> reqwest::blocking::Client {
 
 /// True when a request failed before OpenAI returned any status, so OpenAI
 /// cannot have answered it. The total 180 s timeout is excluded: the upload
-/// may already be processing, and a second full wait under the daemon's lock
-/// is worse than handing the audio to Recovery.
+/// may already be processing, and a second full wait, which holds up every
+/// later dictation's paste, is worse than handing the audio to Recovery.
 fn failed_before_status(error: &reqwest::Error) -> bool {
     (error.is_request() || error.is_body()) && (error.is_connect() || !error.is_timeout())
 }
@@ -328,8 +328,9 @@ fn is_transient_status(status: StatusCode) -> bool {
     )
 }
 
-/// A first attempt slower than this is not repeated: the daemon holds its
-/// global lock throughout, and Recovery can retry a long request later.
+/// A first attempt slower than this is not repeated: later dictations wait
+/// behind this one to paste in order, and Recovery can retry a long request
+/// later.
 const RETRY_ONLY_WITHIN: Duration = Duration::from_secs(30);
 
 /// A short pause of 200 to 600 ms before resending after a transient status,
