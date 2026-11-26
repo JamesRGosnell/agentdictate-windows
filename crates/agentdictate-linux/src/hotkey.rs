@@ -430,6 +430,13 @@ impl HotkeyTracker {
         self.input(device, input)
     }
 
+    /// Forgets every held key, for when releases may have been missed
+    /// wholesale (session unlock, resume from sleep).
+    pub fn release_all(&mut self) -> Option<HotkeySignal> {
+        self.pressed_by_device.clear();
+        self.transition(false)
+    }
+
     pub fn remove_device(&mut self, device: DeviceId) -> Option<HotkeySignal> {
         self.pressed_by_device.remove(&device);
         let matches = self
