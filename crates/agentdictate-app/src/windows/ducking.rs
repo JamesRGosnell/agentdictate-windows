@@ -92,7 +92,17 @@ fn run_worker(incoming: &mpsc::Receiver<Command>, record: DuckingRecord) {
     let mut active: Option<Settings> = None;
     let mut discovered: Option<Instant> = None;
     loop {
-        let received = incoming.recv_timeout(FADE_TICK);
+        let wait = next_wait(
+            active.is_some(),
+            ducking.fading(),
+            discovered.map(|at| at.elapsed()),
+        );
+        let received = match wait {
+            Some(timeout) => incoming.recv_timeout(timeout),
+            None => incoming
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
         match received {
             Ok(Command::Duck(settings)) => {
                 if settings.audio_ducking_enabled {
@@ -133,6 +143,21 @@ fn run_worker(incoming: &mpsc::Receiver<Command>, record: DuckingRecord) {
             }
         }
         ducking.step();
+    }
+}
+
+/// How long the worker may wait for a command: a fade needs the next tick,
+/// active ducking needs the next discovery, and otherwise nothing changes
+/// until a command arrives (`None` blocks).
+fn next_wait(active: bool, fading: bool, since_discovery: Option<Duration>) -> Option<Duration> {
+    if fading {
+        Some(FADE_TICK)
+    } else if active {
+        Some(since_discovery.map_or(Duration::ZERO, |elapsed| {
+            DISCOVERY_INTERVAL.saturating_sub(elapsed)
+        }))
+    } else {
+        None
     }
 }
 
@@ -714,6 +739,26 @@ mod tests {
         assert_eq!(
             DuckingRecord::new(path).load(),
             vec![entry("music", 0.5, 0.25)]
+        );
+    }
+
+    #[test]
+    fn ducking_worker_blocks_only_when_nothing_is_ducked_or_fading() {
+        assert_eq!(next_wait(false, false, None), None);
+        assert_eq!(next_wait(false, false, Some(Duration::from_secs(5))), None);
+        assert_eq!(next_wait(false, true, None), Some(FADE_TICK));
+        assert_eq!(
+            next_wait(true, true, Some(Duration::from_millis(100))),
+            Some(FADE_TICK)
+        );
+        assert_eq!(next_wait(true, false, None), Some(Duration::ZERO));
+        assert_eq!(
+            next_wait(true, false, Some(Duration::from_millis(100))),
+            Some(Duration::from_millis(150))
+        );
+        assert_eq!(
+            next_wait(true, false, Some(Duration::from_secs(1))),
+            Some(Duration::ZERO)
         );
     }
 }
