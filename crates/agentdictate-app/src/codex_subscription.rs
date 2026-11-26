@@ -136,6 +136,37 @@ fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
     }
 }
 
+/// The request never got a reply because the connection failed. A request
+/// that timed out has already waited minutes, so it is not sent again.
+fn is_connection_failure(error: &CodexSubscriptionError) -> bool {
+    matches!(error, CodexSubscriptionError::Transport(error) if !error.is_timeout())
+}
+
+/// A reply worth one more try: the service timed out, was busy, or briefly
+/// limited requests. A used-up limit is not, nor any other reply.
+fn is_retryable_reply(status: StatusCode, payload: &str) -> bool {
+    let retryable = status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error();
+    let payload = payload.to_lowercase();
+    let limit_reached = [
+        "limit reached",
+        "limit has been reached",
+        "usage_limit",
+        "resets_in",
+    ]
+    .iter()
+    .any(|pattern| payload.contains(pattern));
+    retryable && !limit_reached
+}
+
+/// Between 300 and 700 ms, so dictations that failed together do not all
+/// come back at the same moment.
+fn retry_delay() -> Duration {
+    let jitter = (Uuid::new_v4().as_u128() % 400) as u64;
+    Duration::from_millis(300 + jitter)
+}
+
 fn subscription_error_kind(error: &CodexSubscriptionError) -> &'static str {
     match error {
         CodexSubscriptionError::Transport(error) => reqwest_error_kind(error),
@@ -296,67 +327,87 @@ impl CodexSubscriptionTransport {
         let audio = std::fs::read(request.audio_path).map_err(CodexSubscriptionError::AudioRead)?;
         let audio_read_millis = request_started_at.elapsed().as_millis();
         let boundary = format!("----codex-transcribe-{}", Uuid::new_v4());
-        let body = multipart_body(&boundary, &audio, request.language);
 
         let auth_started = Instant::now();
         let mut auth = self.recording_auth(request.audio_path)?;
         let auth_wait_millis = auth_started.elapsed().as_millis();
-        let mut response = self.send(&auth, body, &boundary).inspect_err(|error| {
-            tracing::warn!(
-                attempt = "initial",
-                error_kind = subscription_error_kind(error),
-                audio_bytes = audio.len(),
-                recording_duration_seconds = request.duration_seconds,
-                elapsed_millis = request_started_at.elapsed().as_millis(),
-                "ChatGPT transcription request failed before receiving a response"
-            );
-        })?;
-        let initial_status = response.status();
+        let mut initial_status = None;
         let mut auth_refreshed = false;
-        if matches!(
-            initial_status,
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-        ) {
-            auth_refreshed = true;
-            auth = self.load_auth(true)?;
-            response = self
-                .send(
-                    &auth,
-                    multipart_body(&boundary, &audio, request.language),
-                    &boundary,
-                )
-                .inspect_err(|error| {
+        // Each kind of retry happens at most once.
+        let mut reconnected = false;
+        let mut retried_status = false;
+        let (status, payload) = loop {
+            let attempt = if auth_refreshed {
+                "after_auth_refresh"
+            } else if reconnected || retried_status {
+                "retry"
+            } else {
+                "initial"
+            };
+            let body = multipart_body(&boundary, &audio, request.language);
+            let response = match self.send(&auth, body, &boundary) {
+                Ok(response) => response,
+                Err(error) => {
                     tracing::warn!(
-                        attempt = "after_auth_refresh",
-                        error_kind = subscription_error_kind(error),
-                        initial_http_status = initial_status.as_u16(),
+                        attempt,
+                        error_kind = subscription_error_kind(&error),
                         audio_bytes = audio.len(),
                         recording_duration_seconds = request.duration_seconds,
                         elapsed_millis = request_started_at.elapsed().as_millis(),
                         "ChatGPT transcription request failed before receiving a response"
                     );
-                })?;
-        }
-        let status = response.status();
-        let payload = response
-            .text()
-            .inspect_err(|error| {
+                    // The connection failed before any reply: the service
+                    // never saw the recording, so it is sent once more.
+                    if !reconnected && is_connection_failure(&error) {
+                        reconnected = true;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let status = response.status();
+            initial_status.get_or_insert(status);
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) && !auth_refreshed
+            {
+                auth_refreshed = true;
+                auth = self.load_auth(true)?;
+                continue;
+            }
+            let payload = response
+                .text()
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        attempt = "response_body",
+                        error_kind = reqwest_error_kind(error),
+                        http_status = status.as_u16(),
+                        audio_bytes = audio.len(),
+                        recording_duration_seconds = request.duration_seconds,
+                        elapsed_millis = request_started_at.elapsed().as_millis(),
+                        "ChatGPT transcription response body could not be read"
+                    );
+                })
+                .map_err(CodexSubscriptionError::Transport)?;
+            if !retried_status && is_retryable_reply(status, &payload) {
+                retried_status = true;
+                let delay = retry_delay();
                 tracing::warn!(
-                    attempt = "response_body",
-                    error_kind = reqwest_error_kind(error),
                     http_status = status.as_u16(),
-                    audio_bytes = audio.len(),
-                    recording_duration_seconds = request.duration_seconds,
-                    elapsed_millis = request_started_at.elapsed().as_millis(),
-                    "ChatGPT transcription response body could not be read"
+                    delay_millis = delay.as_millis(),
+                    "ChatGPT transcription is briefly unavailable; retrying once"
                 );
-            })
-            .map_err(CodexSubscriptionError::Transport)?;
+                thread::sleep(delay);
+                continue;
+            }
+            break (status, payload);
+        };
+        let initial_status = initial_status.unwrap_or(status);
         tracing::info!(
             initial_http_status = initial_status.as_u16(),
             final_http_status = status.as_u16(),
             http_success = status.is_success(),
             auth_refreshed,
+            reconnected,
+            retried_status,
             audio_read_millis,
             auth_wait_millis,
             audio_bytes = audio.len(),
@@ -1433,6 +1484,95 @@ mod tests {
         assert!(requests[0].contains("authorization: Bearer expired-token"));
         assert!(requests[1].contains("authorization: Bearer fresh-token"));
         assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+    }
+
+    /// Serves one scripted reply per request (`None` closes the connection
+    /// without one), then counts any further requests for a moment.
+    fn scripted_endpoint(
+        replies: Vec<Option<(&'static str, &'static str)>>,
+    ) -> (String, thread::JoinHandle<(usize, usize)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/backend-api/transcribe",
+            listener.local_addr().unwrap()
+        );
+        let server = thread::spawn(move || {
+            let scripted = replies.len();
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_http_request(&mut stream);
+                if let Some((status, body)) = reply {
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            }
+            listener.set_nonblocking(true).unwrap();
+            let mut extra = 0;
+            let until = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < until {
+                if listener.accept().is_ok() {
+                    extra += 1;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            (scripted, extra)
+        });
+        (endpoint, server)
+    }
+
+    fn transcribe_through(endpoint: String) -> Result<String, ExternalError> {
+        let provider = CallbackAuth(|_| Ok(auth("plan-token")));
+        let directory = tempdir().unwrap();
+        let audio_path = directory.path().join("recording.wav");
+        std::fs::write(&audio_path, b"RIFFspeech").unwrap();
+        let mut transport = CodexSubscriptionTransport::with_endpoint_and_auth(endpoint, provider);
+        transport.transcribe_audio(TranscriptionRequest {
+            keywords: &[],
+            audio_path: &audio_path,
+            provider: TranscriptionProvider::ChatGptSubscription,
+            model: "gpt-transcribe",
+            language: "",
+            prompt: "",
+            duration_seconds: 1.0,
+        })
+    }
+
+    #[test]
+    fn dictation_is_sent_again_once_after_a_dropped_connection_or_a_busy_service() {
+        for first in [
+            None,
+            Some(("503 Service Unavailable", r#"{"detail":"busy"}"#)),
+        ] {
+            let (endpoint, server) =
+                scripted_endpoint(vec![first, Some(("200 OK", r#"{"text":"Made it."}"#))]);
+            assert_eq!(transcribe_through(endpoint).unwrap(), "Made it.");
+            assert_eq!(server.join().unwrap(), (2, 0));
+        }
+    }
+
+    #[test]
+    fn dictation_is_not_sent_again_after_a_rejection_or_a_used_up_limit() {
+        for reply in [
+            ("400 Bad Request", r#"{"detail":"bad audio"}"#),
+            (
+                "429 Too Many Requests",
+                r#"{"error":{"message":"The usage limit has been reached","resets_in_seconds":86400}}"#,
+            ),
+        ] {
+            let (endpoint, server) = scripted_endpoint(vec![Some(reply)]);
+            assert!(transcribe_through(endpoint).is_err());
+            assert_eq!(server.join().unwrap(), (1, 0), "{}", reply.0);
+        }
+        // A second busy reply is the last.
+        let busy = Some(("502 Bad Gateway", "{}"));
+        let (endpoint, server) = scripted_endpoint(vec![busy, busy]);
+        assert!(transcribe_through(endpoint).is_err());
+        assert_eq!(server.join().unwrap(), (2, 0));
     }
 
     #[test]
