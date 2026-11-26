@@ -19,6 +19,9 @@ $previous = $env:AGENTDICTATE_DATA_HOME
 try {
     $env:AGENTDICTATE_DATA_HOME = Join-Path $fixture 'isolated-data'
     & (Join-Path $package 'install.ps1') -InstallDirectory $destination -NoStart -NoShortcuts
+    # Reinstalling over an installation renames the replaced files aside and removes them once free.
+    & (Join-Path $package 'install.ps1') -InstallDirectory $destination -NoStart -NoShortcuts
+    if (Get-ChildItem -LiteralPath $destination -Filter '*.old' -File) { throw 'Reinstall left replaced files behind.' }
     . (Join-Path $package 'shortcuts.ps1')
     $testLink = Join-Path $fixture 'AgentDictate.lnk'
     New-AgentDictateShortcut $testLink $destination
