@@ -29,15 +29,42 @@ fn tray_toggle_maps_only_actionable_workflow_phases() {
     assert!(
         tray_command_for_phase(
             TrayAction::ToggleDictation,
-            WorkflowPhase::Processing {
+            WorkflowPhase::Stopping {
                 job_id: JobId::new(),
-                stage: ProcessingStage::Transcribing,
             },
             9,
         )
         .is_none(),
-        "the tray must not queue a new recording while transcription is busy"
+        "the tray must not queue a new recording while one stops"
     );
+}
+
+#[test]
+fn tray_starts_the_next_dictation_while_an_earlier_one_is_processed() {
+    let processing = WorkflowPhase::Processing {
+        job_id: JobId::new(),
+        stage: ProcessingStage::Transcribing,
+    };
+
+    let toggle = tray_command_for_phase(TrayAction::ToggleDictation, processing, 12)
+        .expect("toggle starts recording");
+    let literal = tray_command_for_phase(TrayAction::StartLiteral, processing, 13)
+        .expect("literal starts recording");
+
+    assert!(matches!(
+        toggle.kind,
+        ClientCommandKind::StartRecording {
+            request_id: 12,
+            mode: None
+        }
+    ));
+    assert!(matches!(
+        literal.kind,
+        ClientCommandKind::StartRecording {
+            request_id: 13,
+            mode: Some(agentdictate_core::DictationMode::Literal)
+        }
+    ));
 }
 
 #[test]

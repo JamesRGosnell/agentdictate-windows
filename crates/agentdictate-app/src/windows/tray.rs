@@ -118,8 +118,8 @@ pub enum TrayAction {
 }
 
 /// Converts the state-sensitive tray toggle into a single daemon command.
-/// Busy processing states intentionally produce no command rather than
-/// replaying an action after the current dictation completes. A dictation
+/// A stopping recording intentionally produces no command rather than
+/// replaying an action after it stops. A dictation still being processed or
 /// waiting in Recovery does not block a new one, as with the hotkey.
 #[must_use]
 pub const fn tray_command_for_phase(
@@ -129,12 +129,12 @@ pub const fn tray_command_for_phase(
 ) -> Option<ClientCommand> {
     if matches!(action, TrayAction::StartLiteral) {
         return match phase {
-            WorkflowPhase::Ready | WorkflowPhase::NeedsAttention { .. } => {
-                Some(ClientCommand::start_recording_in_mode(
-                    request_id,
-                    agentdictate_core::DictationMode::Literal,
-                ))
-            }
+            WorkflowPhase::Ready
+            | WorkflowPhase::Processing { .. }
+            | WorkflowPhase::NeedsAttention { .. } => Some(ClientCommand::start_recording_in_mode(
+                request_id,
+                agentdictate_core::DictationMode::Literal,
+            )),
             _ => None,
         };
     }
@@ -142,13 +142,13 @@ pub const fn tray_command_for_phase(
         return None;
     }
     match phase {
-        WorkflowPhase::Ready | WorkflowPhase::NeedsAttention { .. } => {
-            Some(ClientCommand::start_recording(request_id))
-        }
+        WorkflowPhase::Ready
+        | WorkflowPhase::Processing { .. }
+        | WorkflowPhase::NeedsAttention { .. } => Some(ClientCommand::start_recording(request_id)),
         WorkflowPhase::Starting { .. } | WorkflowPhase::Recording { .. } => {
             Some(ClientCommand::stop_recording(request_id))
         }
-        WorkflowPhase::Stopping { .. } | WorkflowPhase::Processing { .. } => None,
+        WorkflowPhase::Stopping { .. } => None,
     }
 }
 
