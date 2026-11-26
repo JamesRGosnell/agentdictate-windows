@@ -33,27 +33,201 @@ mod startup_tests;
 mod focusless_teardown_tests {
     use super::*;
 
-    #[test]
-    fn an_unconfirmed_helper_exit_does_not_block_the_windows_paste() {
+    use agentdictate_core::{JobId, Workflow, WorkflowSignal};
+
+    fn controller() -> (OverlayController, Receiver<OverlayCommand>) {
         let (commands, received) = channel();
         let controller = OverlayController {
             commands,
             health: Arc::new(OverlayHealth::default()),
         };
-        // A presenter that accepts commands but never observes the exit.
+        (controller, received)
+    }
+
+    /// The presenter side of a dismissal: the reply the supervisor would hold.
+    fn received_dismissal(
+        received: &Receiver<OverlayCommand>,
+    ) -> SyncSender<Result<(), OverlayTeardownError>> {
+        match received.recv_timeout(Duration::from_secs(1)) {
+            Ok(OverlayCommand::Dismiss { reply }) => reply,
+            _ => panic!("the controller did not send a dismissal"),
+        }
+    }
+
+    #[test]
+    fn the_windows_paste_does_not_wait_for_the_pill_to_fade() {
+        let (controller, received) = controller();
+        // A presenter that accepts the dismissal but never observes the exit.
         let started = Instant::now();
         let result = controller.dismiss_and_wait();
+        let elapsed = started.elapsed();
         assert!(result.is_ok(), "paste must proceed: {result:?}");
         assert!(
-            started.elapsed() < OVERLAY_TEARDOWN_TIMEOUT + Duration::from_secs(1),
-            "a lingering helper must not add a second full teardown wait"
+            elapsed < Duration::from_millis(50),
+            "paste waited {elapsed:?} for the overlay"
         );
-        let sent = received.try_iter().collect::<Vec<_>>();
-        assert!(matches!(sent[0], OverlayCommand::Dismiss { .. }));
-        assert!(matches!(sent[1], OverlayCommand::ForceDismiss));
+        let _reply = received_dismissal(&received);
+        assert!(
+            received.try_recv().is_err(),
+            "the fade must not be cut short"
+        );
+    }
+
+    #[test]
+    fn a_pill_that_does_not_exit_is_terminated_after_the_teardown_timeout() {
+        let (controller, received) = controller();
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        controller.dismiss_during_paste(timeout).unwrap();
+        let _reply = received_dismissal(&received);
+
+        let forced = received.recv_timeout(Duration::from_secs(5));
+
+        assert!(matches!(forced, Ok(OverlayCommand::ForceDismiss)));
+        assert!(started.elapsed() >= timeout);
+    }
+
+    #[test]
+    fn a_pill_that_exits_in_time_is_never_terminated() {
+        let (controller, received) = controller();
+        let timeout = Duration::from_millis(100);
+        controller.dismiss_during_paste(timeout).unwrap();
+        received_dismissal(&received).send(Ok(())).unwrap();
+
+        let after = received.recv_timeout(timeout * 4);
+
+        assert!(
+            matches!(after, Err(RecvTimeoutError::Timeout)),
+            "an acknowledged dismissal was forced"
+        );
+    }
+
+    fn recording() -> OverlayUpdate {
+        let job_id = JobId::new();
+        let mut workflow = Workflow::new();
+        workflow
+            .apply(WorkflowSignal::StartRequested { job_id })
+            .unwrap();
+        workflow
+            .apply(WorkflowSignal::FirstAudioFrameWritten { job_id })
+            .unwrap();
+        OverlayUpdate {
+            workflow: workflow.snapshot(),
+            active_recording: None,
+        }
+    }
+
+    /// A helper whose first launch never finishes its fade (bounded to about
+    /// 15 s so a failing run does not leak it) and whose later launches exit
+    /// when their input closes.
+    const FAKE_HELPER: &str = "@echo off\r\n\
+        if exist \"%~dp0first-launched\" goto graceful\r\n\
+        echo.>\"%~dp0first-launched\"\r\n\
+        echo {\"status\":\"frame_submitted\"}\r\n\
+        set n=0\r\n\
+        :hang\r\n\
+        ping -n 2 127.0.0.1 >nul\r\n\
+        set /a n+=1\r\n\
+        if %n% lss 15 goto hang\r\n\
+        exit /b 0\r\n\
+        :graceful\r\n\
+        echo {\"status\":\"frame_submitted\"}\r\n\
+        more >nul\r\n\
+        exit /b 0\r\n";
+
+    /// Feeds helper statuses to `supervisor` until `wanted` matches an event.
+    fn pump_until(
+        supervisor: &mut OverlaySupervisor<'_>,
+        events: &Receiver<PresenterEvent>,
+        wanted: impl Fn(&PresenterEvent) -> bool,
+    ) -> PresenterEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the overlay helper did not respond in time");
+            if wanted(&event) {
+                return event;
+            }
+            if let PresenterEvent::HelperStatus { generation, status } = event {
+                supervisor.handle_helper_status(generation, status);
+            }
+        }
+    }
+
+    fn exit_of(
+        supervisor: &mut OverlaySupervisor<'_>,
+        events: &Receiver<PresenterEvent>,
+    ) -> (u64, io::Result<ExitStatus>) {
+        match pump_until(supervisor, events, |event| {
+            matches!(event, PresenterEvent::HelperExited { .. })
+        }) {
+            PresenterEvent::HelperExited { generation, result } => (generation, result),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_dictation_started_while_the_pill_fades_keeps_its_own_pill() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("overlay-helper.cmd");
+        std::fs::write(&executable, FAKE_HELPER).unwrap();
+        let (events, event_receiver) = channel();
+        let mut supervisor = OverlaySupervisor::new(
+            &executable,
+            Duration::from_secs(5),
+            events,
+            Arc::new(OverlayHealth::default()),
+        );
+        let shown = |wanted: u64| {
+            move |event: &PresenterEvent| {
+                matches!(
+                    event,
+                    PresenterEvent::HelperStatus {
+                        generation,
+                        status: Ok(OverlayHelperStatus::FrameSubmitted),
+                    } if *generation == wanted
+                )
+            }
+        };
+
+        supervisor.handle_update(recording());
+        pump_until(&mut supervisor, &event_receiver, shown(1));
+        let (reply, first_acknowledgment) = sync_channel(1);
+        supervisor.handle_command(OverlayCommand::Dismiss { reply });
+        // The paste went ahead; the next dictation starts while pill 1 fades.
+        supervisor.handle_update(recording());
+        assert_eq!(
+            supervisor.helper.as_ref().map(OverlayChild::generation),
+            Some(2)
+        );
+        pump_until(&mut supervisor, &event_receiver, shown(2));
+        // Pill 1's watchdog fires: it must stop pill 1, not the new pill.
+        supervisor.handle_command(OverlayCommand::ForceDismiss);
+
+        let (generation, result) = exit_of(&mut supervisor, &event_receiver);
+        assert_eq!(generation, 1, "the fading pill was not the one stopped");
+        supervisor.handle_helper_exit(generation, result);
+        assert!(matches!(first_acknowledgment.try_recv(), Ok(Ok(()))));
+        let current = supervisor
+            .helper
+            .as_mut()
+            .expect("the new pill was dropped");
+        assert_eq!(current.generation(), 2);
+        current
+            .send(&recording())
+            .expect("the new pill must still accept updates");
+
+        let (reply, second_acknowledgment) = sync_channel(1);
+        supervisor.handle_command(OverlayCommand::Dismiss { reply });
+        let (generation, result) = exit_of(&mut supervisor, &event_receiver);
+        assert_eq!(generation, 2);
+        supervisor.handle_helper_exit(generation, result);
+        assert!(matches!(second_acknowledgment.try_recv(), Ok(Ok(()))));
+        assert!(supervisor.helper.is_none() && supervisor.pending_dismissal.is_none());
     }
 }
-/// Upper bound the daemon waits for the helper to exit after dismissal. The
+// Upper bound the daemon waits for the helper to exit after dismissal. The
 /// dismissal ack now includes the helper's fade-out, so this must comfortably
 /// exceed the UI crate's `OVERLAY_FADE_HOLD` plus process teardown; the
 /// relation is asserted by the overlay lifecycle tests.
@@ -63,14 +237,6 @@ pub const OVERLAY_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The Windows overlay window is created `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`,
 /// so it cannot become the paste target even while its process lingers.
 const OVERLAY_CANNOT_TAKE_FOCUS: bool = cfg!(windows);
-
-/// How long paste waits for a terminated helper to be observed gone. Where the
-/// overlay cannot take focus, a short grace suffices before pasting anyway.
-const FORCED_EXIT_CONFIRMATION_TIMEOUT: Duration = if OVERLAY_CANNOT_TAKE_FOCUS {
-    Duration::from_millis(250)
-} else {
-    OVERLAY_TEARDOWN_TIMEOUT
-};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayProcessAction {
@@ -138,13 +304,70 @@ impl OverlayController {
         let _ = self.commands.send(OverlayCommand::Update(update));
     }
 
+    /// Closes the overlay before a paste and returns once the paste is safe.
+    /// Where the overlay cannot take focus (Windows) that is at once: the
+    /// fade-out overlaps the paste, and a watchdog kills a helper that has not
+    /// exited by `OVERLAY_TEARDOWN_TIMEOUT`. Elsewhere (X11) the paste waits
+    /// for the helper's observed exit.
     pub fn dismiss_and_wait(&self) -> Result<(), OverlayTeardownError> {
         let started = Instant::now();
+        let result = if OVERLAY_CANNOT_TAKE_FOCUS {
+            self.dismiss_during_paste(OVERLAY_TEARDOWN_TIMEOUT)
+        } else {
+            self.dismiss_and_confirm_exit()
+        };
+        tracing::info!(
+            overlay_wait_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "recording overlay dismissal completed"
+        );
+        result
+    }
+
+    /// Starts the fade and returns without waiting for the helper to exit.
+    /// A watchdog thread waits up to `teardown_timeout` for the exit and then
+    /// sends `ForceDismiss`, so a stalled renderer cannot leave a frozen pill
+    /// on screen. If a newer dismissal supersedes this one, or the presenter
+    /// stops, the acknowledgment disconnects and the watchdog does nothing.
+    fn dismiss_during_paste(&self, teardown_timeout: Duration) -> Result<(), OverlayTeardownError> {
         let (reply, acknowledgment) = sync_channel(1);
         self.commands
             .send(OverlayCommand::Dismiss { reply })
             .map_err(|_| OverlayTeardownError::PresenterUnavailable)?;
-        let result = match acknowledgment.recv_timeout(OVERLAY_TEARDOWN_TIMEOUT) {
+        let commands = self.commands.clone();
+        let dismissed_at = Instant::now();
+        let watchdog = std::thread::Builder::new()
+            .name("agentdictate-overlay-teardown".into())
+            .spawn(
+                move || match acknowledgment.recv_timeout(teardown_timeout) {
+                    Ok(result) => tracing::info!(
+                        overlay_fade_ms = dismissed_at.elapsed().as_millis() as u64,
+                        success = result.is_ok(),
+                        "recording overlay helper exited after dismissal"
+                    ),
+                    Err(RecvTimeoutError::Timeout) => {
+                        tracing::warn!("overlay graceful teardown timed out; terminating helper");
+                        let _ = commands.send(OverlayCommand::ForceDismiss);
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {}
+                },
+            );
+        if let Err(error) = watchdog {
+            tracing::warn!(%error, "overlay teardown watchdog could not start; terminating helper");
+            let _ = self.commands.send(OverlayCommand::ForceDismiss);
+        }
+        Ok(())
+    }
+
+    /// Waits for the helper's observed exit, killing it after
+    /// `OVERLAY_TEARDOWN_TIMEOUT`. A window that can take focus must be gone
+    /// before the paste, so an unconfirmed exit fails the delivery.
+    fn dismiss_and_confirm_exit(&self) -> Result<(), OverlayTeardownError> {
+        let (reply, acknowledgment) = sync_channel(1);
+        self.commands
+            .send(OverlayCommand::Dismiss { reply })
+            .map_err(|_| OverlayTeardownError::PresenterUnavailable)?;
+        match acknowledgment.recv_timeout(OVERLAY_TEARDOWN_TIMEOUT) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 tracing::warn!(
@@ -153,19 +376,10 @@ impl OverlayController {
                 self.commands
                     .send(OverlayCommand::ForceDismiss)
                     .map_err(|_| OverlayTeardownError::PresenterUnavailable)?;
-                // Killing the presentation-only helper is safe. On X11 paste
-                // still requires its observed process exit, not merely a kill
-                // request. The Windows overlay is no-activate and click-through,
-                // so it can never take the paste: a helper slow to die under
-                // load must not cost the user their dictation.
-                match acknowledgment.recv_timeout(FORCED_EXIT_CONFIRMATION_TIMEOUT) {
+                // Killing the presentation-only helper is safe, but paste still
+                // requires its observed process exit, not merely a kill request.
+                match acknowledgment.recv_timeout(OVERLAY_TEARDOWN_TIMEOUT) {
                     Ok(result) => result,
-                    Err(RecvTimeoutError::Timeout) if OVERLAY_CANNOT_TAKE_FOCUS => {
-                        tracing::warn!(
-                            "overlay helper exit unconfirmed after termination; pasting anyway"
-                        );
-                        Ok(())
-                    }
                     Err(RecvTimeoutError::Timeout) => Err(OverlayTeardownError::TimedOut),
                     Err(RecvTimeoutError::Disconnected) => {
                         Err(OverlayTeardownError::PresenterUnavailable)
@@ -173,13 +387,7 @@ impl OverlayController {
                 }
             }
             Err(RecvTimeoutError::Disconnected) => Err(OverlayTeardownError::PresenterUnavailable),
-        };
-        tracing::info!(
-            overlay_wait_ms = started.elapsed().as_millis() as u64,
-            success = result.is_ok(),
-            "recording overlay dismissal completed"
-        );
-        result
+        }
     }
 }
 
@@ -324,8 +532,11 @@ struct OverlaySupervisor<'a> {
     pending_dismissal: Option<PendingDismissal>,
 }
 
+/// A dismissed helper that is fading out. It leaves `helper` at dismissal, so
+/// a new dictation can launch the next helper while this one finishes, and a
+/// later `ForceDismiss` still reaches this one rather than its successor.
 struct PendingDismissal {
-    generation: u64,
+    child: OverlayChild,
     reply: SyncSender<Result<(), OverlayTeardownError>>,
 }
 
@@ -362,24 +573,31 @@ impl<'a> OverlaySupervisor<'a> {
         self.last_visible_update = None;
         self.remaining_restarts = 0;
         self.lifecycle.mark_stopped();
-        let Some(child) = self.helper.as_mut() else {
+        let Some(mut child) = self.helper.take() else {
             let _ = reply.send(Ok(()));
             return;
         };
-        let generation = child.generation();
         child.finish();
-        self.pending_dismissal = Some(PendingDismissal { generation, reply });
+        // An older helper still fading when the next dictation is dismissed
+        // has had its chance; its waiter sees a disconnect and stands down.
+        if let Some(mut superseded) = self
+            .pending_dismissal
+            .replace(PendingDismissal { child, reply })
+        {
+            superseded.child.terminate();
+        }
     }
 
     fn force_dismissal(&mut self) {
-        let Some(pending) = self.pending_dismissal.as_ref() else {
-            return;
-        };
-        if let Some(child) = self.helper.as_mut()
-            && child.generation() == pending.generation
-        {
-            child.terminate();
+        if let Some(pending) = self.pending_dismissal.as_mut() {
+            pending.child.terminate();
         }
+    }
+
+    fn is_dismissed(&self, generation: u64) -> bool {
+        self.pending_dismissal
+            .as_ref()
+            .is_some_and(|pending| pending.child.generation() == generation)
     }
 
     fn handle_update(&mut self, update: OverlayUpdate) {
@@ -429,11 +647,7 @@ impl<'a> OverlaySupervisor<'a> {
         generation: u64,
         status: Result<OverlayHelperStatus, String>,
     ) {
-        if self
-            .pending_dismissal
-            .as_ref()
-            .is_some_and(|pending| pending.generation == generation)
-        {
+        if self.is_dismissed(generation) {
             return;
         }
         let Some(child) = self
@@ -469,19 +683,11 @@ impl<'a> OverlaySupervisor<'a> {
     }
 
     fn handle_helper_exit(&mut self, generation: u64, result: io::Result<ExitStatus>) {
-        if self
-            .pending_dismissal
-            .as_ref()
-            .is_some_and(|pending| pending.generation == generation)
-        {
+        if self.is_dismissed(generation) {
             let pending = self
                 .pending_dismissal
                 .take()
                 .expect("matching pending dismissal must exist");
-            if self.helper.as_ref().map(OverlayChild::generation) == Some(generation) {
-                self.helper.take();
-                self.lifecycle.mark_stopped();
-            }
             let acknowledgment = result
                 .map(|_| ())
                 .map_err(OverlayTeardownError::ExitObservation);
