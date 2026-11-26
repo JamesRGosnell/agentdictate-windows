@@ -132,6 +132,12 @@ const MAX_BACKGROUND_ANSWERS: usize = 2;
 /// the bar says so.
 const DEAF_AFTER: Duration = Duration::from_secs(90);
 const DEAF_MIN_MY_LINES: usize = 3;
+/// The user spoke this recently, so they are still talking.
+const STILL_TALKING: Duration = Duration::from_secs(20);
+/// A level from the other side's audio at or above this (about -48 dBFS)
+/// is sound, even if not speech; below it is the near silence of audio
+/// that no longer reaches the copilot.
+const THEM_SOUND_LEVEL: f32 = 0.15;
 /// Insights failures in a row before the bar says so.
 const INSIGHTS_FAILURES_SHOWN: u8 = 3;
 /// The least time between two alerts that the user was mentioned.
@@ -146,6 +152,7 @@ const NOTES_READY_WAIT: Duration = Duration::from_secs(25);
 /// not judged or answered.
 const LATE_LINE: Duration = Duration::from_secs(20);
 const HEARING_PROBLEM: &str = "Can't hear the other side. Check that the call plays through your default speakers or headset.";
+const HEARING_LOST_PROBLEM: &str = "Can't hear the other side any more. Check that the call still plays through your default speakers or headset.";
 
 /// Audio pipeline output, independent of the capture backend.
 #[derive(Clone, Debug)]
@@ -181,6 +188,12 @@ pub(crate) enum AudioMsg {
     Problem(String),
     /// Informational capture state, such as active echo cancellation.
     Status(String),
+    /// A side's capture stopped and could not be started again, or with
+    /// `None`, works again.
+    CaptureLost {
+        speaker: Speaker,
+        problem: Option<String>,
+    },
 }
 
 impl AudioMsg {
@@ -595,7 +608,14 @@ pub(crate) struct Engine {
     checklist: Vec<ChecklistItem>,
     /// The other side's audio was heard at least once.
     them_heard: bool,
-    hearing_problem: bool,
+    /// When the other side last started speaking, and when any sound was
+    /// last heard from them.
+    them_last_heard: Option<Instant>,
+    them_last_sound: Option<Instant>,
+    /// What the bar says about hearing the other side, if anything.
+    hearing_problem: Option<&'static str>,
+    /// A capture source that stopped and could not be restarted, by side.
+    capture_problems: [Option<String>; 2],
     insights_failures: u8,
     insights_problem: Option<String>,
     /// The problem the bar shows now.
@@ -685,7 +705,10 @@ impl Engine {
             promises: Vec::new(),
             checklist: Vec::new(),
             them_heard: false,
-            hearing_problem: false,
+            them_last_heard: None,
+            them_last_sound: None,
+            hearing_problem: None,
+            capture_problems: [None, None],
             insights_failures: 0,
             insights_problem: None,
             shown_problem: None,
@@ -1284,6 +1307,13 @@ impl Engine {
     fn handle_audio(&mut self, message: AudioMsg) {
         match message {
             AudioMsg::Level { speaker, level } => {
+                if speaker == Speaker::Them && level >= THEM_SOUND_LEVEL {
+                    self.them_last_sound = Some(Instant::now());
+                    if self.hearing_problem == Some(HEARING_LOST_PROBLEM) {
+                        self.hearing_problem = None;
+                        self.refresh_problem();
+                    }
+                }
                 // Levels are coalesced per source by the capture threads.
                 (self.ui)(match speaker {
                     Speaker::Me => CopilotEvent::Levels {
@@ -1301,10 +1331,12 @@ impl Engine {
                     self.last_heard = Instant::now();
                 }
                 if speaker == Speaker::Them {
-                    if active && !self.them_heard {
+                    if active {
+                        self.them_last_heard = Some(Instant::now());
                         self.them_heard = true;
-                        self.hearing_problem = false;
-                        self.refresh_problem();
+                        if self.hearing_problem.take().is_some() {
+                            self.refresh_problem();
+                        }
                     }
                     self.them_speaking = active;
                     if active {
@@ -1343,6 +1375,16 @@ impl Engine {
                 (self.ui)(CopilotEvent::Notice(problem));
             }
             AudioMsg::Status(status) => tracing::info!(%status, "copilot audio status"),
+            AudioMsg::CaptureLost { speaker, problem } => {
+                match &problem {
+                    Some(problem) => {
+                        tracing::warn!(?speaker, %problem, "copilot audio capture lost");
+                    }
+                    None => tracing::info!(?speaker, "copilot audio capture restored"),
+                }
+                self.capture_problems[lane_index(speaker)] = problem;
+                self.refresh_problem();
+            }
         }
     }
 
@@ -1913,7 +1955,8 @@ impl Engine {
         let problem = self
             .transcription_problem
             .clone()
-            .or_else(|| self.hearing_problem.then(|| HEARING_PROBLEM.to_owned()))
+            .or_else(|| self.capture_problems.iter().flatten().next().cloned())
+            .or_else(|| self.hearing_problem.map(str::to_owned))
             .or_else(|| self.insights_problem.clone());
         if problem != self.shown_problem {
             self.shown_problem = problem.clone();
@@ -1924,25 +1967,62 @@ impl Engine {
     /// Says so on the bar when the user has been talking for a while and
     /// nothing has been heard from the other side: the call's sound is
     /// probably going somewhere the copilot does not listen.
+    /// The same once the other side has gone silent for that long while
+    /// the user kept talking: the call's sound has moved somewhere else.
     fn check_hearing(&mut self) {
-        if self.them_heard
-            || self.hearing_problem
+        if self.hearing_problem.is_some()
             || self.ending
             || self.paused
             || self.audio.is_none()
             || !self.settings.capture_system_audio
-            || self.started.elapsed() < DEAF_AFTER
         {
             return;
         }
+        if !self.them_heard {
+            if self.started.elapsed() < DEAF_AFTER {
+                return;
+            }
+            let mine = self
+                .transcript
+                .iter()
+                .filter(|line| line.speaker == Speaker::Me)
+                .count();
+            if mine >= DEAF_MIN_MY_LINES {
+                tracing::warn!("nothing heard from the other side");
+                self.hearing_problem = Some(HEARING_PROBLEM);
+                self.refresh_problem();
+            }
+            return;
+        }
+        // Any sound at all from their side, even someone listening quietly,
+        // means the call still reaches the copilot.
+        let Some(quiet) = self
+            .them_last_heard
+            .into_iter()
+            .chain(self.them_last_sound)
+            .max()
+            .map(|at| at.elapsed())
+        else {
+            return;
+        };
+        if quiet < DEAF_AFTER {
+            return;
+        }
+        let since_ms = self.elapsed_ms().saturating_sub(quiet.as_millis() as u64);
         let mine = self
             .transcript
             .iter()
-            .filter(|line| line.speaker == Speaker::Me)
+            .filter(|line| line.speaker == Speaker::Me && line.at_ms >= since_ms)
             .count();
-        if mine >= DEAF_MIN_MY_LINES {
-            tracing::warn!("nothing heard from the other side");
-            self.hearing_problem = true;
+        let still_talking = self
+            .since_me_spoke_ms()
+            .is_some_and(|since| since <= STILL_TALKING.as_millis() as u64);
+        if mine >= DEAF_MIN_MY_LINES && still_talking {
+            tracing::warn!(
+                quiet_secs = quiet.as_secs(),
+                "the other side went silent while the user kept talking"
+            );
+            self.hearing_problem = Some(HEARING_LOST_PROBLEM);
             self.refresh_problem();
         }
     }
@@ -4373,6 +4453,74 @@ mod tests {
             .filter(|event| matches!(event, CopilotEvent::Problem(_)))
             .count();
         assert_eq!(problems, 2, "shown once, cleared once");
+    }
+
+    #[test]
+    fn losing_the_other_side_mid_call_is_said_on_the_bar() {
+        let (mut engine, _incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        engine.start_audio();
+        engine.started = Instant::now() - Duration::from_secs(300);
+        // They were heard early in the call.
+        for active in [true, false] {
+            engine.handle_audio(AudioMsg::Speaking {
+                speaker: Speaker::Them,
+                active,
+            });
+        }
+        let now_ms = engine.elapsed_ms();
+        for (id, ago_s) in [(1, 60), (2, 30), (3, 5)] {
+            engine.publish(TranscriptLine {
+                id,
+                speaker: Speaker::Me,
+                text: "And the second thing the platform does is this.".into(),
+                at_ms: now_ms - ago_s * 1_000,
+                voice: None,
+            });
+        }
+        engine.check_hearing();
+        assert!(engine.shown_problem.is_none(), "they spoke just now");
+        engine.them_last_heard = Some(Instant::now() - DEAF_AFTER);
+        // A long pitch to someone listening quietly is not an alarm.
+        engine.handle_audio(AudioMsg::Level {
+            speaker: Speaker::Them,
+            level: 0.3,
+        });
+        engine.check_hearing();
+        assert!(
+            engine.shown_problem.is_none(),
+            "their line still makes sound"
+        );
+        engine.them_last_sound = Some(Instant::now() - DEAF_AFTER);
+        engine.handle_audio(AudioMsg::Level {
+            speaker: Speaker::Them,
+            level: 0.02,
+        });
+        engine.check_hearing();
+        assert_eq!(engine.shown_problem.as_deref(), Some(HEARING_LOST_PROBLEM));
+        // Their sound coming back clears it.
+        engine.handle_audio(AudioMsg::Level {
+            speaker: Speaker::Them,
+            level: 0.4,
+        });
+        assert!(engine.shown_problem.is_none());
+    }
+
+    #[test]
+    fn a_capture_that_cannot_be_started_again_is_said_on_the_bar() {
+        let (mut engine, _incoming, _events, _requests, _directory) =
+            harness(CopilotSettings::default());
+        let lost = "Call audio stopped and could not be started again.".to_owned();
+        engine.handle_audio(AudioMsg::CaptureLost {
+            speaker: Speaker::Them,
+            problem: Some(lost.clone()),
+        });
+        assert_eq!(engine.shown_problem, Some(lost));
+        engine.handle_audio(AudioMsg::CaptureLost {
+            speaker: Speaker::Them,
+            problem: None,
+        });
+        assert!(engine.shown_problem.is_none());
     }
 
     #[test]

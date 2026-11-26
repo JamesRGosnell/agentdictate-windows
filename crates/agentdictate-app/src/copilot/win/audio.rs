@@ -249,6 +249,57 @@ struct Source {
     failed: Arc<AtomicBool>,
     chunks: SyncSender<Chunk>,
     last_attempt: Instant,
+    restarts: RestartHealth,
+}
+
+/// Restarts in a row that failed before the bar says a source is lost:
+/// attempts are at least 2 s apart, so about six seconds without it.
+const RESTARTS_BEFORE_PROBLEM: u32 = 3;
+
+/// Failed restarts of one source, to say once when it is lost and again
+/// when it is back.
+#[derive(Default)]
+struct RestartHealth {
+    failures: u32,
+    reported: bool,
+}
+
+impl RestartHealth {
+    /// What the engine should hear after a restart attempt, if anything.
+    fn note(&mut self, kind: SourceKind, outcome: Result<(), &str>) -> Option<AudioMsg> {
+        let speaker = kind.speaker();
+        match outcome {
+            Ok(()) => {
+                self.failures = 0;
+                std::mem::take(&mut self.reported).then_some(AudioMsg::CaptureLost {
+                    speaker,
+                    problem: None,
+                })
+            }
+            Err(error) => {
+                self.failures = self.failures.saturating_add(1);
+                // The call device is captured as well as the default one,
+                // so losing it alone loses nothing.
+                if self.failures < RESTARTS_BEFORE_PROBLEM
+                    || self.reported
+                    || kind == SourceKind::CallPlayback
+                {
+                    return None;
+                }
+                self.reported = true;
+                let what = match kind {
+                    SourceKind::Microphone => "Your microphone",
+                    SourceKind::Playback | SourceKind::CallPlayback => "Call audio",
+                };
+                Some(AudioMsg::CaptureLost {
+                    speaker,
+                    problem: Some(format!(
+                        "{what} stopped and could not be started again: {error}"
+                    )),
+                })
+            }
+        }
+    }
 }
 
 /// Friendly name of the default communications playback device.
@@ -514,6 +565,7 @@ fn run_controller(
             failed,
             chunks,
             last_attempt: Instant::now(),
+            restarts: RestartHealth::default(),
         });
     }
     if sources.iter().all(|source| source.stream.is_none()) {
@@ -592,10 +644,19 @@ fn restart(source: &mut Source, sink: &AudioSink) {
             }
             source.stream = Some(stream);
             source.device_name = name;
+            if let Some(message) = source.restarts.note(source.kind, Ok(())) {
+                sink(message);
+            }
         }
-        Err(error) => {
-            tracing::debug!(source = source.kind.label(), %error, "copilot audio source still unavailable");
-        }
+        Err(error) => match source.restarts.note(source.kind, Err(&error)) {
+            Some(message) => {
+                tracing::warn!(source = source.kind.label(), %error, "copilot audio source could not be restarted");
+                sink(message);
+            }
+            None => {
+                tracing::debug!(source = source.kind.label(), %error, "copilot audio source still unavailable");
+            }
+        },
     }
 }
 
@@ -777,6 +838,41 @@ mod tests {
 
     fn share(flags: &[bool]) -> f32 {
         flags.iter().filter(|flag| **flag).count() as f32 / flags.len().max(1) as f32
+    }
+
+    #[test]
+    fn a_source_that_keeps_failing_to_restart_is_reported_once_and_cleared() {
+        let mut health = RestartHealth::default();
+        let lost = |message: Option<AudioMsg>| match message {
+            Some(AudioMsg::CaptureLost { speaker, problem }) => Some((speaker, problem)),
+            _ => None,
+        };
+        for _ in 1..RESTARTS_BEFORE_PROBLEM {
+            assert!(
+                health
+                    .note(SourceKind::Playback, Err("no device"))
+                    .is_none()
+            );
+        }
+        let (speaker, problem) =
+            lost(health.note(SourceKind::Playback, Err("no device"))).expect("reported");
+        assert_eq!(speaker, Speaker::Them);
+        assert!(problem.unwrap().contains("no device"));
+        assert!(
+            health
+                .note(SourceKind::Playback, Err("no device"))
+                .is_none()
+        );
+        assert_eq!(
+            lost(health.note(SourceKind::Playback, Ok(()))),
+            Some((Speaker::Them, None))
+        );
+        assert!(health.note(SourceKind::Playback, Ok(())).is_none());
+        // The separate call device is only a second listener.
+        let mut call = RestartHealth::default();
+        for _ in 0..RESTARTS_BEFORE_PROBLEM * 2 {
+            assert!(call.note(SourceKind::CallPlayback, Err("gone")).is_none());
+        }
     }
 
     #[test]
