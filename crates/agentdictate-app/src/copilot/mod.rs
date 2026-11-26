@@ -17,6 +17,7 @@ mod calendar;
 #[cfg(windows)]
 mod check;
 mod engine;
+mod journal;
 mod knowledge;
 mod live;
 mod meeting;

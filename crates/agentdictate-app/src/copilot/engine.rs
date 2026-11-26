@@ -36,6 +36,7 @@ use agentdictate_core::{
 use agentdictate_core::ENDED_TURN_PAUSE_MS;
 
 use super::{
+    journal::{self, Entry, Journal},
     knowledge::{Knowledge, fingerprint},
     live::{LiveCommand, LiveEvent, LiveFactory, LiveStream},
     names::{Clue, Roster},
@@ -533,7 +534,11 @@ pub(crate) struct Engine {
     ui: UiSink,
     messages: Sender<EngineMsg>,
     started: Instant,
+    /// When the session started, for the notes.
+    started_at: chrono::DateTime<chrono::Local>,
     session_key: String,
+    /// What the notes need, kept on disk as the meeting goes.
+    journal: Journal,
     audio: Option<Box<dyn AudioControl>>,
     paused: bool,
     jobs: Option<Sender<TranscriptionJob>>,
@@ -626,13 +631,18 @@ impl Engine {
         ui: UiSink,
         messages: Sender<EngineMsg>,
     ) -> Self {
+        let session_key = uuid::Uuid::new_v4().to_string();
+        let started_at = chrono::Local::now();
+        let journal = Journal::new(&services.notes_dir, &session_key, started_at);
         Self {
             services,
             settings,
             ui,
             messages,
             started: Instant::now(),
-            session_key: uuid::Uuid::new_v4().to_string(),
+            started_at,
+            session_key,
+            journal,
             audio: None,
             paused: false,
             jobs: None,
@@ -704,6 +714,7 @@ impl Engine {
     /// Runs the session until the user ends it.
     /// Runs until the session ends; true when the user ended it.
     pub(crate) fn run(mut self, incoming: Receiver<EngineMsg>) -> bool {
+        self.recover_cut_off_meetings();
         self.start_transcription_workers();
         self.load_models(self.settings.provider);
         self.load_knowledge();
@@ -727,6 +738,59 @@ impl Engine {
         };
         self.finish(&incoming, user_ended);
         user_ended
+    }
+
+    /// Saves the notes of meetings an earlier copilot never finished, for
+    /// example because it was closed by a reinstall.
+    fn recover_cut_off_meetings(&self) {
+        let notes_dir = self.services.notes_dir.clone();
+        let current = self.session_key.clone();
+        let ui = Arc::clone(&self.ui);
+        let _ = std::thread::Builder::new()
+            .name("copilot-recover".into())
+            .spawn(move || {
+                let recovered = journal::recover(&notes_dir, &current);
+                if !recovered.is_empty() {
+                    ui(CopilotEvent::Notice(
+                        "Saved the notes of a meeting that was cut off".into(),
+                    ));
+                }
+            });
+    }
+
+    /// Keeps `entry` for the notes, on disk, in case the session never
+    /// gets to write them.
+    fn record(&self, entry: Entry) {
+        if self.settings.save_notes {
+            self.journal.append(&entry);
+        }
+    }
+
+    /// Keeps a shown answer for the notes.
+    fn keep_answer(&mut self, id: u64, title: String, text: String) {
+        self.record(Entry::Answer {
+            id,
+            title: title.clone(),
+            text: text.clone(),
+        });
+        self.answers.push((id, title, text));
+    }
+
+    /// Keeps, or with `None` forgets, the rewritten line the user kept for
+    /// an answer.
+    fn keep_version(&mut self, id: u64, text: Option<String>) {
+        self.record(Entry::Kept {
+            id,
+            text: text.clone(),
+        });
+        match text {
+            Some(text) => {
+                self.kept.insert(id, text);
+            }
+            None => {
+                self.kept.remove(&id);
+            }
+        }
     }
 
     fn start_transcription_workers(&mut self) {
@@ -1055,9 +1119,7 @@ impl Engine {
                 }
             }
             EngineMsg::WindowRead { voice, view } => self.handle_window_read(voice, view),
-            EngineMsg::Rewritten { id, text } => {
-                self.kept.insert(id, text);
-            }
+            EngineMsg::Rewritten { id, text } => self.keep_version(id, Some(text)),
             EngineMsg::Translated { line, text } => {
                 if let Some(text) = text {
                     (self.ui)(CopilotEvent::Translation { line, text });
@@ -1175,14 +1237,7 @@ impl Engine {
                 }
             }
             CopilotAction::Rewrite { id, style, text } => self.rewrite(id, style, &text),
-            CopilotAction::KeepVersion { id, text } => match text {
-                Some(text) => {
-                    self.kept.insert(id, text);
-                }
-                None => {
-                    self.kept.remove(&id);
-                }
-            },
+            CopilotAction::KeepVersion { id, text } => self.keep_version(id, text),
             CopilotAction::NameSpeaker { voice, name } => {
                 self.roster.note(voice, &name, Clue::User);
                 tracing::info!(voice, named = !name.trim().is_empty(), "speaker named");
@@ -1802,6 +1857,7 @@ impl Engine {
             .position(|existing| existing.at_ms > line.at_ms)
             .unwrap_or(self.transcript.len());
         self.transcript.insert(position, line.clone());
+        self.record(Entry::Line { line: line.clone() });
         match line.speaker {
             Speaker::Them => self.translate(&line),
             Speaker::Me => self.check_my_statement(&line.text),
@@ -1978,6 +2034,10 @@ impl Engine {
     /// Keeps something the user typed for the notes.
     fn add_note(&mut self, note: String) {
         let at_ms = self.elapsed_ms();
+        self.record(Entry::Note {
+            at_ms,
+            text: note.clone(),
+        });
         self.my_notes.push((at_ms, note.clone()));
         (self.ui)(CopilotEvent::Note { at_ms, text: note });
         (self.ui)(CopilotEvent::Notice("Note saved".into()));
@@ -2026,6 +2086,9 @@ impl Engine {
                 .iter()
                 .any(|known| utterance_similarity(known, promise) >= 0.6)
             {
+                self.record(Entry::Promise {
+                    text: promise.clone(),
+                });
                 self.promises.push(promise.clone());
                 promised = true;
             }
@@ -2078,6 +2141,9 @@ impl Engine {
             }
         }
         self.calendar = Some(event);
+        self.record(Entry::Title {
+            title: self.notes_title(),
+        });
         self.publish_speakers();
         self.maybe_brief();
     }
@@ -2173,7 +2239,7 @@ impl Engine {
             draft.finished = Some((title, text));
             return;
         }
-        self.answers.push((id, title, text));
+        self.keep_answer(id, title, text);
     }
 
     /// Judges whether a line from the other side calls for the user to
@@ -2511,7 +2577,7 @@ impl Engine {
             );
             self.last_auto_question = Some((turn.text, Instant::now()));
             if let Some((title, text)) = draft.finished {
-                self.answers.push((draft.id, title, text));
+                self.keep_answer(draft.id, title, text);
             }
             return;
         }
@@ -2573,7 +2639,7 @@ impl Engine {
         );
         self.last_auto_question = Some((turn.text, Instant::now()));
         if let Some((title, text)) = draft.finished {
-            self.answers.push((draft.id, title, text));
+            self.keep_answer(draft.id, title, text);
         }
     }
 
@@ -3275,6 +3341,9 @@ impl Engine {
     }
 
     fn publish_speakers(&self) {
+        self.record(Entry::Names {
+            names: self.roster.names(),
+        });
         (self.ui)(CopilotEvent::Speakers {
             names: self.roster.names(),
             seen: self.seen_names.clone(),
@@ -3547,6 +3616,9 @@ impl Engine {
         self.name_from_conversation(&insights.speakers);
         self.maybe_brief();
         self.insights = insights.clone();
+        self.record(Entry::Title {
+            title: self.notes_title(),
+        });
         (self.ui)(CopilotEvent::Insights(insights));
         let after = self.insights.situation;
         if before.user_takes_part() && !after.user_takes_part() {
@@ -3614,16 +3686,25 @@ impl Engine {
         self.resolve_pending_mine(true);
         drop(self.jobs.take());
         if !self.settings.save_notes || self.transcript.is_empty() {
+            self.journal.remove();
             (self.ui)(CopilotEvent::Exit);
             return;
         }
         if !user_ended {
             (self.ui)(CopilotEvent::Ending);
         }
+        // The notes are saved before the summary is asked for, which can
+        // take half a minute: closing the copilot meanwhile loses nothing.
+        let saved = self.save_notes(None);
         let summary = self.summarize();
-        match self.write_notes(summary.as_deref()) {
+        let saved = if summary.is_some() || saved.is_err() {
+            self.save_notes(summary.as_deref())
+        } else {
+            saved
+        };
+        match saved {
             Ok(path) => {
-                tracing::info!(path = %path.display(), "meeting notes saved");
+                tracing::info!(path = %path.display(), summary = summary.is_some(), "meeting notes saved");
                 let (summary, follow_up) = summary
                     .as_deref()
                     .map(split_follow_up)
@@ -3790,30 +3871,29 @@ impl Engine {
             });
     }
 
+    /// Writes the notes, to the same file each time, and drops the record
+    /// they now make unnecessary.
+    fn save_notes(&mut self, summary: Option<&str>) -> std::io::Result<PathBuf> {
+        let result = self.write_notes(summary);
+        match &result {
+            Ok(path) => {
+                self.notes_path = Some(path.clone());
+                self.journal.remove();
+            }
+            Err(error) => tracing::warn!(%error, "meeting notes could not be written"),
+        }
+        result
+    }
+
     fn write_notes(&self, summary: Option<&str>) -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(&self.services.notes_dir)?;
-        let started = chrono::Local::now()
-            - chrono::Duration::milliseconds(self.started.elapsed().as_millis() as i64);
+        let started = self.started_at;
         let title = self.notes_title();
-        let slug: String = title
-            .chars()
-            .map(|character| {
-                if character.is_alphanumeric() || character == ' ' || character == '-' {
-                    character
-                } else {
-                    ' '
-                }
-            })
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let name = format!(
-            "{} {}.md",
-            started.format("%Y-%m-%d %H%M"),
-            slug.chars().take(60).collect::<String>()
-        );
-        let path = self.services.notes_dir.join(name);
+        let path = self.notes_path.clone().unwrap_or_else(|| {
+            self.services
+                .notes_dir
+                .join(format!("{}.md", journal::notes_file_stem(&started, &title)))
+        });
         // A rewritten line the user kept follows the answer it came from.
         let answers: Vec<(String, String)> = self
             .answers
@@ -3842,7 +3922,7 @@ impl Engine {
             &answers,
             &extras,
         );
-        std::fs::write(&path, markdown)?;
+        journal::write_atomically(&path, &markdown)?;
         Ok(path)
     }
 }
@@ -6107,6 +6187,127 @@ mod tests {
             event,
             CopilotEvent::Settings(saved) if saved.provider == CopilotProvider::ClaudeCode
         )));
+    }
+
+    fn said(id: u64, speaker: Speaker, text: &str) -> TranscriptLine {
+        TranscriptLine {
+            id,
+            speaker,
+            text: text.into(),
+            at_ms: id * 2_000,
+            voice: None,
+        }
+    }
+
+    #[test]
+    fn a_meeting_cut_off_before_it_ends_is_recovered_from_its_record() {
+        let (mut engine, _incoming, _events, _requests, _directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        engine.publish(said(1, Speaker::Them, "Can we start with a pilot?"));
+        engine.publish(said(2, Speaker::Me, "Yes, thirty days with ten seats."));
+        engine.add_note("they renew in March".into());
+        engine.keep_answer(1, "Pilot".into(), "Offer **30 days**.".into());
+        let record = engine.journal.path().to_owned();
+        let notes_dir = engine.services.notes_dir.clone();
+        // Killed by a reinstall: the session never finishes.
+        drop(engine);
+        let kept = std::fs::read_to_string(&record).unwrap();
+        assert!(kept.contains("Can we start with a pilot?"));
+        let recovered = journal::recover(&notes_dir, "the-next-session");
+        assert_eq!(recovered.len(), 1);
+        let notes = std::fs::read_to_string(&recovered[0]).unwrap();
+        for expected in [
+            "Can we start with a pilot?",
+            "Yes, thirty days with ten seats.",
+            "they renew in March",
+            "Offer **30 days**.",
+            "(recovered)",
+        ] {
+            assert!(notes.contains(expected), "{expected} is in the notes");
+        }
+        assert!(!record.exists(), "the record is gone once recovered");
+    }
+
+    /// Answers at once, except the meeting summary, which waits to be let go.
+    struct SlowSummary {
+        release: Arc<Mutex<Receiver<()>>>,
+    }
+    impl AnswerProvider for SlowSummary {
+        fn stream(
+            &self,
+            request: &AnswerRequest,
+            _cancel: &AtomicBool,
+            sink: &mut dyn FnMut(StreamEvent),
+        ) -> Result<(), String> {
+            if request
+                .system
+                .starts_with(agentdictate_core::notes_system_prompt())
+            {
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                sink(StreamEvent::Text("Agreed on a pilot.".into()));
+            }
+            sink(StreamEvent::Done);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn notes_are_on_disk_while_the_summary_is_still_being_written() {
+        let (mut engine, incoming, _events, _requests, directory) = harness(CopilotSettings {
+            auto_answer: false,
+            ..CopilotSettings::default()
+        });
+        let (release, wait) = mpsc::channel();
+        let wait = Arc::new(Mutex::new(wait));
+        engine.services.providers = Arc::new(move |_| {
+            Ok(Box::new(SlowSummary {
+                release: Arc::clone(&wait),
+            }) as Box<dyn AnswerProvider>)
+        });
+        engine.publish(said(1, Speaker::Them, "Can we start with a pilot?"));
+        engine.publish(said(2, Speaker::Me, "Yes, thirty days with ten seats."));
+        engine.publish(said(3, Speaker::Them, "Great, send the details."));
+        engine.notes_ready_wait = Duration::ZERO;
+        let record = engine.journal.path().to_owned();
+        assert!(record.exists());
+        let finishing = std::thread::spawn(move || engine.finish(&incoming, true));
+        let meetings = directory.path().join("meetings");
+        let notes_files = || -> Vec<PathBuf> {
+            std::fs::read_dir(&meetings)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                            !name.starts_with('.') && name.ends_with(".md")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (notes_files().is_empty() || record.exists()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let files = notes_files();
+        assert_eq!(files.len(), 1, "the notes exist before the summary");
+        let early = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(early.contains("Great, send the details."));
+        assert!(!early.contains("Agreed on a pilot."));
+        assert!(!record.exists(), "the saved notes replace the record");
+        release.send(()).unwrap();
+        finishing.join().unwrap();
+        assert_eq!(notes_files(), files, "the summary rewrites the same file");
+        let done = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(done.contains("Agreed on a pilot."));
+        assert!(done.contains("Great, send the details."));
     }
 
     #[test]
