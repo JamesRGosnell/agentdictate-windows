@@ -181,6 +181,7 @@ fn verify_overlay_lifecycle() -> anyhow::Result<()> {
         controller.update(OverlayUpdate {
             workflow: workflow.snapshot(),
             active_recording: None,
+            notice: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         let passed = loop {

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agentdictate_core::WorkflowSnapshot;
+use agentdictate_core::{DictationNotice, WorkflowSnapshot};
 use agentdictate_ui::{ActiveRecordingPresentation, OverlayPresentation};
 use serde::{Deserialize, Serialize};
 
@@ -29,9 +29,17 @@ pub struct ActiveRecordingUpdate {
 pub struct OverlayUpdate {
     pub workflow: WorkflowSnapshot,
     pub active_recording: Option<ActiveRecordingUpdate>,
+    /// Sent with the update that ends a dictation that was not pasted
+    /// normally. The presenter keeps it up for `OVERLAY_NOTICE_HOLD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<DictationNotice>,
 }
 
 impl OverlayUpdate {
+    pub fn state(&self) -> agentdictate_ui::OverlayState {
+        self.presentation().state()
+    }
+
     pub fn presentation(&self) -> OverlayPresentation {
         OverlayPresentation {
             workflow: self.workflow,
@@ -41,6 +49,7 @@ impl OverlayUpdate {
                     started_at_unix_millis: recording.started_at_unix_millis,
                 }
             }),
+            notice: self.notice,
         }
     }
 }

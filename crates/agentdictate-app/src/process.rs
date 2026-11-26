@@ -156,6 +156,7 @@ impl AgentProcess {
                         },
                     },
                     active_recording: None,
+                    notice: None,
                 });
             });
         self.daemon.set_overlay_controller(controller);

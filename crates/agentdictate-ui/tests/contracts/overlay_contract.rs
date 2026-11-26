@@ -1,13 +1,14 @@
 //! Overlay model, placement, and waveform contracts.
 
-use agentdictate_core::{JobId, Workflow, WorkflowSignal};
+use agentdictate_core::{DictationNotice, JobId, JobStage, Workflow, WorkflowSignal};
 use agentdictate_ui::{
     ActiveRecordingPresentation, OverlayPresentation, OverlayState, OverlayWindowPolicy,
     StatusTone, WaveformArea, WaveformFrame, fit_waveform, format_elapsed,
     recording_overlay_layout, sample_recent_wav, waveform_bars,
 };
 use agentdictate_ui::{
-    OVERLAY_FADE_HOLD, OVERLAY_FADE_IN, OVERLAY_FADE_OUT, overlay_fade_active, overlay_opacity,
+    OVERLAY_FADE_HOLD, OVERLAY_FADE_IN, OVERLAY_FADE_OUT, OVERLAY_NOTICE_HOLD, overlay_fade_active,
+    overlay_opacity,
 };
 use std::{fs, path::PathBuf, time::Duration};
 
@@ -90,6 +91,7 @@ fn recording_presentation_keeps_audio_telemetry_outside_the_workflow_snapshot() 
             audio_path: PathBuf::from("/tmp/active-recording.wav"),
             started_at_unix_millis: 1_726_000_000_250,
         }),
+        notice: None,
     };
 
     assert_eq!(presentation.state(), OverlayState::Recording);
@@ -124,6 +126,7 @@ fn recording_elapsed_time_uses_an_injected_clock_and_never_goes_negative() {
             audio_path: PathBuf::from("/tmp/active-recording.wav"),
             started_at_unix_millis: 10_000,
         }),
+        notice: None,
     };
 
     assert_eq!(presentation.elapsed_seconds(12_345), 2.345);
@@ -314,4 +317,60 @@ fn fade_is_active_only_while_a_ramp_is_progressing() {
 #[test]
 fn destruction_hold_outlasts_the_fade_out() {
     assert!(OVERLAY_FADE_HOLD > OVERLAY_FADE_OUT);
+}
+
+fn presentation(workflow: &Workflow, notice: Option<DictationNotice>) -> OverlayPresentation {
+    OverlayPresentation {
+        workflow: workflow.snapshot(),
+        active_recording: None,
+        notice,
+    }
+}
+
+#[test]
+fn a_notice_shows_once_the_dictation_has_ended() {
+    let notice = DictationNotice::LimitReached;
+    let state = presentation(&Workflow::new(), Some(notice)).state();
+    assert_eq!(state, OverlayState::Notice(notice));
+    assert!(state.is_visible());
+    assert_eq!(state.stable_id(), "recording-overlay-notice");
+    assert_eq!(state.label(), "Transcription limit reached");
+    assert_eq!(state.window_policy(), OverlayWindowPolicy::focus_neutral());
+
+    // A failure leaves the workflow asking for attention; the notice shows.
+    let job_id = JobId::new();
+    let mut failed = Workflow::new();
+    failed
+        .apply(WorkflowSignal::StartRequested { job_id })
+        .unwrap();
+    failed
+        .apply(WorkflowSignal::Interrupted {
+            job_id,
+            at: JobStage::Interrupted,
+        })
+        .unwrap();
+    assert_eq!(
+        presentation(&failed, Some(DictationNotice::MicrophoneFailed)).state(),
+        OverlayState::Notice(DictationNotice::MicrophoneFailed)
+    );
+    assert!(!presentation(&failed, None).state().is_visible());
+}
+
+#[test]
+fn a_new_dictation_replaces_a_notice() {
+    let job_id = JobId::new();
+    let mut starting = Workflow::new();
+    starting
+        .apply(WorkflowSignal::StartRequested { job_id })
+        .unwrap();
+    assert_eq!(
+        presentation(&starting, Some(DictationNotice::NotPasted)).state(),
+        OverlayState::Starting
+    );
+}
+
+#[test]
+fn a_notice_is_held_long_enough_to_read() {
+    assert!(OVERLAY_NOTICE_HOLD >= Duration::from_secs(2));
+    assert!(OVERLAY_NOTICE_HOLD > OVERLAY_FADE_IN + OVERLAY_FADE_HOLD);
 }

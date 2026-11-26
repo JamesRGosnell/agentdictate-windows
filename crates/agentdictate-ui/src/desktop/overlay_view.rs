@@ -2,9 +2,34 @@ use gpui::{Context, Hsla, IntoElement, Render, Window, prelude::*, px};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    OverlayPresentation, OverlayState, ThemeTokens, WaveformFrame, overlay_fade_active,
-    overlay_opacity,
+    NOTICE_CARD_MAX_WIDTH, OVERLAY_WIDTH, OverlayPresentation, OverlayState, RECORDING_CARD_WIDTH,
+    ThemeTokens, WaveformFrame, overlay_fade_active, overlay_opacity,
 };
+
+/// Text sizes and the side padding of a notice card.
+const NOTICE_TITLE_SIZE: f32 = 13.;
+const NOTICE_DETAIL_SIZE: f32 = 11.5;
+const NOTICE_PADDING: f32 = 14.;
+
+/// Width of `text` laid out on one line in the overlay font.
+fn line_width(window: &mut Window, text: &str, size: f32, weight: gpui::FontWeight) -> f32 {
+    let mut style = window.text_style().highlight(weight);
+    style.font_family = OVERLAY_FONT.into();
+    let run = gpui::TextRun {
+        len: text.len(),
+        font: style.font(),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    f32::from(
+        window
+            .text_system()
+            .layout_line(text, px(size), &[run], None)
+            .width,
+    )
+}
 
 #[cfg(windows)]
 const OVERLAY_FONT: &str = "Segoe UI";
@@ -149,9 +174,33 @@ impl Render for RecordingOverlay {
         let stable_id = self.state.stable_id().to_owned();
         let recording = self.state == OverlayState::Recording;
         let starting = self.state == OverlayState::Starting;
+        let notice = match &self.state {
+            OverlayState::Notice(notice) => Some(*notice),
+            _ => None,
+        };
         // Processing states (transcribing, cleaning) animate a small pulsing
         // ellipsis so the helper visibly shows work in progress.
-        let busy = self.state.is_visible() && !recording && !starting;
+        let busy = self.state.is_visible() && !recording && !starting && notice.is_none();
+        // A notice card grows to fit its longer line; every card is centered.
+        let card_width = match notice {
+            _ if starting => 40.,
+            Some(notice) => {
+                let title = line_width(
+                    window,
+                    notice.title(),
+                    NOTICE_TITLE_SIZE,
+                    gpui::FontWeight::MEDIUM,
+                );
+                let detail = notice.detail().map_or(0., |detail| {
+                    line_width(window, detail, NOTICE_DETAIL_SIZE, gpui::FontWeight::NORMAL)
+                });
+                // An even width keeps the centered card on whole pixels.
+                (((title.max(detail) + 2. * NOTICE_PADDING) / 2.).ceil() * 2.)
+                    .clamp(RECORDING_CARD_WIDTH, NOTICE_CARD_MAX_WIDTH)
+            }
+            None => RECORDING_CARD_WIDTH,
+        };
+        let card_left = ((OVERLAY_WIDTH as f32 - card_width) / 2.).floor();
         let now = cx.background_executor().now();
         let shown_at = *self.shown_at.get_or_insert(now);
         let since_shown = now.saturating_duration_since(shown_at);
@@ -227,9 +276,9 @@ impl Render for RecordingOverlay {
                     gpui::div()
                         .debug_selector(|| "recording-overlay-card".to_owned())
                         .absolute()
-                        .left(px(if starting { 80. } else { 8. }))
+                        .left(px(card_left))
                         .top(px(6.))
-                        .w(px(if starting { 40. } else { 184. }))
+                        .w(px(card_width))
                         .h(px(40.))
                         .overflow_hidden()
                         .rounded(px(20.))
@@ -283,7 +332,49 @@ impl Render for RecordingOverlay {
                                     .child(timer),
                             )
                         })
-                        .when(!recording && !starting, |card| {
+                        .when_some(notice, |card, notice| {
+                            card.child(
+                                gpui::div()
+                                    .debug_selector(|| "recording-overlay-notice".to_owned())
+                                    .size_full()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .justify_center()
+                                    .px(px(NOTICE_PADDING))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .font_family(OVERLAY_FONT)
+                                    .child(
+                                        gpui::div()
+                                            .debug_selector(|| {
+                                                "recording-overlay-notice-title".to_owned()
+                                            })
+                                            .max_w_full()
+                                            .truncate()
+                                            .text_size(px(NOTICE_TITLE_SIZE))
+                                            .line_height(px(16.))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(gpui::rgba(0xf5f5f5f5))
+                                            .child(notice.title()),
+                                    )
+                                    .when_some(notice.detail(), |text, detail| {
+                                        text.child(
+                                            gpui::div()
+                                                .debug_selector(|| {
+                                                    "recording-overlay-notice-detail".to_owned()
+                                                })
+                                                .max_w_full()
+                                                .truncate()
+                                                .text_size(px(NOTICE_DETAIL_SIZE))
+                                                .line_height(px(14.))
+                                                .text_color(gpui::rgba(0xf5f5f5b0))
+                                                .child(detail),
+                                        )
+                                    }),
+                            )
+                        })
+                        .when(busy, |card| {
                             card.child(
                                 gpui::div()
                                     .size_full()

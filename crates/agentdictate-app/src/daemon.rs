@@ -55,6 +55,7 @@ impl<R: Recorder> Recorder for StartingRecorder<'_, R> {
             overlay.update(OverlayUpdate {
                 workflow: self.workflow.snapshot(),
                 active_recording: None,
+                notice: None,
             });
         }
         tracing::info!(job_id = %job.id, "recording startup requested");
@@ -825,6 +826,7 @@ where
         OverlayUpdate {
             workflow: self.workflow.snapshot(),
             active_recording: self.active_recording.clone(),
+            notice: None,
         }
     }
 

@@ -20,6 +20,7 @@ fn update(workflow: &Workflow) -> OverlayUpdate {
     OverlayUpdate {
         workflow: workflow.snapshot(),
         active_recording: None,
+        notice: None,
     }
 }
 
@@ -95,6 +96,7 @@ fn helper_update_serializes_only_overlay_workflow_and_active_recording_metadata(
             audio_path: PathBuf::from("/tmp/recording.wav"),
             started_at_unix_millis: 1_726_000_000_250,
         }),
+        notice: None,
     };
 
     let encoded = serde_json::to_string(&update).unwrap();
@@ -145,6 +147,7 @@ fn visible_overlay_is_relaunched_when_its_helper_exits_without_an_update() {
             audio_path: directory.path().join("active-recording.wav"),
             started_at_unix_millis: 1_726_000_000_250,
         }),
+        notice: None,
     };
     let hidden = update(&Workflow::new());
     let (overlay, presenter) = start_overlay_presenter(executable).unwrap();

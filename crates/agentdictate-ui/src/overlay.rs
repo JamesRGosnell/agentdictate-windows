@@ -5,11 +5,18 @@ use std::{
     time::Duration,
 };
 
-use agentdictate_core::{ProcessingStage, WorkflowPhase, WorkflowSnapshot};
+use agentdictate_core::{DictationNotice, ProcessingStage, WorkflowPhase, WorkflowSnapshot};
 
 use crate::StatusTone;
 
-pub const OVERLAY_WIDTH: u32 = 200;
+/// The recording card is this wide; the waveform and timer fill it.
+pub const RECORDING_CARD_WIDTH: f32 = 184.0;
+/// A notice card grows past the recording card to fit its text, up to this.
+pub const NOTICE_CARD_MAX_WIDTH: f32 = 240.0;
+/// The window fits the widest card and its shadow, and every card is
+/// centered in it, so the pill stays centered whatever it shows. The
+/// window passes clicks through, so its transparent margin takes none.
+pub const OVERLAY_WIDTH: u32 = NOTICE_CARD_MAX_WIDTH as u32 + 16;
 pub const OVERLAY_HEIGHT: u32 = 56;
 pub const OVERLAY_BOTTOM_GAP: u32 = 72;
 pub const WAVEFORM_SOURCE_BIN_COUNT: usize = 44;
@@ -22,6 +29,8 @@ pub const OVERLAY_FADE_OUT: Duration = Duration::from_millis(120);
 /// Hold between dismissal and window destruction: the fade-out plus two
 /// 60 Hz frames of margin so the destroyed frame is fully transparent.
 pub const OVERLAY_FADE_HOLD: Duration = Duration::from_millis(150);
+/// How long a notice stays up before the pill fades out.
+pub const OVERLAY_NOTICE_HOLD: Duration = Duration::from_millis(2_500);
 const WAV_HEADER_BYTES: u64 = 44;
 const RECENT_SAMPLE_COUNT: usize = 2_816;
 
@@ -40,11 +49,20 @@ pub struct ActiveRecordingPresentation {
 pub struct OverlayPresentation {
     pub workflow: WorkflowSnapshot,
     pub active_recording: Option<ActiveRecordingPresentation>,
+    /// How the dictation that just ended went, when it was not pasted.
+    pub notice: Option<DictationNotice>,
 }
 
 impl OverlayPresentation {
+    /// The workflow's state while a dictation runs; once it has ended, the
+    /// notice about it, if any. A new dictation always wins over a notice.
     pub fn state(&self) -> OverlayState {
-        OverlayState::from(self.workflow)
+        match (OverlayState::from(self.workflow), self.notice) {
+            (OverlayState::Hidden | OverlayState::RecoverableFailure { .. }, Some(notice)) => {
+                OverlayState::Notice(notice)
+            }
+            (state, _) => state,
+        }
     }
 
     /// Elapsed recording time against an injected clock, kept deterministic
@@ -347,8 +365,9 @@ fn fade_progress(elapsed: Duration, span: Duration) -> f32 {
 ///
 /// The transient window opens during microphone startup, recording,
 /// transcription, or cleaning, then lingers up to
-/// `OVERLAY_FADE_HOLD` while it fades out. Recovery remains durable in
-/// History rather than turning the overlay into a second action surface.
+/// `OVERLAY_FADE_HOLD` while it fades out. A dictation that ends without a
+/// normal paste shows a `Notice` for `OVERLAY_NOTICE_HOLD` instead. The
+/// overlay never offers actions; Recovery keeps the dictation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OverlayState {
     Hidden,
@@ -360,6 +379,7 @@ pub enum OverlayState {
     ReadyToDeliver,
     Delivering,
     RecoverableFailure { message: String, action: String },
+    Notice(DictationNotice),
 }
 
 impl OverlayState {
@@ -373,7 +393,11 @@ impl OverlayState {
     pub const fn is_visible(&self) -> bool {
         matches!(
             self,
-            Self::Starting | Self::Recording | Self::Transcribing | Self::Cleaning
+            Self::Starting
+                | Self::Recording
+                | Self::Transcribing
+                | Self::Cleaning
+                | Self::Notice(_)
         )
     }
 
@@ -393,6 +417,7 @@ impl OverlayState {
             Self::ReadyToDeliver => "recording-overlay-ready-to-deliver",
             Self::Delivering => "recording-overlay-delivering",
             Self::RecoverableFailure { .. } => "recording-overlay-recoverable-failure",
+            Self::Notice(_) => "recording-overlay-notice",
         }
     }
 
@@ -411,6 +436,7 @@ impl OverlayState {
             Self::ReadyToDeliver => "Ready to paste",
             Self::Delivering => "Pasting…",
             Self::RecoverableFailure { message, .. } => message,
+            Self::Notice(notice) => notice.title(),
         }
     }
 
@@ -429,6 +455,10 @@ impl OverlayState {
             Self::Finishing | Self::Transcribing | Self::Cleaning => StatusTone::Processing,
             Self::ReadyToDeliver | Self::Delivering => StatusTone::Success,
             Self::RecoverableFailure { .. } => StatusTone::Danger,
+            Self::Notice(DictationNotice::CopiedNotPasted | DictationNotice::NothingHeard) => {
+                StatusTone::Neutral
+            }
+            Self::Notice(_) => StatusTone::Danger,
         }
     }
 }

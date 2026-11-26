@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$Binary,
-    [ValidateSet('starting','recording','transcribing','cleaning')][string]$State = 'recording',
+    [ValidateSet('starting','recording','transcribing','cleaning','notice')][string]$State = 'recording',
+    # The notice shown when -State is notice, as the overlay protocol names it.
+    [string]$Notice = 'transcription_failed',
     [ValidateRange(1,50)][int]$Samples = 1,
     [string]$TimingsPath,
     [string]$ComparisonBinary
@@ -79,7 +81,7 @@ public class AgentDictateOverlayProbe {
       if((normalStyle&0x80000000L)==0||(normalStyle&0x00C40000L)!=0)throw new Exception("Overlay must be a borderless WS_POPUP, without caption or resize frame");
       RECT client;var origin=new POINT();
       if(!GetClientRect(hwnd,out client)||!ClientToScreen(hwnd,ref origin)||client.right!=rect.right-rect.left||client.bottom!=rect.bottom-rect.top||origin.x!=rect.left||origin.y!=rect.top)throw new Exception("Overlay has a non-client frame or inset");
-      var scale=GetDpiForWindow(hwnd)/96.0;var width=(int)Math.Round(200*scale);var height=(int)Math.Round(56*scale);var gap=(int)Math.Round(72*scale);
+      var scale=GetDpiForWindow(hwnd)/96.0;var width=(int)Math.Round(256*scale);var height=(int)Math.Round(56*scale);var gap=(int)Math.Round(72*scale);
       int expectedX=info.work.left+(info.work.right-info.work.left-width)/2;int expectedY=info.work.bottom-height-gap;
       if(Math.Abs(rect.left-expectedX)>2||Math.Abs(rect.top-expectedY)>2||Math.Abs(rect.right-rect.left-width)>2||Math.Abs(rect.bottom-rect.top-height)>2)throw new Exception("Overlay is not centered above the primary taskbar: actual "+rect.left+","+rect.top+","+rect.right+","+rect.bottom+" expected "+expectedX+","+expectedY+","+width+","+height);
       using(var bitmap=new System.Drawing.Bitmap(rect.right-rect.left,rect.bottom-rect.top)){
@@ -112,7 +114,9 @@ $previousDataHome = $env:AGENTDICTATE_DATA_HOME
 try {
     $env:AGENTDICTATE_DATA_HOME = $taskProbeData
     $taskPhase = @{phase='recording';job_id=[guid]::NewGuid().ToString()}
+    $taskNotice = $null
     if ($State -eq 'starting') { $taskPhase.phase = 'starting' }
+    elseif ($State -eq 'notice') { $taskPhase = @{phase='ready'}; $taskNotice = @{notice=$Notice} }
     elseif ($State -ne 'recording') { $taskPhase.phase = 'processing'; $taskPhase.stage = $State }
     $taskActiveRecording = $null
     if ($State -eq 'recording') {
@@ -130,7 +134,9 @@ try {
         } finally { $taskWriter.Dispose() }
         $taskActiveRecording = @{audio_path=$taskWavePath;started_at_unix_millis=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 6000}
     }
-    $taskOverlayJson = @{workflow=@{phase=$taskPhase};active_recording=$taskActiveRecording} | ConvertTo-Json -Depth 5 -Compress
+    $taskOverlay = @{workflow=@{phase=$taskPhase};active_recording=$taskActiveRecording}
+    if ($taskNotice) { $taskOverlay.notice = $taskNotice }
+    $taskOverlayJson = $taskOverlay | ConvertTo-Json -Depth 5 -Compress
     $taskVariants = @([pscustomobject]@{label='baseline';binary=[IO.Path]::GetFullPath($Binary)})
     if ($ComparisonBinary) {
         $taskVariants += [pscustomobject]@{label='candidate';binary=[IO.Path]::GetFullPath($ComparisonBinary)}

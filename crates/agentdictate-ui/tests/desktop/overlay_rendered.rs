@@ -9,10 +9,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use agentdictate_core::{JobId, Workflow, WorkflowSignal};
+use agentdictate_core::{DictationNotice, JobId, Workflow, WorkflowSignal};
 use agentdictate_ui::{
-    ActiveRecordingPresentation, OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayPresentation,
-    RecordingOverlay, test_support,
+    ActiveRecordingPresentation, NOTICE_CARD_MAX_WIDTH, OVERLAY_HEIGHT, OVERLAY_WIDTH,
+    OverlayPresentation, RECORDING_CARD_WIDTH, RecordingOverlay, test_support,
 };
 use gpui::{
     AppContext, Bounds, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, point, px,
@@ -28,6 +28,7 @@ fn recording_overlay_restores_the_twenty_bar_waveform_and_timer(cx: &mut TestApp
         .debug_bounds("recording-overlay-card")
         .expect("overlay card renders");
     assert_eq!(card.size, size(px(184.), px(40.)));
+    assert_eq!(card.center().x, px(OVERLAY_WIDTH as f32 / 2.));
     assert_recording_content_fits(cx);
     for selector in [
         "recording-overlay-wave-0",
@@ -105,6 +106,7 @@ fn open_recording_overlay(
             audio_path: audio_path.clone(),
             started_at_unix_millis: now_unix_millis().saturating_sub(elapsed_millis),
         }),
+        notice: None,
     };
     let overlay = cx.new(|_| RecordingOverlay::from_presentation(presentation));
     let root = overlay.clone();
@@ -243,5 +245,71 @@ fn processing_labels_and_activity_dots_fit_inside_the_capsule(cx: &mut TestAppCo
         assert!(label.right() <= card.right() - px(14.));
         assert!(label.top() >= card.top() && label.bottom() <= card.bottom());
     }
+    fs::remove_file(audio_path).unwrap();
+}
+
+#[gpui::test]
+fn notices_render_their_text_inside_a_centered_pill(cx: &mut TestAppContext) {
+    let (audio_path, overlay, cx) = open_recording_overlay(cx, 0);
+    for notice in [
+        DictationNotice::CopiedNotPasted,
+        DictationNotice::NotPasted,
+        DictationNotice::MayNotHavePasted { copied: true },
+        DictationNotice::MayNotHavePasted { copied: false },
+        DictationNotice::NothingHeard,
+        DictationNotice::LimitReached,
+        DictationNotice::SignInNeeded,
+        DictationNotice::TranscriptionFailed,
+        DictationNotice::MicrophoneFailed,
+        DictationNotice::RecordingFailed,
+    ] {
+        overlay.update(cx, |overlay, cx| {
+            overlay.set_state(agentdictate_ui::OverlayState::Notice(notice));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.debug_bounds("recording-overlay-notice")
+            .unwrap_or_else(|| panic!("{notice:?} did not render"));
+        let card = cx.debug_bounds("recording-overlay-card").unwrap();
+        assert_eq!(card.center().x, px(OVERLAY_WIDTH as f32 / 2.), "{notice:?}");
+        assert_eq!(card.size.height, px(40.));
+        assert!(card.size.width >= px(RECORDING_CARD_WIDTH));
+        assert!(card.size.width <= px(NOTICE_CARD_MAX_WIDTH));
+        assert!(card.left() >= px(0.) && card.right() <= px(OVERLAY_WIDTH as f32));
+
+        // GPUI keeps debug bounds from earlier frames, so only elements
+        // that never rendered in this test can be checked for absence.
+        let title = cx.debug_bounds("recording-overlay-notice-title").unwrap();
+        let mut lines = vec![title];
+        if notice.detail().is_some() {
+            let detail = cx.debug_bounds("recording-overlay-notice-detail").unwrap();
+            assert!(detail.top() >= title.bottom(), "{notice:?}");
+            lines.push(detail);
+        }
+        for line in lines {
+            assert!(line.left() >= card.left() + px(8.), "{notice:?}");
+            assert!(line.right() <= card.right() - px(8.), "{notice:?}");
+            assert!(line.top() >= card.top() && line.bottom() <= card.bottom());
+        }
+        for selector in [
+            "recording-overlay-busy-dot-0",
+            "recording-overlay-status-label",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{notice:?}: {selector}"
+            );
+        }
+    }
+
+    // A new dictation takes the pill back at once.
+    overlay.update(cx, |overlay, cx| {
+        overlay.set_state(agentdictate_ui::OverlayState::Recording);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let card = cx.debug_bounds("recording-overlay-card").unwrap();
+    assert_eq!(card.size, size(px(RECORDING_CARD_WIDTH), px(40.)));
+    assert_recording_content_fits(cx);
     fs::remove_file(audio_path).unwrap();
 }

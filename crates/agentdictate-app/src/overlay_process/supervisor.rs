@@ -114,6 +114,7 @@ mod focusless_teardown_tests {
         OverlayUpdate {
             workflow: workflow.snapshot(),
             active_recording: None,
+            notice: None,
         }
     }
 
