@@ -157,6 +157,38 @@ fn encode_ogg_opus(
     Ok(encoded)
 }
 
+/// Captured WAV is 16 kHz mono PCM16: 32,000 bytes per second of audio.
+const WAV_BYTES_PER_SECOND: u64 = 32_000;
+
+/// Recordings up to 60 s upload as WAV without compressing. Starting ffmpeg
+/// costs about 100 ms at best and often more than a second, which is more
+/// than the upload it saves on a clip this short; at 60 s the WAV is still
+/// under 2 MB, far below OpenAI's 25 MB limit.
+const UNCOMPRESSED_UPLOAD_MAX_BYTES: u64 = 60 * WAV_BYTES_PER_SECOND;
+
+/// True when a WAV of `wav_bytes` is long enough that compressing it saves
+/// more upload time than running the encoder costs.
+const fn compression_pays_off(wav_bytes: u64) -> bool {
+    wav_bytes > UNCOMPRESSED_UPLOAD_MAX_BYTES
+}
+
+/// Chooses the upload for one recording: the WAV itself for a short clip,
+/// otherwise its compression, falling back to the WAV.
+fn upload_audio(
+    encoder: &EncoderCommand,
+    audio_path: &Path,
+    audio_seconds: f64,
+) -> Result<UploadAudio, ExternalError> {
+    // An unreadable size goes down the compression path, whose WAV fallback
+    // reports the read failure.
+    let wav_bytes = std::fs::metadata(audio_path).map_or(u64::MAX, |metadata| metadata.len());
+    if !compression_pays_off(wav_bytes) {
+        return wav_upload(audio_path);
+    }
+    let audio_seconds = audio_seconds.max(wav_bytes as f64 / WAV_BYTES_PER_SECOND as f64);
+    prepare_upload_audio(encoder, audio_path, encode_deadline(audio_seconds))
+}
+
 fn prepare_upload_audio(
     encoder: &EncoderCommand,
     audio_path: &Path,
@@ -172,17 +204,21 @@ fn prepare_upload_audio(
         }),
         Err(error) => {
             tracing::warn!(%error, "audio compression unavailable; uploading raw WAV");
-            let bytes = std::fs::read(audio_path).map_err(|error| {
-                ExternalError::new(format!("Could not read the captured recording: {error}"))
-            })?;
-            Ok(UploadAudio {
-                bytes,
-                file_name: upload_file_name(audio_path, "wav"),
-                mime: "audio/wav",
-                encode_ms: None,
-            })
+            wav_upload(audio_path)
         }
     }
+}
+
+fn wav_upload(audio_path: &Path) -> Result<UploadAudio, ExternalError> {
+    let bytes = std::fs::read(audio_path).map_err(|error| {
+        ExternalError::new(format!("Could not read the captured recording: {error}"))
+    })?;
+    Ok(UploadAudio {
+        bytes,
+        file_name: upload_file_name(audio_path, "wav"),
+        mime: "audio/wav",
+        encode_ms: None,
+    })
 }
 
 fn cleanup_reasoning_effort(value: &str) -> Option<&str> {
@@ -594,11 +630,7 @@ impl SpeechTransport for ReqwestOpenAiTransport {
                 "This model accepts one language hint; choose one language or automatic detection",
             ));
         }
-        let upload = prepare_upload_audio(
-            &self.encoder,
-            request.audio_path,
-            encode_deadline(request.duration_seconds),
-        )?;
+        let upload = upload_audio(&self.encoder, request.audio_path, request.duration_seconds)?;
         let upload_bytes = upload.bytes.len();
         let file = reqwest::blocking::multipart::Part::bytes(upload.bytes)
             .file_name(upload.file_name)
@@ -782,8 +814,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        EncoderCommand, cleanup_reasoning_effort, encode_ogg_opus, ffmpeg_command,
-        prepare_upload_audio, upload_file_name,
+        EncoderCommand, UNCOMPRESSED_UPLOAD_MAX_BYTES, cleanup_reasoning_effort,
+        compression_pays_off, encode_ogg_opus, ffmpeg_command, prepare_upload_audio, upload_audio,
+        upload_file_name,
     };
 
     fn ffmpeg() -> EncoderCommand {
@@ -855,6 +888,34 @@ mod tests {
 
         assert_eq!(upload.mime, "audio/wav");
         assert_eq!(upload.bytes, tiny_wav());
+    }
+
+    #[test]
+    fn clips_up_to_a_minute_upload_as_wav_without_running_the_encoder() {
+        assert!(!compression_pays_off(0));
+        assert!(!compression_pays_off(3 * 32_000));
+        assert!(!compression_pays_off(UNCOMPRESSED_UPLOAD_MAX_BYTES));
+        assert!(compression_pays_off(UNCOMPRESSED_UPLOAD_MAX_BYTES + 1));
+
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let encoder: EncoderCommand = Arc::new(move |_: &Path| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Command::new("agentdictate-missing-encoder-for-test")
+        });
+        let short = directory.path().join("short.wav");
+        std::fs::write(&short, tiny_wav()).unwrap();
+        let long = directory.path().join("long.wav");
+        std::fs::write(&long, vec![0; UNCOMPRESSED_UPLOAD_MAX_BYTES as usize + 1]).unwrap();
+
+        let upload = upload_audio(&encoder, &short, 0.1).unwrap();
+        assert_eq!(upload.mime, "audio/wav");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let upload = upload_audio(&encoder, &long, 61.0).unwrap();
+        assert_eq!(upload.mime, "audio/wav");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
