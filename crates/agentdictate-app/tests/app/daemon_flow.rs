@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use agentdictate_app::{AppPaths, CapturedRecording, Daemon, RecordingController};
 use agentdictate_core::{HistoryPageRequest, HotkeyReadiness, JobStage, Settings, WorkflowPhase};
 use agentdictate_runtime::{
-    Deliverer, DeliveryDisposition, ExternalError, HistoryQuery, Recorder, RecordingJob, Runtime,
+    Deliverer, DeliveryDisposition, ExternalError, FocusedWindow, HistoryQuery, Recorder,
+    RecordingJob, Runtime, Transcriber, Transcript,
 };
 use rusqlite::params;
 use tempfile::tempdir;
@@ -169,6 +170,98 @@ impl Deliverer for ExitInspectingDelivery {
             paste_triggered: true,
         })
     }
+}
+
+const EDITOR: FocusedWindow = FocusedWindow {
+    window: 0x1234,
+    process_id: 40,
+};
+const BROWSER: FocusedWindow = FocusedWindow {
+    window: 0x5678,
+    process_id: 41,
+};
+
+/// The desktop's focused window, shared by the fakes so transcription can
+/// move it the way a user switching windows would.
+type SharedFocus = std::rc::Rc<std::cell::Cell<Option<FocusedWindow>>>;
+
+/// Moves the focus to the browser while the transcript is produced.
+struct FocusMovingTranscriber(SharedFocus);
+
+impl Transcriber for FocusMovingTranscriber {
+    fn transcribe(&mut self, job: &RecordingJob) -> Result<Transcript, ExternalError> {
+        self.0.set(Some(BROWSER));
+        FixedTranscriber.transcribe(job)
+    }
+}
+
+/// Records which stop window each delivery was asked to respect, and
+/// leaves the first one unsent so it can be retried from Recovery.
+struct StopWindowDelivery {
+    focus: SharedFocus,
+    received: Vec<Option<FocusedWindow>>,
+}
+
+impl Deliverer for StopWindowDelivery {
+    fn deliver(&mut self, job: &RecordingJob) -> Result<DeliveryDisposition, ExternalError> {
+        self.deliver_to(job, None)
+    }
+
+    fn focused_window(&mut self) -> Option<FocusedWindow> {
+        self.focus.get()
+    }
+
+    fn deliver_to(
+        &mut self,
+        _job: &RecordingJob,
+        stopped_in: Option<FocusedWindow>,
+    ) -> Result<DeliveryDisposition, ExternalError> {
+        self.received.push(stopped_in);
+        Ok(if self.received.len() == 1 {
+            DeliveryDisposition::NotSent {
+                copied_to_clipboard: false,
+                reason: "held for the retry".into(),
+            }
+        } else {
+            DeliveryDisposition::Submitted {
+                copied_to_clipboard: true,
+                paste_triggered: true,
+            }
+        })
+    }
+}
+
+#[test]
+fn delivery_receives_the_window_focused_at_stop_and_a_retry_receives_none() {
+    let directory = tempdir().unwrap();
+    let paths = app_paths(directory.path());
+    std::fs::create_dir_all(paths.database_file.parent().unwrap()).unwrap();
+    let runtime = Runtime::open(&paths.database_file).unwrap();
+    let focus = SharedFocus::default();
+    let mut daemon = Daemon::new(
+        runtime,
+        Settings::default(),
+        paths,
+        TimedRecorder(3.0),
+        FocusMovingTranscriber(focus.clone()),
+        StopWindowDelivery {
+            focus: focus.clone(),
+            received: Vec::new(),
+        },
+    );
+
+    daemon.start_recording().unwrap();
+    focus.set(Some(EDITOR));
+    let stopped = daemon.stop_recording().unwrap();
+    // The focus moved to the browser during transcription; delivery still
+    // gets the editor the user stopped in.
+    assert_eq!(focus.get(), Some(BROWSER));
+    assert_eq!(daemon.deliverer().received, vec![Some(EDITOR)]);
+    assert_ne!(stopped.stage, JobStage::Delivered);
+
+    let retried = daemon.retry_delivery(stopped.id).unwrap();
+    assert_eq!(retried.stage, JobStage::Delivered);
+    assert_eq!(daemon.deliverer().received, vec![Some(EDITOR), None]);
 }
 
 #[test]

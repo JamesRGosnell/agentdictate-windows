@@ -191,7 +191,36 @@ pub enum DeliveryStatus {
 }
 
 pub trait Deliverer {
+    /// Delivers into whichever window has the focus now. Recovery retries
+    /// use this: they have no window the dictation was stopped in.
     fn deliver(&mut self, job: &RecordingJob) -> Result<DeliveryDisposition, ExternalError>;
+
+    /// The window a paste would reach right now, or `None` when the
+    /// platform cannot tell windows apart.
+    fn focused_window(&mut self) -> Option<FocusedWindow> {
+        None
+    }
+
+    /// Delivers a dictation the user stopped while `stopped_in` had the
+    /// focus. When the focus has moved since, the text must only be copied
+    /// and reported as `Submitted { copied_to_clipboard: true,
+    /// paste_triggered: false }`. `None` delivers like [`Self::deliver`].
+    fn deliver_to(
+        &mut self,
+        job: &RecordingJob,
+        stopped_in: Option<FocusedWindow>,
+    ) -> Result<DeliveryDisposition, ExternalError> {
+        let _ = stopped_in;
+        self.deliver(job)
+    }
+}
+
+/// A top-level window that had the keyboard focus. The owning process id
+/// tells a window apart from a later one that reused its handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FocusedWindow {
+    pub window: u64,
+    pub process_id: u32,
 }
 
 /// Confirms that transient AgentDictate UI cannot receive the upcoming paste.

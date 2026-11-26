@@ -2,7 +2,7 @@
 use crate::{CapturedRecording, RecordingController};
 use agentdictate_core::{ClientCommand, JobId, Settings};
 use agentdictate_runtime::{
-    Deliverer, DeliveryDisposition, ExternalError, IpcClient, Recorder, RecordingJob,
+    Deliverer, DeliveryDisposition, ExternalError, FocusedWindow, IpcClient, Recorder, RecordingJob,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::{
@@ -565,16 +565,80 @@ fn process_integrity(pid: Option<u32>) -> ProcessIntegrity {
         integrity
     }
 }
+/// Whether a finished dictation may be pasted, or only copied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasteDecision {
+    Paste,
+    CopyOnly,
+}
+/// A dictation is pasted only into the window it was stopped in. A delivery
+/// without a stop window (a Recovery retry, or a focus that could not be
+/// read at stop) pastes into the current window, as before.
+fn paste_decision(stopped_in: Option<FocusedWindow>, now: Option<FocusedWindow>) -> PasteDecision {
+    match stopped_in {
+        None => PasteDecision::Paste,
+        Some(stopped_in) if now == Some(stopped_in) => PasteDecision::Paste,
+        Some(_) => PasteDecision::CopyOnly,
+    }
+}
+fn foreground_window() -> Option<FocusedWindow> {
+    // SAFETY: only queries the foreground HWND and its owning process id.
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_null() {
+        return None;
+    }
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+    Some(FocusedWindow {
+        window: window as usize as u64,
+        process_id,
+    })
+}
+/// The text stays on the clipboard for the user to paste; the job counts
+/// as delivered.
+const COPIED_ONLY: DeliveryDisposition = DeliveryDisposition::Submitted {
+    copied_to_clipboard: true,
+    paste_triggered: false,
+};
 fn not_sent(copied_to_clipboard: bool, reason: impl Into<String>) -> DeliveryDisposition {
     DeliveryDisposition::NotSent {
         copied_to_clipboard,
         reason: reason.into(),
     }
 }
+impl SystemDeliverer {
+    /// Copies the transcript without pasting because the focus left the
+    /// window the dictation was stopped in.
+    fn copy_after_focus_moved(&mut self, text: &str) -> DeliveryDisposition {
+        tracing::info!("the focus moved since the stop; copied without pasting");
+        match self.copy_text(text) {
+            Ok(()) => COPIED_ONLY,
+            Err(error) => not_sent(
+                false,
+                format!("Could not copy the text, so nothing was pasted: {error}"),
+            ),
+        }
+    }
+}
 impl Deliverer for SystemDeliverer {
+    fn deliver(&mut self, job: &RecordingJob) -> Result<DeliveryDisposition, ExternalError> {
+        self.deliver_to(job, None)
+    }
+    fn focused_window(&mut self) -> Option<FocusedWindow> {
+        foreground_window()
+    }
     /// Pastes with one injected shortcut. Every failure before any key is
     /// injected is `NotSent`, so the text can be pasted again safely.
-    fn deliver(&mut self, job: &RecordingJob) -> Result<DeliveryDisposition, ExternalError> {
+    fn deliver_to(
+        &mut self,
+        job: &RecordingJob,
+        stopped_in: Option<FocusedWindow>,
+    ) -> Result<DeliveryDisposition, ExternalError> {
+        // Copying needs no released modifiers, so a moved focus is
+        // honored before waiting for them.
+        if paste_decision(stopped_in, foreground_window()) == PasteDecision::CopyOnly {
+            return Ok(self.copy_after_focus_moved(&job.final_text));
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         // Wait for physical modifiers to be released; never release the user's held keys.
         while [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
@@ -589,14 +653,18 @@ impl Deliverer for SystemDeliverer {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let target = unsafe { GetForegroundWindow() };
-        if target.is_null() {
-            return Ok(not_sent(false, "No focused destination window"));
+        let Some(focused) = foreground_window() else {
+            return Ok(if stopped_in.is_some() {
+                self.copy_after_focus_moved(&job.final_text)
+            } else {
+                not_sent(false, "No focused destination window")
+            });
+        };
+        if paste_decision(stopped_in, Some(focused)) == PasteDecision::CopyOnly {
+            return Ok(self.copy_after_focus_moved(&job.final_text));
         }
-        let mut pid = 0;
-        unsafe {
-            GetWindowThreadProcessId(target, &mut pid);
-        }
+        let target = focused.window as usize as HWND;
+        let pid = focused.process_id;
         let mut destination_is_ours = pid == std::process::id();
         unsafe {
             let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -711,6 +779,39 @@ mod tests {
             || panic!("already focused destination must not wait"),
         )
         .unwrap();
+    }
+    #[test]
+    fn a_dictation_is_pasted_only_into_the_window_it_was_stopped_in() {
+        use PasteDecision::{CopyOnly, Paste};
+        let editor = FocusedWindow {
+            window: 0x1234,
+            process_id: 40,
+        };
+        let browser = FocusedWindow {
+            window: 0x5678,
+            process_id: 41,
+        };
+        // The handle was freed and reused by another process's window.
+        let reused = FocusedWindow {
+            window: 0x1234,
+            process_id: 42,
+        };
+        for (stopped_in, now, expected) in [
+            (Some(editor), Some(editor), Paste),
+            (Some(editor), Some(browser), CopyOnly),
+            (Some(editor), Some(reused), CopyOnly),
+            // Nothing has the focus, so it surely left the stop window.
+            (Some(editor), None, CopyOnly),
+            // Recovery retries have no stop window and paste where focused.
+            (None, Some(browser), Paste),
+            (None, None, Paste),
+        ] {
+            assert_eq!(
+                paste_decision(stopped_in, now),
+                expected,
+                "{stopped_in:?} -> {now:?}"
+            );
+        }
     }
     #[test]
     fn paste_is_skipped_only_for_a_higher_integrity_or_unreadable_target() {

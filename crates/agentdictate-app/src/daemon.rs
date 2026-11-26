@@ -7,9 +7,10 @@ use agentdictate_core::{
     WorkflowSignal, WorkspaceSnapshot,
 };
 use agentdictate_runtime::{
-    Deliverer, DeliveryGate, DeliveryGateError, DeliveryStatus, ExternalError,
-    HeadlessDeliveryGate, HistoryCursor, HistoryEntry, HistoryQuery, Recorder, RecordingJob,
-    RecordingRequest, Runtime, RuntimeError, Transcriber, UsageAggregate, UsageMetric,
+    Deliverer, DeliveryDisposition, DeliveryGate, DeliveryGateError, DeliveryStatus, ExternalError,
+    FocusedWindow, HeadlessDeliveryGate, HistoryCursor, HistoryEntry, HistoryQuery, Recorder,
+    RecordingJob, RecordingRequest, Runtime, RuntimeError, Transcriber, UsageAggregate,
+    UsageMetric,
 };
 use chrono::Utc;
 use thiserror::Error;
@@ -62,6 +63,18 @@ impl<R: Recorder> Recorder for StartingRecorder<'_, R> {
 
     fn abort_start(&mut self, job: &RecordingJob) -> Result<(), ExternalError> {
         self.inner.abort_start(job)
+    }
+}
+
+/// Delivers a stopped dictation only into the window it was stopped in.
+struct StoppedInDeliverer<'a, D> {
+    inner: &'a mut D,
+    stopped_in: Option<FocusedWindow>,
+}
+
+impl<D: Deliverer> Deliverer for StoppedInDeliverer<'_, D> {
+    fn deliver(&mut self, job: &RecordingJob) -> Result<DeliveryDisposition, ExternalError> {
+        self.inner.deliver_to(job, self.stopped_in)
     }
 }
 
@@ -231,6 +244,9 @@ where
     pub fn stop_recording(&mut self) -> Result<RecordingJob, DaemonError> {
         let stop_started = std::time::Instant::now();
         let id = self.active_job.ok_or(DaemonError::NotRecording)?;
+        // Every stop (hotkey, tray, CLI) arrives here; the paste may only
+        // land in the window the user was in when they stopped.
+        let stopped_in = self.deliverer.focused_window();
         let job = self.runtime.job(id)?.ok_or(RuntimeError::JobNotFound(id))?;
         self.workflow.apply(WorkflowSignal::StopRequested)?;
         tracing::info!(job_id = %id, "recording stop requested");
@@ -284,7 +300,10 @@ where
             id,
             &mut self.transcriber,
             &mut self.overlay,
-            &mut self.deliverer,
+            &mut StoppedInDeliverer {
+                inner: &mut self.deliverer,
+                stopped_in,
+            },
         ) {
             Ok(result) => result,
             Err(error) => {
