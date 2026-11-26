@@ -225,6 +225,7 @@ fn finish_capture(capture: Capture) -> Result<CapturedRecording, ExternalError> 
 impl SystemRecordingController {
     pub fn for_system(settings: &Settings, runtime: &Path) -> Self {
         let (commands, incoming) = mpsc::channel();
+        let ducker = ducking::PlaybackDucker::new(runtime.join("ducking.json"));
         let runtime = runtime.to_owned();
         std::thread::Builder::new()
             .name("agentdictate-wasapi".into())
@@ -264,7 +265,7 @@ impl SystemRecordingController {
         Self {
             commands,
             settings: settings.clone(),
-            ducker: ducking::PlaybackDucker::new(),
+            ducker,
         }
     }
     pub fn update_settings(&mut self, settings: &Settings) {
