@@ -14,6 +14,10 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::*,
+    Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TokenIntegrityLevel,
+    },
     System::{DataExchange::*, Memory::*, Threading::*},
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
@@ -483,6 +487,84 @@ fn key(vk: u16, up: bool) -> INPUT {
         },
     }
 }
+/// Mandatory integrity level of a process, as far as we are allowed to see it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessIntegrity {
+    Level(u32),
+    /// The token could not be opened for query, which from a normal process
+    /// means the target runs elevated.
+    AccessDenied,
+    Unknown,
+}
+const ELEVATED_PASTE_REASON: &str = "Can't paste into an administrator window; press Ctrl+V";
+/// UIPI silently drops input sent to a higher-integrity window while
+/// SendInput still reports success, so such a paste must not be attempted.
+fn paste_blocked_by_integrity(target: ProcessIntegrity, ours: ProcessIntegrity) -> bool {
+    match (target, ours) {
+        (ProcessIntegrity::AccessDenied, _) => true,
+        (ProcessIntegrity::Level(target), ProcessIntegrity::Level(ours)) => target > ours,
+        _ => false,
+    }
+}
+fn process_integrity(pid: Option<u32>) -> ProcessIntegrity {
+    // SAFETY: every handle opened here is closed before returning, and the
+    // token buffer is u32-aligned and sized by the first GetTokenInformation.
+    unsafe {
+        let process = match pid {
+            None => GetCurrentProcess(),
+            Some(pid) => OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid),
+        };
+        if process.is_null() {
+            return if GetLastError() == ERROR_ACCESS_DENIED {
+                ProcessIntegrity::AccessDenied
+            } else {
+                ProcessIntegrity::Unknown
+            };
+        }
+        let mut token = std::ptr::null_mut();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0;
+        let open_error = GetLastError();
+        if pid.is_some() {
+            CloseHandle(process);
+        }
+        if !opened {
+            return if open_error == ERROR_ACCESS_DENIED {
+                ProcessIntegrity::AccessDenied
+            } else {
+                ProcessIntegrity::Unknown
+            };
+        }
+        let mut size = 0;
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::null_mut(),
+            0,
+            &mut size,
+        );
+        let mut buffer = vec![0u32; (size as usize).div_ceil(4).max(1)];
+        let read = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * 4) as u32,
+            &mut size,
+        ) != 0;
+        let integrity = if read {
+            let label = &*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
+            let count = *GetSidSubAuthorityCount(label.Label.Sid);
+            if count == 0 {
+                ProcessIntegrity::Unknown
+            } else {
+                ProcessIntegrity::Level(*GetSidSubAuthority(label.Label.Sid, u32::from(count) - 1))
+            }
+        } else {
+            ProcessIntegrity::Unknown
+        };
+        CloseHandle(token);
+        integrity
+    }
+}
 fn not_sent(copied_to_clipboard: bool, reason: impl Into<String>) -> DeliveryDisposition {
     DeliveryDisposition::NotSent {
         copied_to_clipboard,
@@ -537,11 +619,17 @@ impl Deliverer for SystemDeliverer {
                 "Focus the destination application before stopping dictation",
             ));
         }
+        let elevated_target =
+            paste_blocked_by_integrity(process_integrity(Some(pid)), process_integrity(None));
         if let Err(error) = self.copy_text(&job.final_text) {
             return Ok(not_sent(
                 false,
                 format!("Could not copy the text, so nothing was pasted: {error}"),
             ));
+        }
+        if elevated_target {
+            tracing::info!(pid, "focused window is elevated; copied without pasting");
+            return Ok(not_sent(true, ELEVATED_PASTE_REASON));
         }
         if unsafe { GetForegroundWindow() } != target
             || [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
@@ -623,6 +711,26 @@ mod tests {
             || panic!("already focused destination must not wait"),
         )
         .unwrap();
+    }
+    #[test]
+    fn paste_is_skipped_only_for_a_higher_integrity_or_unreadable_target() {
+        use ProcessIntegrity::{AccessDenied, Level, Unknown};
+        const MEDIUM: u32 = 0x2000;
+        const HIGH: u32 = 0x3000;
+        assert!(paste_blocked_by_integrity(Level(HIGH), Level(MEDIUM)));
+        assert!(paste_blocked_by_integrity(AccessDenied, Level(MEDIUM)));
+        assert!(paste_blocked_by_integrity(AccessDenied, Unknown));
+        assert!(!paste_blocked_by_integrity(Level(MEDIUM), Level(MEDIUM)));
+        assert!(!paste_blocked_by_integrity(Level(MEDIUM), Level(HIGH)));
+        assert!(!paste_blocked_by_integrity(Unknown, Level(MEDIUM)));
+        assert!(!paste_blocked_by_integrity(Level(HIGH), Unknown));
+    }
+    #[test]
+    fn own_process_integrity_is_readable_and_never_blocks_itself() {
+        let ours = process_integrity(None);
+        assert!(matches!(ours, ProcessIntegrity::Level(_)), "{ours:?}");
+        assert_eq!(process_integrity(Some(std::process::id())), ours);
+        assert!(!paste_blocked_by_integrity(ours, ours));
     }
     #[test]
     fn terminal_paste_uses_windows_application_conventions() {
