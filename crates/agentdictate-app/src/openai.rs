@@ -25,6 +25,13 @@ struct UploadAudio {
     encode_ms: Option<u64>,
 }
 
+impl UploadAudio {
+    /// True for the encoder's output, false for the captured WAV itself.
+    const fn is_compressed(&self) -> bool {
+        self.encode_ms.is_some()
+    }
+}
+
 fn upload_file_name(audio_path: &Path, extension: &str) -> String {
     let stem = audio_path
         .file_stem()
@@ -219,6 +226,27 @@ fn wav_upload(audio_path: &Path) -> Result<UploadAudio, ExternalError> {
         mime: "audio/wav",
         encode_ms: None,
     })
+}
+
+/// True when OpenAI answered HTTP 400 with an error about the uploaded file
+/// or its format. The WAV original is then worth one more attempt.
+fn rejects_upload_format(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| body.to_owned())
+        .to_ascii_lowercase();
+    ["file", "format", "audio"]
+        .iter()
+        .any(|word| message.contains(word))
 }
 
 /// Builds the multipart body for one transcription attempt. Sending consumes
@@ -772,10 +800,19 @@ impl SpeechTransport for ReqwestOpenAiTransport {
                 "This model accepts one language hint; choose one language or automatic detection",
             ));
         }
-        let upload = upload_audio(&self.encoder, request.audio_path, request.duration_seconds)?;
+        let mut upload = upload_audio(&self.encoder, request.audio_path, request.duration_seconds)?;
         let request_started = Instant::now();
-        let (status, body) =
+        let (mut status, mut body) =
             self.send_transcription(|| transcription_form(&request, profile, &upload))?;
+        if upload.is_compressed() && rejects_upload_format(status, &body) {
+            tracing::warn!(
+                error = %Self::response_error(status, &body),
+                "OpenAI rejected the compressed audio; resending the original WAV"
+            );
+            upload = wav_upload(request.audio_path)?;
+            (status, body) =
+                self.send_transcription(|| transcription_form(&request, profile, &upload))?;
+        }
         let request_ms = request_started.elapsed().as_millis() as u64;
         if !status.is_success() {
             return Err(Self::response_error(status, &body));
@@ -800,6 +837,7 @@ impl SpeechTransport for ReqwestOpenAiTransport {
         tracing::info!(
             model = request.model,
             audio_seconds = request.duration_seconds,
+            upload_mime = upload.mime,
             upload_bytes = upload.bytes.len(),
             encode_ms = upload.encode_ms,
             request_ms,

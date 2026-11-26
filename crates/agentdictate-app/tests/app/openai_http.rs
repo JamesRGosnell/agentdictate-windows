@@ -462,6 +462,106 @@ fn a_client_error_status_is_never_retried() {
     }
 }
 
+/// A recording long enough to be compressed before upload.
+fn long_recording() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempdir().unwrap();
+    let audio_path = directory.path().join("recording.wav");
+    let mut wav = b"RIFFrecorded speech".to_vec();
+    wav.resize(61 * 32_000, 0);
+    std::fs::write(&audio_path, wav).unwrap();
+    (directory, audio_path)
+}
+
+/// A stand-in encoder that prints a recognizable payload.
+fn fake_encoder(_: &std::path::Path) -> std::process::Command {
+    let mut command;
+    if cfg!(windows) {
+        command = std::process::Command::new("cmd");
+        command.args(["/C", "echo", "OGG-OPUS"]);
+    } else {
+        command = std::process::Command::new("sh");
+        command.args(["-c", "printf OGG-OPUS"]);
+    }
+    command
+}
+
+fn long_transcription_request(audio_path: &std::path::Path) -> TranscriptionRequest<'_> {
+    TranscriptionRequest {
+        duration_seconds: 61.0,
+        ..transcription_request(audio_path)
+    }
+}
+
+#[test]
+fn compressed_audio_rejected_as_a_bad_file_is_sent_again_as_the_original_wav() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let compressed = read_http_request(&mut stream);
+        respond(
+            &mut stream,
+            "400 Bad Request",
+            r#"{"error":{"message":"Invalid file format. Supported formats: ['mp3', 'wav']","param":"file"}}"#,
+        );
+        drop(stream);
+        let (mut stream, _) = listener.accept().unwrap();
+        let original = read_http_request(&mut stream);
+        respond(&mut stream, "200 OK", r#"{"text":"Every spoken word."}"#);
+        (compressed, original)
+    });
+    let (_directory, audio_path) = long_recording();
+    let mut transport =
+        ReqwestOpenAiTransport::with_api_base("sk-test", format!("http://{address}/v1"))
+            .with_audio_encoder(fake_encoder);
+
+    let text = transport
+        .transcribe_audio(long_transcription_request(&audio_path))
+        .unwrap();
+
+    let (compressed, original) = server.join().unwrap();
+    assert_eq!(text, "Every spoken word.");
+    assert!(compressed.contains("filename=\"recording.ogg\""));
+    assert!(compressed.contains("Content-Type: audio/ogg"));
+    assert!(compressed.contains("OGG-OPUS"));
+    assert!(original.contains("filename=\"recording.wav\""));
+    assert!(original.contains("Content-Type: audio/wav"));
+    assert!(original.contains("RIFFrecorded speech"));
+}
+
+#[test]
+fn compressed_audio_rejected_for_another_reason_is_not_resent() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let compressed = read_http_request(&mut stream);
+        respond(
+            &mut stream,
+            "400 Bad Request",
+            r#"{"error":{"message":"Unsupported language: xx"}}"#,
+        );
+        drop(stream);
+        (compressed, another_connection_arrives(&listener))
+    });
+    let (_directory, audio_path) = long_recording();
+    let mut transport =
+        ReqwestOpenAiTransport::with_api_base("sk-test", format!("http://{address}/v1"))
+            .with_audio_encoder(fake_encoder);
+
+    let error = transport
+        .transcribe_audio(long_transcription_request(&audio_path))
+        .unwrap_err();
+
+    let (compressed, resent) = server.join().unwrap();
+    assert!(compressed.contains("OGG-OPUS"));
+    assert!(
+        error.to_string().contains("Unsupported language"),
+        "{error}"
+    );
+    assert!(!resent, "a rejection unrelated to the file was resent");
+}
+
 fn read_http_request(stream: &mut impl Read) -> String {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
